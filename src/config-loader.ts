@@ -4,6 +4,7 @@
 
 import { glob } from "glob";
 import { resolve, dirname, relative, basename } from "path";
+import { $ } from "bun";
 import type { WorktreeConfig, LoadedConfig } from "./types.js";
 
 /**
@@ -16,7 +17,17 @@ const CONFIG_PATTERNS = ["**/worktree.config.ts", "**/worktree.*.config.ts"];
 /**
  * Directories to ignore when searching for config files.
  */
-const IGNORE_PATTERNS = ["**/node_modules/**", "**/dist/**", "**/.git/**", "**/build/**", "**/.next/**"];
+const IGNORE_PATTERNS = [
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/.git/**",
+  "**/build/**",
+  "**/.next/**",
+  "**/.open-next/**",
+  "**/.wrangler/**",
+  "**/.turbo/**",
+  "**/coverage/**",
+];
 
 /**
  * Extract variant name from config filename.
@@ -30,12 +41,9 @@ function extractVariantName(filename: string): string | null {
 }
 
 /**
- * Discover all worktree config files in the repository.
- *
- * @param repoRoot - The root directory of the git repository
- * @returns Array of absolute paths to config files, sorted by path
+ * Discover config files using glob (fallback method).
  */
-export async function discoverConfigFiles(repoRoot: string): Promise<string[]> {
+async function discoverConfigFilesWithGlob(repoRoot: string): Promise<string[]> {
   const configFiles: string[] = [];
 
   for (const pattern of CONFIG_PATTERNS) {
@@ -52,6 +60,33 @@ export async function discoverConfigFiles(repoRoot: string): Promise<string[]> {
   unique.sort();
 
   return unique;
+}
+
+/**
+ * Discover all worktree config files in the repository.
+ * Uses git ls-files for fast lookup, falls back to glob if git fails.
+ *
+ * @param repoRoot - The root directory of the git repository
+ * @returns Array of absolute paths to config files, sorted by path
+ */
+export async function discoverConfigFiles(repoRoot: string): Promise<string[]> {
+  // Use git ls-files for fast lookup of tracked config files
+  const result =
+    await $`git ls-files "worktree.config.ts" "**/worktree.config.ts" "worktree.*.config.ts" "**/worktree.*.config.ts"`
+      .cwd(repoRoot)
+      .nothrow();
+
+  if (result.exitCode !== 0) {
+    // Fallback to glob if git fails
+    return discoverConfigFilesWithGlob(repoRoot);
+  }
+
+  const files = result.stdout.toString().trim().split("\n").filter(Boolean);
+
+  const absolutePaths = files.map((f) => resolve(repoRoot, f));
+  absolutePaths.sort();
+
+  return absolutePaths;
 }
 
 /**

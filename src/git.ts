@@ -2,6 +2,8 @@
  * Git worktree operations.
  */
 
+import { mkdirSync } from "fs";
+import { dirname } from "path";
 import { $ } from "bun";
 
 export interface WorktreeInfo {
@@ -114,6 +116,9 @@ export async function createWorktree(
     detach?: boolean;
   } = {},
 ): Promise<void> {
+  // Ensure parent directory exists
+  mkdirSync(dirname(path), { recursive: true });
+
   const args: string[] = ["git", "worktree", "add"];
 
   if (options.detach) {
@@ -134,16 +139,22 @@ export async function createWorktree(
 
   // Use shell array expansion
   const cmd = args.join(" ");
-  await $`sh -c ${cmd}`.quiet();
+  const result = await $`sh -c ${cmd}`.nothrow();
+  if (result.exitCode !== 0) {
+    const stderr = result.stderr.toString().trim();
+    throw new Error(`Git worktree creation failed (exit code ${result.exitCode}): ${stderr}`);
+  }
 }
 
 /**
  * Remove a worktree.
  */
 export async function removeWorktree(path: string, force = false): Promise<void> {
-  if (force) {
-    await $`git worktree remove ${path} --force`.quiet();
-  } else {
-    await $`git worktree remove ${path}`.quiet();
+  const args = force ? ["git", "worktree", "remove", path, "--force"] : ["git", "worktree", "remove", path];
+  const cmd = args.join(" ");
+  const result = await $`sh -c ${cmd}`.nothrow();
+  if (result.exitCode !== 0) {
+    const stderr = result.stderr.toString().trim();
+    throw new Error(`Git worktree removal failed (exit code ${result.exitCode}): ${stderr}`);
   }
 }

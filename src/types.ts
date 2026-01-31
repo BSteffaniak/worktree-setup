@@ -62,6 +62,15 @@ export interface WorktreeConfig {
   copyNodeModules?: boolean;
 
   /**
+   * If true, copy all unstaged and untracked files from the main worktree to the target.
+   * This copies any modified tracked files and new untracked files, overwriting the target.
+   * Useful for propagating work-in-progress changes to a new worktree.
+   * Can be overridden via CLI --unstaged / --no-unstaged flags.
+   * @default false
+   */
+  copyUnstaged?: boolean;
+
+  /**
    * Commands to run after setup is complete.
    * Commands are run from the worktree root directory.
    * Example: ["bun install", "bun run generate:types"]

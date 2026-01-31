@@ -7,6 +7,7 @@ import { dirname, join, relative } from "path";
 import { glob } from "glob";
 import { $ } from "bun";
 import type { LoadedConfig, TemplateConfig } from "./types.js";
+import { getUnstagedAndUntrackedFiles } from "./git.js";
 
 export type OperationResult = "created" | "exists" | "skipped" | "overwritten";
 
@@ -165,7 +166,16 @@ export interface ConfigApplyResult {
   symlinks: Array<{ path: string; result: OperationResult }>;
   copies: Array<{ path: string; result: OperationResult }>;
   overwrites: Array<{ path: string; result: OperationResult }>;
+  unstaged: Array<{ path: string; result: OperationResult }>;
   templates: Array<{ source: string; target: string; result: OperationResult }>;
+}
+
+/**
+ * Options for applying a config.
+ */
+export interface ApplyConfigOptions {
+  /** Override copyUnstaged setting from config. undefined = use config value. */
+  copyUnstaged?: boolean;
 }
 
 /**
@@ -174,11 +184,13 @@ export interface ConfigApplyResult {
  * @param loaded - The loaded config to apply
  * @param mainWorktreePath - Path to the main worktree (source)
  * @param targetWorktreePath - Path to the target worktree (destination)
+ * @param options - Options to override config settings
  */
 export async function applyConfig(
   loaded: LoadedConfig,
   mainWorktreePath: string,
   targetWorktreePath: string,
+  options?: ApplyConfigOptions,
 ): Promise<ConfigApplyResult> {
   const { config, configDir } = loaded;
 
@@ -190,6 +202,7 @@ export async function applyConfig(
     symlinks: [],
     copies: [],
     overwrites: [],
+    unstaged: [],
     templates: [],
   };
 
@@ -264,6 +277,18 @@ export async function applyConfig(
         target: join(configRelativeDir, template.target),
         result: opResult,
       });
+    }
+  }
+
+  // Process unstaged/untracked files
+  const shouldCopyUnstaged = options?.copyUnstaged ?? config.copyUnstaged ?? false;
+  if (shouldCopyUnstaged) {
+    const unstagedFiles = await getUnstagedAndUntrackedFiles(mainWorktreePath);
+    for (const file of unstagedFiles) {
+      const sourcePath = join(mainWorktreePath, file);
+      const targetPath = join(targetWorktreePath, file);
+      const opResult = overwriteFile(sourcePath, targetPath);
+      result.unstaged.push({ path: file, result: opResult });
     }
   }
 

@@ -69,6 +69,8 @@ async function main(): Promise<void> {
     .option("--config <path>", "Specific config file to use (can be specified multiple times)", collect, [])
     .option("--no-node-modules", "Skip copying node_modules")
     .option("--no-install", "Skip running post-setup commands")
+    .option("--unstaged", "Copy unstaged and untracked files from main worktree")
+    .option("--no-unstaged", "Skip copying unstaged files (overrides config)")
     .option("--list", "List discovered configs and exit")
     .option("--non-interactive", "Run without prompts (requires target-path)")
     .action(runSetup);
@@ -94,6 +96,7 @@ async function runSetup(
     config: string[];
     nodeModules: boolean;
     install: boolean;
+    unstaged?: boolean;
     list: boolean;
     nonInteractive: boolean;
   },
@@ -226,7 +229,9 @@ async function runSetup(
     for (const loaded of selectedConfigs) {
       console.log(`[${getConfigDisplayName(loaded)}] Applying config...`);
 
-      const result = await applyConfig(loaded, mainWorktree.path, targetPath);
+      const result = await applyConfig(loaded, mainWorktree.path, targetPath, {
+        copyUnstaged: options.unstaged,
+      });
 
       // Print symlinks
       if (result.symlinks.length > 0) {
@@ -248,6 +253,14 @@ async function runSetup(
       if (result.overwrites.length > 0) {
         console.log("  Overwrites:");
         for (const { path, result: opResult } of result.overwrites) {
+          console.log(`    ${resultIcon(opResult)} ${path} ${resultStatus(opResult)}`);
+        }
+      }
+
+      // Print unstaged files
+      if (result.unstaged.length > 0) {
+        console.log("  Unstaged changes:");
+        for (const { path, result: opResult } of result.unstaged) {
           console.log(`    ${resultIcon(opResult)} ${path} ${resultStatus(opResult)}`);
         }
       }

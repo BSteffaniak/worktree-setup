@@ -158,3 +158,28 @@ export async function removeWorktree(path: string, force = false): Promise<void>
     throw new Error(`Git worktree removal failed (exit code ${result.exitCode}): ${stderr}`);
   }
 }
+
+/**
+ * Get list of unstaged modified files and untracked files from git.
+ *
+ * @param repoRoot - The root directory of the git repository
+ * @returns Array of file paths relative to repo root
+ */
+export async function getUnstagedAndUntrackedFiles(repoRoot: string): Promise<string[]> {
+  const files: string[] = [];
+
+  // Modified but unstaged files
+  const modified = await $`git diff --name-only`.cwd(repoRoot).nothrow();
+  if (modified.exitCode === 0) {
+    files.push(...modified.stdout.toString().trim().split("\n").filter(Boolean));
+  }
+
+  // Untracked files (excluding ignored)
+  const untracked = await $`git ls-files --others --exclude-standard`.cwd(repoRoot).nothrow();
+  if (untracked.exitCode === 0) {
+    files.push(...untracked.stdout.toString().trim().split("\n").filter(Boolean));
+  }
+
+  // Dedupe and return
+  return [...new Set(files)];
+}

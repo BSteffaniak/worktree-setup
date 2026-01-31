@@ -30,6 +30,8 @@ function resultIcon(result: OperationResult): string {
   switch (result) {
     case "created":
       return "\u2713"; // checkmark
+    case "overwritten":
+      return "\u2713"; // checkmark
     case "exists":
       return "\u2022"; // bullet
     case "skipped":
@@ -44,6 +46,8 @@ function resultStatus(result: OperationResult): string {
   switch (result) {
     case "created":
       return "";
+    case "overwritten":
+      return "(overwritten)";
     case "exists":
       return "(already exists)";
     case "skipped":
@@ -236,6 +240,14 @@ async function runSetup(
       if (result.copies.length > 0) {
         console.log("  Copies:");
         for (const { path, result: opResult } of result.copies) {
+          console.log(`    ${resultIcon(opResult)} ${path} ${resultStatus(opResult)}`);
+        }
+      }
+
+      // Print overwrites
+      if (result.overwrites.length > 0) {
+        console.log("  Overwrites:");
+        for (const { path, result: opResult } of result.overwrites) {
           console.log(`    ${resultIcon(opResult)} ${path} ${resultStatus(opResult)}`);
         }
       }

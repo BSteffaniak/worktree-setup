@@ -8,7 +8,7 @@ import { glob } from "glob";
 import { $ } from "bun";
 import type { LoadedConfig, TemplateConfig } from "./types.js";
 
-export type OperationResult = "created" | "exists" | "skipped";
+export type OperationResult = "created" | "exists" | "skipped" | "overwritten";
 
 /**
  * Ensure a directory exists, creating parent directories as needed.
@@ -83,6 +83,20 @@ export function copyFile(source: string, target: string): OperationResult {
 }
 
 /**
+ * Copy a file from source to target, overwriting if it exists.
+ */
+export function overwriteFile(source: string, target: string): OperationResult {
+  if (!existsSync(source)) {
+    return "skipped";
+  }
+
+  const existed = existsSync(target);
+  ensureParentDir(target);
+  copyFileSync(source, target);
+  return existed ? "overwritten" : "created";
+}
+
+/**
  * Copy a directory recursively from source to target.
  */
 export function copyDirectory(source: string, target: string): OperationResult {
@@ -150,6 +164,7 @@ export interface ConfigApplyResult {
   config: LoadedConfig;
   symlinks: Array<{ path: string; result: OperationResult }>;
   copies: Array<{ path: string; result: OperationResult }>;
+  overwrites: Array<{ path: string; result: OperationResult }>;
   templates: Array<{ source: string; target: string; result: OperationResult }>;
 }
 
@@ -174,6 +189,7 @@ export async function applyConfig(
     config: loaded,
     symlinks: [],
     copies: [],
+    overwrites: [],
     templates: [],
   };
 
@@ -194,6 +210,16 @@ export async function applyConfig(
       const targetPath = join(targetWorktreePath, configRelativeDir, copyPath);
       const opResult = copyFile(sourcePath, targetPath);
       result.copies.push({ path: join(configRelativeDir, copyPath), result: opResult });
+    }
+  }
+
+  // Process overwrite files (always copy, even if exists)
+  if (config.overwrite) {
+    for (const overwritePath of config.overwrite) {
+      const sourcePath = join(mainWorktreePath, configRelativeDir, overwritePath);
+      const targetPath = join(targetWorktreePath, configRelativeDir, overwritePath);
+      const opResult = overwriteFile(sourcePath, targetPath);
+      result.overwrites.push({ path: join(configRelativeDir, overwritePath), result: opResult });
     }
   }
 

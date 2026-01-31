@@ -30,8 +30,16 @@ export interface WorktreeConfig {
   /**
    * Files or directories to copy exactly from main worktree.
    * These are copied (not symlinked) so changes don't affect the main worktree.
+   * Files are only copied if they don't already exist in the target.
    */
   copy?: string[];
+
+  /**
+   * Files to always copy/overwrite from main worktree, even if they exist.
+   * Use this for config files with local modifications you want propagated
+   * to all worktrees (e.g., wrangler.jsonc with local dev settings).
+   */
+  overwrite?: string[];
 
   /**
    * Glob patterns for files to copy from main worktree.

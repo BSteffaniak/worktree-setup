@@ -18,7 +18,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "bun build ./src/cli.ts --outdir ./dist --target node && bun build ./src/index.ts --outdir ./dist --target node && tsc --emitDeclarationOnly",
+    "build": "bun build ./src/cli.ts --outdir ./dist --target bun && bun build ./src/index.ts --outdir ./dist --target bun && tsc --emitDeclarationOnly",
     "build:binary": "bun build ./src/cli.ts --compile --outfile worktree-setup",
     "dev": "bun run ./src/cli.ts",
     "typecheck": "tsc --noEmit",

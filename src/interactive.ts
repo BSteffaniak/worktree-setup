@@ -102,7 +102,7 @@ export async function promptWorktreeCreate(targetPath: string): Promise<Worktree
   const createAction = await select({
     message: "Worktree path doesn't exist. Create from:",
     choices: [
-      { name: `Current branch (${currentBranch || "HEAD"})`, value: "current" },
+      { name: `New branch from ${currentBranch || "HEAD"} (auto-named from path)`, value: "current" },
       { name: "Existing branch...", value: "branch" },
       { name: "New branch...", value: "new-branch" },
       { name: "Detached HEAD (current commit)", value: "detach" },
@@ -115,10 +115,11 @@ export async function promptWorktreeCreate(targetPath: string): Promise<Worktree
   }
 
   if (createAction === "current") {
+    // Let git derive branch name from path (default git worktree behavior)
+    // git worktree add <path> creates a new branch named after path's basename
     return {
       shouldCreate: true,
-      branch: currentBranch || undefined,
-      detach: !currentBranch,
+      // No branch/newBranch/detach - let git handle it naturally
     };
   }
 

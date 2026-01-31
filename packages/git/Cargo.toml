@@ -1,0 +1,20 @@
+[package]
+name = "worktree_setup_git"
+description = "Git operations for worktree-setup"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+git2 = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "worktree_setup_copy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Fast parallel file copying with progress tracking"
+
+[dependencies]
+jwalk = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }
+reflink-copy = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = []

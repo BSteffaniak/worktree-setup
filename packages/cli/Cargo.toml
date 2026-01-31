@@ -1,0 +1,27 @@
+[package]
+name = "worktree-setup"
+description = "CLI tool for setting up git worktrees with project-specific configurations"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "worktree-setup"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+colored = { workspace = true }
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
+log = { workspace = true }
+pretty_env_logger = { workspace = true }
+worktree_setup_config = { workspace = true }
+worktree_setup_git = { workspace = true }
+worktree_setup_operations = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = []

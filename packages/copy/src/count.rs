@@ -15,6 +15,30 @@ use std::path::Path;
 /// Uses `jwalk` with sorting disabled for maximum speed.
 #[must_use]
 pub fn count_files(path: &Path) -> u64 {
+    count_files_with_progress(path, |_| {})
+}
+
+/// Count files in a directory with progress callback.
+///
+/// The callback is invoked every 100 files with the current count.
+/// This allows updating a progress display during enumeration of large directories.
+///
+/// - If path is a file: returns 1
+/// - If path is a directory: returns count of all files recursively
+/// - If path doesn't exist or is a symlink: returns 0
+///
+/// # Arguments
+///
+/// * `path` - Path to count files in
+/// * `on_progress` - Callback invoked every 100 files with current count
+///
+/// # Returns
+///
+/// Total file count
+pub fn count_files_with_progress<F>(path: &Path, on_progress: F) -> u64
+where
+    F: Fn(u64),
+{
     if !path.exists() {
         return 0;
     }
@@ -25,6 +49,7 @@ pub fn count_files(path: &Path) -> u64 {
     }
 
     if path.is_file() {
+        on_progress(1);
         return 1;
     }
 
@@ -33,13 +58,23 @@ pub fn count_files(path: &Path) -> u64 {
     }
 
     // Use jwalk with sort disabled for speed
-    jwalk::WalkDir::new(path)
+    let mut count = 0u64;
+    for _entry in jwalk::WalkDir::new(path)
         .skip_hidden(false)
         .sort(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-        .count() as u64
+    {
+        count += 1;
+        if count % 100 == 0 {
+            on_progress(count);
+        }
+    }
+
+    // Final callback with total
+    on_progress(count);
+    count
 }
 
 #[cfg(test)]

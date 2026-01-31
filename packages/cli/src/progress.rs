@@ -72,6 +72,26 @@ impl ProgressManager {
         let _ = std::io::stdout().flush();
     }
 
+    /// Create a progress bar for scanning operations.
+    ///
+    /// Shows current operation being scanned with file count during enumeration.
+    /// If progress is disabled, returns a hidden progress bar.
+    #[must_use]
+    pub fn create_scanning_bar(&self, total: u64) -> ProgressBar {
+        if !self.enabled {
+            return ProgressBar::hidden();
+        }
+
+        let pb = self.multi.add(ProgressBar::new(total));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(" Scanning [{bar:20.green/dim}] {pos}/{len} {msg}")
+                .expect("Invalid progress bar template")
+                .progress_chars("━━─"),
+        );
+        pb
+    }
+
     /// Clear any active progress bars (for clean output after completion).
     pub fn clear(&self) {
         self.multi.clear().ok();

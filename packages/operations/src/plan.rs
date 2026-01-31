@@ -7,8 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use worktree_setup_config::LoadedConfig;
-use worktree_setup_copy::count_files;
-use worktree_setup_git::{get_unstaged_and_untracked_files, open_repo};
+use worktree_setup_copy::count_files_with_progress;
 
 use crate::ApplyConfigOptions;
 use crate::error::OperationError;
@@ -78,13 +77,54 @@ pub struct PlannedOperation {
 ///
 /// # Errors
 ///
-/// * If git operations fail (when planning unstaged files)
+/// * If glob pattern matching fails
 pub fn plan_operations(
     config: &LoadedConfig,
     main_worktree: &Path,
     target_worktree: &Path,
     options: &ApplyConfigOptions,
 ) -> Result<Vec<PlannedOperation>, OperationError> {
+    plan_operations_with_progress(
+        config,
+        main_worktree,
+        target_worktree,
+        options,
+        &|_, _, _, _| {},
+    )
+}
+
+/// Plan all operations for a config with progress reporting.
+///
+/// This is like `plan_operations` but reports progress during scanning,
+/// which is useful for displaying a progress bar to the user.
+///
+/// The progress callback receives:
+/// - `current_op`: Current operation index (1-based)
+/// - `total_ops`: Total number of operations to scan
+/// - `path`: Path being scanned
+/// - `file_count`: Current file count (Some during directory scan, None for quick checks)
+///
+/// # Arguments
+///
+/// * `config` - The loaded configuration
+/// * `main_worktree` - Path to the main worktree (source)
+/// * `target_worktree` - Path to the target worktree (destination)
+/// * `options` - Options to override config settings
+/// * `on_progress` - Progress callback
+///
+/// # Errors
+///
+/// * If glob pattern matching fails
+pub fn plan_operations_with_progress<F>(
+    config: &LoadedConfig,
+    main_worktree: &Path,
+    target_worktree: &Path,
+    _options: &ApplyConfigOptions,
+    on_progress: &F,
+) -> Result<Vec<PlannedOperation>, OperationError>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
     let mut operations = Vec::new();
 
     // Calculate relative path from repo root to config directory
@@ -93,11 +133,24 @@ pub fn plan_operations(
         .strip_prefix(main_worktree)
         .unwrap_or(&config.config_dir);
 
+    // Calculate total operations (excluding unstaged - those are handled separately)
+    let total_ops = config.config.symlinks.len()
+        + config.config.copy.len()
+        + config.config.overwrite.len()
+        + config.config.copy_glob.len()
+        + config.config.templates.len();
+
+    let mut current_op = 0usize;
+
     // Plan symlinks
     for symlink_path in &config.config.symlinks {
+        current_op += 1;
         let source = main_worktree.join(config_relative_dir).join(symlink_path);
         let target = target_worktree.join(config_relative_dir).join(symlink_path);
         let display_path = config_relative_dir.join(symlink_path);
+        let display_str = display_path.to_string_lossy().to_string();
+
+        on_progress(current_op, total_ops, &display_str, None);
 
         let (will_skip, skip_reason) = if !source.exists() {
             (true, Some("not found".to_string()))
@@ -108,7 +161,7 @@ pub fn plan_operations(
         };
 
         operations.push(PlannedOperation {
-            display_path: display_path.to_string_lossy().to_string(),
+            display_path: display_str,
             operation_type: OperationType::Symlink,
             source,
             target,
@@ -121,9 +174,13 @@ pub fn plan_operations(
 
     // Plan explicit copies
     for copy_path in &config.config.copy {
+        current_op += 1;
         let source = main_worktree.join(config_relative_dir).join(copy_path);
         let target = target_worktree.join(config_relative_dir).join(copy_path);
         let display_path = config_relative_dir.join(copy_path);
+        let display_str = display_path.to_string_lossy().to_string();
+
+        on_progress(current_op, total_ops, &display_str, None);
 
         let (will_skip, skip_reason, file_count, is_directory) = if !source.exists() {
             (true, Some("not found".to_string()), 0, false)
@@ -131,12 +188,18 @@ pub fn plan_operations(
             (true, Some("exists".to_string()), 0, false)
         } else {
             let is_dir = source.is_dir();
-            let count = count_files(&source);
+            let count = if is_dir {
+                count_files_with_progress(&source, |n| {
+                    on_progress(current_op, total_ops, &display_str, Some(n));
+                })
+            } else {
+                1
+            };
             (false, None, count, is_dir)
         };
 
         operations.push(PlannedOperation {
-            display_path: display_path.to_string_lossy().to_string(),
+            display_path: display_str,
             operation_type: OperationType::Copy,
             source,
             target,
@@ -149,22 +212,32 @@ pub fn plan_operations(
 
     // Plan overwrites
     for overwrite_path in &config.config.overwrite {
+        current_op += 1;
         let source = main_worktree.join(config_relative_dir).join(overwrite_path);
         let target = target_worktree
             .join(config_relative_dir)
             .join(overwrite_path);
         let display_path = config_relative_dir.join(overwrite_path);
+        let display_str = display_path.to_string_lossy().to_string();
+
+        on_progress(current_op, total_ops, &display_str, None);
 
         let (will_skip, skip_reason, file_count, is_directory) = if !source.exists() {
             (true, Some("not found".to_string()), 0, false)
         } else {
             let is_dir = source.is_dir();
-            let count = count_files(&source);
+            let count = if is_dir {
+                count_files_with_progress(&source, |n| {
+                    on_progress(current_op, total_ops, &display_str, Some(n));
+                })
+            } else {
+                1
+            };
             (false, None, count, is_dir)
         };
 
         operations.push(PlannedOperation {
-            display_path: display_path.to_string_lossy().to_string(),
+            display_path: display_str,
             operation_type: OperationType::Overwrite,
             source,
             target,
@@ -175,10 +248,13 @@ pub fn plan_operations(
         });
     }
 
-    // Plan glob copies
+    // Plan glob copies (each pattern counts as 1 operation for progress)
     for pattern in &config.config.copy_glob {
+        current_op += 1;
         let search_dir = main_worktree.join(config_relative_dir);
         let full_pattern = search_dir.join(pattern).to_string_lossy().to_string();
+
+        on_progress(current_op, total_ops, pattern, None);
 
         for entry in glob::glob(&full_pattern)? {
             if let Ok(source) = entry {
@@ -210,6 +286,7 @@ pub fn plan_operations(
 
     // Plan templates
     for template in &config.config.templates {
+        current_op += 1;
         let source = main_worktree
             .join(config_relative_dir)
             .join(&template.source);
@@ -221,6 +298,8 @@ pub fn plan_operations(
             config_relative_dir.join(&template.source).display(),
             config_relative_dir.join(&template.target).display()
         );
+
+        on_progress(current_op, total_ops, &display_path, None);
 
         let (will_skip, skip_reason) = if !source.exists() {
             (true, Some("not found".to_string()))
@@ -242,34 +321,54 @@ pub fn plan_operations(
         });
     }
 
-    // Plan unstaged files
-    let should_copy_unstaged = options.copy_unstaged.unwrap_or(config.config.copy_unstaged);
+    // Note: Unstaged files are NOT planned here - they should be handled separately
+    // by the caller who can show a "Checking git status..." spinner first.
+    // This avoids the git operation being part of the planning progress bar.
 
-    if should_copy_unstaged {
-        let repo = open_repo(main_worktree)?;
-        let files = get_unstaged_and_untracked_files(&repo)?;
+    Ok(operations)
+}
 
-        for file in files {
-            let source = main_worktree.join(&file);
-            let target = target_worktree.join(&file);
+/// Plan unstaged file operations.
+///
+/// This is separate from `plan_operations` so the caller can show a different
+/// progress indicator for the git status check.
+///
+/// # Arguments
+///
+/// * `unstaged_files` - List of unstaged/untracked file paths from git
+/// * `main_worktree` - Path to the main worktree (source)
+/// * `target_worktree` - Path to the target worktree (destination)
+///
+/// # Returns
+///
+/// Vector of planned operations for unstaged files
+pub fn plan_unstaged_operations(
+    unstaged_files: &[String],
+    main_worktree: &Path,
+    target_worktree: &Path,
+) -> Vec<PlannedOperation> {
+    let mut operations = Vec::new();
 
-            // Only plan if source exists
-            if source.exists() {
-                operations.push(PlannedOperation {
-                    display_path: file,
-                    operation_type: OperationType::Unstaged,
-                    source,
-                    target,
-                    file_count: 1,
-                    is_directory: false,
-                    will_skip: false,
-                    skip_reason: None,
-                });
-            }
+    for file in unstaged_files {
+        let source = main_worktree.join(file);
+        let target = target_worktree.join(file);
+
+        // Only plan if source exists
+        if source.exists() {
+            operations.push(PlannedOperation {
+                display_path: file.clone(),
+                operation_type: OperationType::Unstaged,
+                source,
+                target,
+                file_count: 1,
+                is_directory: false,
+                will_skip: false,
+                skip_reason: None,
+            });
         }
     }
 
-    Ok(operations)
+    operations
 }
 
 #[cfg(test)]
@@ -371,5 +470,66 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(ops[0].is_directory);
         assert_eq!(ops[0].file_count, 3);
+    }
+
+    #[test]
+    fn test_plan_operations_with_progress_callback() {
+        use std::cell::RefCell;
+
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create source files
+        fs::create_dir_all(main_dir.path().join("data")).unwrap();
+        fs::write(main_dir.path().join("config.json"), "{}").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                symlinks: vec!["data".to_string()],
+                copy: vec!["config.json".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.path().join("worktree.config.toml"),
+            config_dir: main_dir.path().to_path_buf(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+        let options = ApplyConfigOptions::default();
+
+        let progress_calls = RefCell::new(Vec::new());
+        let ops = plan_operations_with_progress(
+            &config,
+            main_dir.path(),
+            target_dir.path(),
+            &options,
+            &|current, total, path, _file_count| {
+                progress_calls
+                    .borrow_mut()
+                    .push((current, total, path.to_string()));
+            },
+        )
+        .unwrap();
+
+        let calls = progress_calls.into_inner();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (1, 2, "data".to_string()));
+        assert_eq!(calls[1], (2, 2, "config.json".to_string()));
+    }
+
+    #[test]
+    fn test_plan_unstaged_operations() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create source files
+        fs::write(main_dir.path().join("modified.txt"), "content").unwrap();
+        fs::write(main_dir.path().join("untracked.txt"), "content").unwrap();
+
+        let unstaged = vec!["modified.txt".to_string(), "untracked.txt".to_string()];
+        let ops = plan_unstaged_operations(&unstaged, main_dir.path(), target_dir.path());
+
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].operation_type, OperationType::Unstaged);
+        assert_eq!(ops[1].operation_type, OperationType::Unstaged);
     }
 }

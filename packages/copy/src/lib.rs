@@ -31,6 +31,6 @@ mod error;
 mod progress;
 
 pub use copy::{CopyResult, copy_directory, copy_file, overwrite_file};
-pub use count::count_files;
+pub use count::{count_files, count_files_with_progress};
 pub use error::CopyError;
 pub use progress::{CopyProgress, ProgressTracker};

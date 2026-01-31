@@ -26,7 +26,7 @@ use worktree_setup_git::{
     get_main_worktree, get_repo_root,
 };
 use worktree_setup_operations::{
-    ApplyConfigOptions, OperationType, execute_operation, plan_operations,
+    ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
 };
 
 fn main() {
@@ -200,12 +200,46 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         copy_unstaged: args.copy_unstaged_override(),
     };
 
-    // Plan all operations across all configs
+    // Calculate total operations across all configs for scanning progress
+    let config_op_counts: Vec<usize> = selected_configs
+        .iter()
+        .map(|c| {
+            c.config.symlinks.len()
+                + c.config.copy.len()
+                + c.config.overwrite.len()
+                + c.config.copy_glob.len()
+                + c.config.templates.len()
+        })
+        .collect();
+    let total_ops: usize = config_op_counts.iter().sum();
+
+    // Create scanning progress bar
+    let scanning_bar = progress_mgr.create_scanning_bar(total_ops as u64);
+
+    // Plan all operations across all configs with progress
     let mut all_operations = Vec::new();
-    for config in &selected_configs {
-        let ops = plan_operations(config, &main_worktree.path, &target_path, &options)?;
+    let mut offset = 0usize;
+    for (config, &config_count) in selected_configs.iter().zip(&config_op_counts) {
+        let current_offset = offset;
+        let ops = plan_operations_with_progress(
+            config,
+            &main_worktree.path,
+            &target_path,
+            &options,
+            &|current, _total, path, file_count| {
+                scanning_bar.set_position((current_offset + current) as u64);
+                match file_count {
+                    Some(n) => scanning_bar.set_message(format!("{path} ({n} files)")),
+                    None => scanning_bar.set_message(path.to_string()),
+                }
+            },
+        )?;
+        offset += config_count;
         all_operations.extend(ops);
     }
+
+    // Clear scanning progress bar
+    scanning_bar.finish_and_clear();
 
     // Execute operations with progress
     for op in &all_operations {

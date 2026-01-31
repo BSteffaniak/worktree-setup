@@ -41,7 +41,10 @@ pub use copy::{
     overwrite_file, overwrite_file_with_progress,
 };
 pub use error::OperationError;
-pub use plan::{OperationType, PlannedOperation, plan_operations};
+pub use plan::{
+    OperationType, PlannedOperation, plan_operations, plan_operations_with_progress,
+    plan_unstaged_operations,
+};
 pub use symlink::create_symlink;
 pub use worktree_setup_copy::CopyProgress;
 

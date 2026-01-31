@@ -48,6 +48,7 @@ thiserror = { version = "2.0.17", default-features = false }
 # File operations
 glob = { version = "0.3.2", default-features = false }
 jwalk = { version = "0.8.1", default-features = false }
+path-clean = { version = "1.0.1", default-features = false }
 rayon = { version = "1.10.0", default-features = false }
 reflink-copy = { version = "0.1.20", default-features = false }
 

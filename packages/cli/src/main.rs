@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
+use path_clean::PathClean;
 
 use args::Args;
 use progress::ProgressManager;
@@ -133,12 +134,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         interactive::prompt_worktree_path()?
     };
 
-    // Make target path absolute
+    // Make target path absolute and normalize (resolve . and .. components)
     let target_path = if target_path.is_absolute() {
         target_path
     } else {
         cwd.join(&target_path)
-    };
+    }
+    .clean();
 
     // Get main worktree
     let main_worktree = get_main_worktree(&repo)?;

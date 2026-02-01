@@ -1,0 +1,75 @@
+name: Claude Denied
+
+on:
+    issue_comment:
+        types: [created]
+    pull_request_review_comment:
+        types: [created]
+    issues:
+        types: [opened]
+
+permissions:
+    issues: write
+    pull-requests: write
+
+jobs:
+    deny-access:
+        name: Deny Unauthorized Access
+        runs-on: ubuntu-latest
+        if: contains(github.event.comment.body || github.event.issue.body, '@claude')
+
+        steps:
+            - name: Check authorization
+              id: check
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const actor = context.actor;
+                      const owner = context.repo.owner;
+
+                      if (actor === owner) {
+                          core.setOutput('is-authorized', 'true');
+                          return;
+                      }
+
+                      try {
+                          const { data: membership } = await github.rest.orgs.checkMembershipForUser({
+                              org: owner,
+                              username: actor
+                          });
+                          core.setOutput('is-authorized', 'true');
+                      } catch (error) {
+                          core.setOutput('is-authorized', 'false');
+                      }
+
+            - name: Post denial message
+              if: steps.check.outputs.is-authorized != 'true'
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const message = `👋 Hi @${context.actor}!
+
+                      The \`@claude\` assistant is only available to repository maintainers and organization members.
+
+                      If you'd like to contribute, please feel free to:
+                      - Open a pull request with your proposed changes
+                      - Describe the issue in detail so a maintainer can address it
+
+                      Thank you for your interest in this project!`;
+
+                      if (context.eventName === 'pull_request_review_comment') {
+                          await github.rest.pulls.createReplyForReviewComment({
+                              owner: context.repo.owner,
+                              repo: context.repo.repo,
+                              pull_number: context.payload.pull_request.number,
+                              comment_id: context.payload.comment.id,
+                              body: message
+                          });
+                      } else {
+                          await github.rest.issues.createComment({
+                              owner: context.repo.owner,
+                              repo: context.repo.repo,
+                              issue_number: context.issue.number,
+                              body: message
+                          });
+                      }

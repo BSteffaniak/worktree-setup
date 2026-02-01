@@ -1,0 +1,59 @@
+name: Claude Code Review
+
+on:
+    pull_request:
+        types: [opened, synchronize]
+
+permissions:
+    contents: read
+    pull-requests: write
+    issues: write
+
+jobs:
+    review:
+        name: Code Review
+        runs-on: ubuntu-latest
+        if: github.event.pull_request.draft == false
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Check organization membership
+              id: check-membership
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const actor = context.actor;
+                      const owner = context.repo.owner;
+
+                      // Check if actor is the repo owner
+                      if (actor === owner) {
+                          core.setOutput('is-member', 'true');
+                          return;
+                      }
+
+                      // Check if this is an org repo and actor is a member
+                      try {
+                          const { data: membership } = await github.rest.orgs.checkMembershipForUser({
+                              org: owner,
+                              username: actor
+                          });
+                          core.setOutput('is-member', 'true');
+                      } catch (error) {
+                          core.setOutput('is-member', 'false');
+                      }
+
+            - name: Run Claude Code Review
+              if: steps.check-membership.outputs.is-member == 'true'
+              uses: MoosicBox/MoosicBox/.github/actions/claude-checker@master
+              with:
+                  command: check
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  claude_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  prompt_template: code-review
+                  template_vars: |
+                      pr_number: ${{ github.event.pull_request.number }}
+                  auto_commit: false
+                  model: claude-opus-4-20250514

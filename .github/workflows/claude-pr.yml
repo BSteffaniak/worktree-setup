@@ -1,0 +1,196 @@
+name: Claude PR Handler
+
+on:
+    pull_request_review_comment:
+        types: [created]
+    issue_comment:
+        types: [created]
+
+permissions:
+    contents: write
+    pull-requests: write
+    issues: write
+    id-token: write
+    actions: read
+
+jobs:
+    check-authorization:
+        name: Check Authorization
+        runs-on: ubuntu-latest
+        if: |
+            github.event.issue.pull_request != null &&
+            contains(github.event.comment.body, '@claude')
+        outputs:
+            is-authorized: ${{ steps.check.outputs.is-authorized }}
+
+        steps:
+            - name: Check organization membership
+              id: check
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const actor = context.actor;
+                      const owner = context.repo.owner;
+
+                      if (actor === owner) {
+                          core.setOutput('is-authorized', 'true');
+                          return;
+                      }
+
+                      try {
+                          const { data: membership } = await github.rest.orgs.checkMembershipForUser({
+                              org: owner,
+                              username: actor
+                          });
+                          core.setOutput('is-authorized', 'true');
+                      } catch (error) {
+                          core.setOutput('is-authorized', 'false');
+                      }
+
+    handle-pr-comment:
+        name: Handle PR Comment
+        runs-on: ubuntu-latest
+        needs: check-authorization
+        if: |
+            needs.check-authorization.outputs.is-authorized == 'true' &&
+            github.event_name == 'issue_comment'
+
+        steps:
+            - name: Get PR details
+              id: pr
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const { data: pr } = await github.rest.pulls.get({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          pull_number: context.issue.number
+                      });
+                      core.setOutput('branch', pr.head.ref);
+                      core.setOutput('number', pr.number);
+
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  ref: ${{ steps.pr.outputs.branch }}
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Post acknowledgment
+              id: ack
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const { data: comment } = await github.rest.issues.createComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: context.issue.number,
+                          body: '👀 Looking into this...'
+                      });
+                      core.setOutput('comment-id', comment.id);
+
+            - name: Run Claude
+              id: claude
+              uses: MoosicBox/MoosicBox/.github/actions/claude-checker@master
+              with:
+                  command: check
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  claude_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  prompt_template: pr
+                  template_vars: |
+                      pr_number: ${{ steps.pr.outputs.number }}
+                      branch_name: ${{ steps.pr.outputs.branch }}
+                      comment_body: ${{ github.event.comment.body }}
+                  branch_name: ${{ steps.pr.outputs.branch }}
+                  auto_commit: true
+                  enable_resilient_push: true
+                  enable_stream_watcher: true
+                  stream_comment_id: ${{ steps.ack.outputs.comment-id }}
+                  stream_comment_type: pr_issue_comment
+                  enable_execution_details: true
+                  acknowledgment_comment_id: ${{ steps.ack.outputs.comment-id }}
+                  enable_coauthor_attribution: true
+                  model: claude-opus-4-20250514
+
+    handle-review-comment:
+        name: Handle Review Comment
+        runs-on: ubuntu-latest
+        if: |
+            github.event_name == 'pull_request_review_comment' &&
+            contains(github.event.comment.body, '@claude')
+
+        steps:
+            - name: Check authorization
+              id: check-auth
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const actor = context.actor;
+                      const owner = context.repo.owner;
+
+                      if (actor === owner) {
+                          core.setOutput('is-authorized', 'true');
+                          return;
+                      }
+
+                      try {
+                          const { data: membership } = await github.rest.orgs.checkMembershipForUser({
+                              org: owner,
+                              username: actor
+                          });
+                          core.setOutput('is-authorized', 'true');
+                      } catch (error) {
+                          core.setOutput('is-authorized', 'false');
+                      }
+
+            - name: Exit if unauthorized
+              if: steps.check-auth.outputs.is-authorized != 'true'
+              run: exit 0
+
+            - uses: actions/checkout@v4
+              if: steps.check-auth.outputs.is-authorized == 'true'
+              with:
+                  fetch-depth: 0
+                  ref: ${{ github.event.pull_request.head.ref }}
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Post acknowledgment
+              if: steps.check-auth.outputs.is-authorized == 'true'
+              id: ack
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const { data: comment } = await github.rest.pulls.createReplyForReviewComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          pull_number: context.payload.pull_request.number,
+                          comment_id: context.payload.comment.id,
+                          body: '👀 Looking into this...'
+                      });
+                      core.setOutput('comment-id', comment.id);
+
+            - name: Run Claude
+              if: steps.check-auth.outputs.is-authorized == 'true'
+              id: claude
+              uses: MoosicBox/MoosicBox/.github/actions/claude-checker@master
+              with:
+                  command: check
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  claude_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  prompt_template: pr
+                  template_vars: |
+                      pr_number: ${{ github.event.pull_request.number }}
+                      branch_name: ${{ github.event.pull_request.head.ref }}
+                      comment_body: ${{ github.event.comment.body }}
+                      code_file: ${{ github.event.comment.path }}
+                      code_line: ${{ github.event.comment.line }}
+                      diff_hunk: ${{ github.event.comment.diff_hunk }}
+                  branch_name: ${{ github.event.pull_request.head.ref }}
+                  auto_commit: true
+                  enable_resilient_push: true
+                  enable_stream_watcher: true
+                  stream_comment_id: ${{ steps.ack.outputs.comment-id }}
+                  stream_comment_type: pr_review_comment
+                  enable_execution_details: true
+                  acknowledgment_comment_id: ${{ steps.ack.outputs.comment-id }}
+                  enable_coauthor_attribution: true
+                  model: claude-opus-4-20250514

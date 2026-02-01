@@ -23,10 +23,11 @@ use progress::ProgressManager;
 use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
 use worktree_setup_git::{
     WorktreeCreateOptions, create_worktree, discover_repo, get_current_branch, get_local_branches,
-    get_main_worktree, get_repo_root,
+    get_main_worktree, get_repo_root, get_unstaged_and_untracked_files,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
+    plan_unstaged_operations,
 };
 
 fn main() {
@@ -240,6 +241,26 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Clear scanning progress bar
     scanning_bar.finish_and_clear();
+
+    // Handle copyUnstaged - check if any selected config enables it
+    let should_copy_unstaged = selected_configs.iter().any(|c| {
+        args.copy_unstaged_override()
+            .unwrap_or(c.config.copy_unstaged)
+    });
+
+    if should_copy_unstaged {
+        println!("Checking for unstaged files...");
+        let unstaged_files = get_unstaged_and_untracked_files(&repo)?;
+        if !unstaged_files.is_empty() {
+            println!(
+                "Found {} unstaged/untracked files to copy",
+                unstaged_files.len()
+            );
+            let unstaged_ops =
+                plan_unstaged_operations(&unstaged_files, &main_worktree.path, &target_path);
+            all_operations.extend(unstaged_ops);
+        }
+    }
 
     // Execute operations with progress
     for op in &all_operations {

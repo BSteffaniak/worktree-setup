@@ -109,6 +109,45 @@ pub fn get_local_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
     Ok(names)
 }
 
+/// Get the default branch name.
+///
+/// Detection order:
+/// 1. `refs/remotes/origin/HEAD` - the remote's default branch
+/// 2. `init.defaultBranch` git config - user's configured default
+/// 3. Check if `main` or `master` exist locally
+///
+/// Returns `None` if no default can be determined.
+#[must_use]
+pub fn get_default_branch(repo: &Repository) -> Option<String> {
+    // Try origin/HEAD first (most accurate for cloned repos)
+    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
+        if let Some(target) = reference.symbolic_target() {
+            // target is "refs/remotes/origin/main" -> extract "main"
+            if let Some(branch) = target.strip_prefix("refs/remotes/origin/") {
+                return Some(branch.to_string());
+            }
+        }
+    }
+
+    // Try init.defaultBranch config
+    if let Ok(config) = repo.config() {
+        if let Ok(default) = config.get_string("init.defaultBranch") {
+            return Some(default);
+        }
+    }
+
+    // Fall back to checking for common branches locally
+    if let Ok(branches) = get_local_branches(repo) {
+        for candidate in ["main", "master"] {
+            if branches.contains(&candidate.to_string()) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

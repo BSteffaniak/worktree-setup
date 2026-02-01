@@ -58,6 +58,30 @@ worktree-setup ../new-worktree --new-branch feature-x --branch master
 worktree-setup --list
 ```
 
+### Interactive Mode
+
+When creating a new worktree interactively, you'll be prompted to choose how to set it up:
+
+```
+How should the worktree be created?
+> New branch (auto-named 'my-worktree')
+  New branch (custom name)...
+  Use current branch (feature-xyz)
+  Use existing branch...
+  Detached HEAD (current commit)
+```
+
+For new branches, you'll also be asked what to base them off:
+
+```
+Base the new branch off:
+> Current HEAD
+  master
+  Enter custom branch/ref...
+```
+
+The default branch (e.g., `master`) is auto-detected from your repository.
+
 ## Configuration
 
 Create `worktree.config.toml` in your repo root (or any subdirectory):
@@ -157,19 +181,19 @@ templates = [
 
 ## CLI Flags
 
-| Flag                     | Description                                                        |
-| ------------------------ | ------------------------------------------------------------------ |
-| `<target-path>`          | Path where the worktree will be created                            |
-| `--branch <name>`        | Check out this branch, or use as start point with `--new-branch`   |
-| `--new-branch <name>`    | Create a new branch for the worktree                               |
-| `-c, --config <pattern>` | Only use configs matching this pattern (can be repeated)           |
-| `--unstaged`             | Copy unstaged/untracked files (overrides config)                   |
-| `--no-unstaged`          | Don't copy unstaged files (overrides config)                       |
-| `--no-install`           | Skip running post-setup commands                                   |
-| `--list`                 | List discovered configs and exit                                   |
-| `--non-interactive`      | Run without prompts (requires target-path)                         |
-| `--no-progress`          | Disable progress bars                                              |
-| `-v, --verbose`          | Enable debug output                                                |
+| Flag                     | Description                                                      |
+| ------------------------ | ---------------------------------------------------------------- |
+| `<target-path>`          | Path where the worktree will be created                          |
+| `--branch <name>`        | Check out this branch, or use as start point with `--new-branch` |
+| `--new-branch <name>`    | Create a new branch for the worktree                             |
+| `-c, --config <pattern>` | Only use configs matching this pattern (can be repeated)         |
+| `--unstaged`             | Copy unstaged/untracked files (overrides config)                 |
+| `--no-unstaged`          | Don't copy unstaged files (overrides config)                     |
+| `--no-install`           | Skip running post-setup commands                                 |
+| `--list`                 | List discovered configs and exit                                 |
+| `--non-interactive`      | Run without prompts (requires target-path)                       |
+| `--no-progress`          | Disable progress bars                                            |
+| `-v, --verbose`          | Enable debug output                                              |
 
 ## TypeScript Config
 

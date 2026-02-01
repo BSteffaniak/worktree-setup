@@ -48,6 +48,50 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// Prompt for which branch to base a new branch off.
+///
+/// # Arguments
+///
+/// * `default_branch` - The detected default branch (e.g., "main" or "master")
+///
+/// # Returns
+///
+/// `None` for current HEAD, `Some(branch)` for a specific branch/ref
+///
+/// # Errors
+///
+/// * If the user cancels the prompts
+fn prompt_base_branch(default_branch: Option<&str>) -> io::Result<Option<String>> {
+    let mut options = vec!["Current HEAD".to_string()];
+
+    if let Some(branch) = default_branch {
+        options.push(branch.to_string());
+    }
+
+    options.push("Enter custom branch/ref...".to_string());
+
+    let choice = Select::new()
+        .with_prompt("Base the new branch off")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    let last_idx = options.len() - 1;
+
+    if choice == 0 {
+        Ok(None) // Current HEAD
+    } else if choice == last_idx {
+        // Custom input
+        let custom: String = Input::new()
+            .with_prompt("Enter branch name or ref")
+            .interact_text()?;
+        Ok(Some(custom))
+    } else {
+        // Selected the default branch
+        Ok(Some(options[choice].clone()))
+    }
+}
+
 /// Prompt for worktree creation options.
 ///
 /// Returns `None` if the user doesn't want to create a worktree.
@@ -57,6 +101,7 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 /// * `target_path` - The path where the worktree will be created
 /// * `current_branch` - The current branch name, if on a branch (None if detached HEAD)
 /// * `branches` - List of available local branches
+/// * `default_branch` - The detected default branch (e.g., "main" or "master")
 ///
 /// # Errors
 ///
@@ -65,6 +110,7 @@ pub fn prompt_worktree_create(
     target_path: &PathBuf,
     current_branch: Option<&str>,
     branches: &[String],
+    default_branch: Option<&str>,
 ) -> io::Result<Option<WorktreeCreateOptions>> {
     let should_create = Confirm::new()
         .with_prompt(format!(
@@ -89,24 +135,22 @@ pub fn prompt_worktree_create(
     let mut option_values: Vec<&str> = Vec::new();
 
     // Option 0: Auto-named branch (git's default behavior) - ALWAYS FIRST/DEFAULT
-    options.push(format!(
-        "New branch from HEAD (auto-named '{worktree_name}')"
-    ));
+    options.push(format!("New branch (auto-named '{worktree_name}')"));
     option_values.push("auto");
 
-    // Option 1: Use current branch (only if we're on a branch)
+    // Option 1: Custom-named branch
+    options.push("New branch (custom name)...".to_string());
+    option_values.push("new");
+
+    // Option 2: Use current branch (only if we're on a branch)
     if let Some(branch) = current_branch {
         options.push(format!("Use current branch ({branch})"));
         option_values.push("current");
     }
 
-    // Option 2: Use existing branch
+    // Option 3: Use existing branch
     options.push("Use existing branch...".to_string());
     option_values.push("existing");
-
-    // Option 3: Create new branch with custom name
-    options.push("Create new branch (custom name)...".to_string());
-    option_values.push("new");
 
     // Option 4: Detached HEAD (advanced)
     options.push("Detached HEAD (current commit)".to_string());
@@ -122,9 +166,34 @@ pub fn prompt_worktree_create(
 
     let result = match selected_value {
         "auto" => {
-            // Let git create an auto-named branch (default behavior)
-            // Don't set branch, new_branch, or detach - git will create a branch named after the path
-            WorktreeCreateOptions::default()
+            // Let git create an auto-named branch, but ask what to base it off
+            let base_branch = prompt_base_branch(default_branch)?;
+
+            // For auto-named branch with a custom base, we need to explicitly
+            // create the branch with -b, otherwise git just checks out the base branch
+            if base_branch.is_some() {
+                WorktreeCreateOptions {
+                    new_branch: Some(worktree_name.to_string()),
+                    branch: base_branch,
+                    ..Default::default()
+                }
+            } else {
+                // Current HEAD - let git handle auto-naming
+                WorktreeCreateOptions::default()
+            }
+        }
+        "new" => {
+            let branch_name: String = Input::new()
+                .with_prompt("Enter new branch name")
+                .interact_text()?;
+
+            let base_branch = prompt_base_branch(default_branch)?;
+
+            WorktreeCreateOptions {
+                new_branch: Some(branch_name),
+                branch: base_branch,
+                ..Default::default()
+            }
         }
         "current" => {
             // Use the current branch
@@ -147,16 +216,6 @@ pub fn prompt_worktree_create(
                     branch: Some(branches[branch_idx].clone()),
                     ..Default::default()
                 }
-            }
-        }
-        "new" => {
-            let branch_name: String = Input::new()
-                .with_prompt("Enter new branch name")
-                .interact_text()?;
-
-            WorktreeCreateOptions {
-                new_branch: Some(branch_name),
-                ..Default::default()
             }
         }
         "detach" => WorktreeCreateOptions {

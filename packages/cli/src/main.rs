@@ -22,8 +22,8 @@ use args::Args;
 use progress::ProgressManager;
 use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
 use worktree_setup_git::{
-    WorktreeCreateOptions, create_worktree, discover_repo, get_current_branch, get_local_branches,
-    get_main_worktree, get_repo_root, get_unstaged_and_untracked_files,
+    WorktreeCreateOptions, create_worktree, discover_repo, get_current_branch, get_default_branch,
+    get_local_branches, get_main_worktree, get_repo_root, get_unstaged_and_untracked_files,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
@@ -170,10 +170,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // Interactive creation
             let current_branch = get_current_branch(&repo)?;
             let branches = get_local_branches(&repo)?;
+            let default_branch = get_default_branch(&repo);
             if let Some(options) = interactive::prompt_worktree_create(
                 &target_path,
                 current_branch.as_deref(),
                 &branches,
+                default_branch.as_deref(),
             )? {
                 println!("\nCreating worktree at {}...", target_path.display());
                 create_worktree(&repo, &target_path, &options)?;

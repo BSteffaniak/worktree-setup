@@ -62,10 +62,6 @@ pub enum ConfigError {
     #[error("Invalid config path: {}", .0.display())]
     InvalidPath(PathBuf),
 
-    /// Failed to execute glob pattern.
-    #[error("Glob pattern error: {0}")]
-    GlobError(#[from] glob::PatternError),
-
     /// IO error during config discovery.
     #[error("IO error during config discovery: {0}")]
     IoError(#[from] std::io::Error),

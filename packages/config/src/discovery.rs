@@ -1,21 +1,23 @@
 //! Configuration file discovery.
 //!
-//! Discovers worktree configuration files in a repository using git ls-files.
+//! Discovers worktree configuration files in a repository using fast parallel
+//! filesystem traversal.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::ConfigError;
 use crate::types::LoadedConfig;
 
 /// Discover all worktree configuration files in a repository.
 ///
-/// Searches for files matching `**/worktree.config.{toml,ts}` and
-/// `**/worktree.*.config.{toml,ts}` patterns.
+/// Searches for files matching `worktree.config.{toml,ts}` and
+/// `worktree.*.config.{toml,ts}` patterns using fast parallel directory traversal.
+///
+/// Automatically skips `node_modules`, `.git`, and `target` directories.
 ///
 /// # Arguments
 ///
@@ -23,76 +25,42 @@ use crate::types::LoadedConfig;
 ///
 /// # Errors
 ///
-/// * If git ls-files fails
-/// * If the output cannot be parsed
+/// * If the directory cannot be read
 pub fn discover_configs(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     log::debug!("Discovering configs in {}", repo_root.display());
 
-    // Use git ls-files to find config files (fast and respects .gitignore)
-    let output = Command::new("git")
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "*.config.toml",
-            "*.config.ts",
-        ])
-        .current_dir(repo_root)
-        .output()?;
+    let mut configs: Vec<PathBuf> = jwalk::WalkDir::new(repo_root)
+        .skip_hidden(false)
+        .sort(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            // Only files
+            if !entry.file_type().is_file() {
+                return false;
+            }
 
-    if !output.status.success() {
-        // Fall back to glob if git fails
-        return discover_configs_with_glob(repo_root);
-    }
+            // Skip node_modules, .git, target directories
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            if path_str.contains("node_modules")
+                || path_str.contains("/.git/")
+                || path_str.contains("/target/")
+            {
+                return false;
+            }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut configs: Vec<PathBuf> = stdout
-        .lines()
-        .filter(|line| {
-            let name = Path::new(line)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
             // Match worktree.config.{toml,ts} or worktree.*.config.{toml,ts}
-            name.starts_with("worktree") && name.contains(".config.")
+            let name = entry.file_name().to_string_lossy();
+            name.starts_with("worktree")
+                && name.contains(".config.")
+                && (name.ends_with(".toml") || name.ends_with(".ts"))
         })
-        .map(|line| repo_root.join(line))
+        .map(|entry| entry.path())
         .collect();
 
     configs.sort();
     log::debug!("Found {} config files", configs.len());
-
-    Ok(configs)
-}
-
-/// Fall back to glob-based discovery if git is not available.
-fn discover_configs_with_glob(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
-    log::debug!("Falling back to glob-based discovery");
-
-    let patterns = [
-        "**/worktree.config.toml",
-        "**/worktree.config.ts",
-        "**/worktree.*.config.toml",
-        "**/worktree.*.config.ts",
-    ];
-
-    let mut configs = Vec::new();
-
-    for pattern in patterns {
-        let full_pattern = repo_root.join(pattern).to_string_lossy().to_string();
-        for entry in glob::glob(&full_pattern)? {
-            if let Ok(path) = entry {
-                // Skip node_modules
-                if !path.to_string_lossy().contains("node_modules") {
-                    configs.push(path);
-                }
-            }
-        }
-    }
-
-    configs.sort();
-    configs.dedup();
 
     Ok(configs)
 }

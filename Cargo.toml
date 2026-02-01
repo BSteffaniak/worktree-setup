@@ -17,9 +17,6 @@ worktree_setup_copy = { version = "0.2.0", path = "packages/copy", default-featu
 worktree_setup_git = { version = "0.2.0", path = "packages/git", default-features = false }
 worktree_setup_operations = { version = "0.2.0", path = "packages/operations", default-features = false }
 
-# From MoosicBox
-switchy = { git = "https://github.com/MoosicBox/MoosicBox", default-features = false }
-
 # Git
 git2 = { version = "0.20.3", default-features = false }
 

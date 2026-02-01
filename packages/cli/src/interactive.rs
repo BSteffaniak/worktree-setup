@@ -53,6 +53,7 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 /// # Arguments
 ///
 /// * `default_branch` - The detected default branch (e.g., "main" or "master")
+/// * `recent_branches` - Recently checked-out branches from reflog
 ///
 /// # Returns
 ///
@@ -61,11 +62,27 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 /// # Errors
 ///
 /// * If the user cancels the prompts
-fn prompt_base_branch(default_branch: Option<&str>) -> io::Result<Option<String>> {
-    let mut options = vec!["Current HEAD".to_string()];
+fn prompt_base_branch(
+    default_branch: Option<&str>,
+    recent_branches: &[String],
+) -> io::Result<Option<String>> {
+    use std::collections::BTreeSet;
 
+    let mut options = vec!["Current HEAD".to_string()];
+    let mut seen = BTreeSet::new();
+
+    // Add default branch first
     if let Some(branch) = default_branch {
         options.push(branch.to_string());
+        seen.insert(branch.to_string());
+    }
+
+    // Add recent branches (excluding duplicates)
+    for branch in recent_branches {
+        if !seen.contains(branch) {
+            options.push(branch.clone());
+            seen.insert(branch.clone());
+        }
     }
 
     options.push("Enter custom branch/ref...".to_string());
@@ -87,7 +104,7 @@ fn prompt_base_branch(default_branch: Option<&str>) -> io::Result<Option<String>
             .interact_text()?;
         Ok(Some(custom))
     } else {
-        // Selected the default branch
+        // Selected a branch from the list
         Ok(Some(options[choice].clone()))
     }
 }
@@ -102,6 +119,7 @@ fn prompt_base_branch(default_branch: Option<&str>) -> io::Result<Option<String>
 /// * `current_branch` - The current branch name, if on a branch (None if detached HEAD)
 /// * `branches` - List of available local branches
 /// * `default_branch` - The detected default branch (e.g., "main" or "master")
+/// * `recent_branches` - Recently checked-out branches from reflog
 ///
 /// # Errors
 ///
@@ -111,6 +129,7 @@ pub fn prompt_worktree_create(
     current_branch: Option<&str>,
     branches: &[String],
     default_branch: Option<&str>,
+    recent_branches: &[String],
 ) -> io::Result<Option<WorktreeCreateOptions>> {
     let should_create = Confirm::new()
         .with_prompt(format!(
@@ -167,7 +186,7 @@ pub fn prompt_worktree_create(
     let result = match selected_value {
         "auto" => {
             // Let git create an auto-named branch, but ask what to base it off
-            let base_branch = prompt_base_branch(default_branch)?;
+            let base_branch = prompt_base_branch(default_branch, recent_branches)?;
 
             // For auto-named branch with a custom base, we need to explicitly
             // create the branch with -b, otherwise git just checks out the base branch
@@ -187,7 +206,7 @@ pub fn prompt_worktree_create(
                 .with_prompt("Enter new branch name")
                 .interact_text()?;
 
-            let base_branch = prompt_base_branch(default_branch)?;
+            let base_branch = prompt_base_branch(default_branch, recent_branches)?;
 
             WorktreeCreateOptions {
                 new_branch: Some(branch_name),

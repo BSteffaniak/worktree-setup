@@ -148,6 +148,38 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
     None
 }
 
+/// Get recently checked-out branches from the reflog.
+///
+/// Returns up to `limit` unique branch names, most recent first.
+/// Excludes detached HEAD states and duplicate entries.
+#[must_use]
+pub fn get_recent_branches(repo: &Repository, limit: usize) -> Vec<String> {
+    let mut recent = Vec::new();
+
+    if let Ok(reflog) = repo.reflog("HEAD") {
+        for entry in reflog.iter() {
+            // Reflog message format: "checkout: moving from X to Y"
+            if let Some(msg) = entry.message() {
+                if let Some(rest) = msg.strip_prefix("checkout: moving from ") {
+                    // Extract the "to" branch
+                    if let Some(to_branch) = rest.split(" to ").nth(1) {
+                        let branch = to_branch.to_string();
+                        // Deduplicate and skip detached HEAD descriptions (contain spaces)
+                        if !recent.contains(&branch) && !branch.contains(' ') {
+                            recent.push(branch);
+                            if recent.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    recent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

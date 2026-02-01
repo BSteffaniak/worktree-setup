@@ -63,6 +63,31 @@ pub struct PlannedOperation {
     pub skip_reason: Option<String>,
 }
 
+/// Resolve a path from config, handling repo-root-relative paths.
+///
+/// Paths starting with `/` are relative to the base (repo root).
+/// Other paths are relative to the config file's directory.
+///
+/// # Arguments
+///
+/// * `base` - The base path (main_worktree or target_worktree)
+/// * `config_relative_dir` - Relative path from repo root to config directory
+/// * `path` - The path from the config file
+///
+/// # Returns
+///
+/// A tuple of (resolved_path, display_path)
+fn resolve_path(base: &Path, config_relative_dir: &Path, path: &str) -> (PathBuf, String) {
+    if let Some(stripped) = path.strip_prefix('/') {
+        // Repo-root-relative path (e.g., "/.nix" -> ".nix")
+        (base.join(stripped), stripped.to_string())
+    } else {
+        // Config-relative path (e.g., "data" -> "apps/myapp/data")
+        let display = config_relative_dir.join(path);
+        (base.join(&display), display.to_string_lossy().to_string())
+    }
+}
+
 /// Plan all operations for a config without executing.
 ///
 /// This enumerates all operations that would be performed, along with file counts
@@ -145,10 +170,8 @@ where
     // Plan symlinks
     for symlink_path in &config.config.symlinks {
         current_op += 1;
-        let source = main_worktree.join(config_relative_dir).join(symlink_path);
-        let target = target_worktree.join(config_relative_dir).join(symlink_path);
-        let display_path = config_relative_dir.join(symlink_path);
-        let display_str = display_path.to_string_lossy().to_string();
+        let (source, display_str) = resolve_path(main_worktree, config_relative_dir, symlink_path);
+        let (target, _) = resolve_path(target_worktree, config_relative_dir, symlink_path);
 
         on_progress(current_op, total_ops, &display_str, None);
 
@@ -175,10 +198,8 @@ where
     // Plan explicit copies
     for copy_path in &config.config.copy {
         current_op += 1;
-        let source = main_worktree.join(config_relative_dir).join(copy_path);
-        let target = target_worktree.join(config_relative_dir).join(copy_path);
-        let display_path = config_relative_dir.join(copy_path);
-        let display_str = display_path.to_string_lossy().to_string();
+        let (source, display_str) = resolve_path(main_worktree, config_relative_dir, copy_path);
+        let (target, _) = resolve_path(target_worktree, config_relative_dir, copy_path);
 
         on_progress(current_op, total_ops, &display_str, None);
 
@@ -213,12 +234,9 @@ where
     // Plan overwrites
     for overwrite_path in &config.config.overwrite {
         current_op += 1;
-        let source = main_worktree.join(config_relative_dir).join(overwrite_path);
-        let target = target_worktree
-            .join(config_relative_dir)
-            .join(overwrite_path);
-        let display_path = config_relative_dir.join(overwrite_path);
-        let display_str = display_path.to_string_lossy().to_string();
+        let (source, display_str) =
+            resolve_path(main_worktree, config_relative_dir, overwrite_path);
+        let (target, _) = resolve_path(target_worktree, config_relative_dir, overwrite_path);
 
         on_progress(current_op, total_ops, &display_str, None);
 
@@ -251,16 +269,36 @@ where
     // Plan glob copies (each pattern counts as 1 operation for progress)
     for pattern in &config.config.copy_glob {
         current_op += 1;
-        let search_dir = main_worktree.join(config_relative_dir);
-        let full_pattern = search_dir.join(pattern).to_string_lossy().to_string();
+
+        // Handle repo-root-relative glob patterns
+        let (search_dir, display_prefix, glob_pattern) =
+            if let Some(stripped) = pattern.strip_prefix('/') {
+                (main_worktree.to_path_buf(), PathBuf::new(), stripped)
+            } else {
+                (
+                    main_worktree.join(config_relative_dir),
+                    config_relative_dir.to_path_buf(),
+                    pattern.as_str(),
+                )
+            };
+
+        let full_pattern = search_dir.join(glob_pattern).to_string_lossy().to_string();
 
         on_progress(current_op, total_ops, pattern, None);
 
         for entry in glob::glob(&full_pattern)? {
             if let Ok(source) = entry {
                 if let Ok(rel_path) = source.strip_prefix(&search_dir) {
-                    let target = target_worktree.join(config_relative_dir).join(rel_path);
-                    let display_path = config_relative_dir.join(rel_path);
+                    let target = if pattern.starts_with('/') {
+                        target_worktree.join(rel_path)
+                    } else {
+                        target_worktree.join(config_relative_dir).join(rel_path)
+                    };
+                    let display_path = if display_prefix.as_os_str().is_empty() {
+                        rel_path.to_path_buf()
+                    } else {
+                        display_prefix.join(rel_path)
+                    };
 
                     let (will_skip, skip_reason) = if target.exists() {
                         (true, Some("exists".to_string()))
@@ -287,17 +325,11 @@ where
     // Plan templates
     for template in &config.config.templates {
         current_op += 1;
-        let source = main_worktree
-            .join(config_relative_dir)
-            .join(&template.source);
-        let target = target_worktree
-            .join(config_relative_dir)
-            .join(&template.target);
-        let display_path = format!(
-            "{} -> {}",
-            config_relative_dir.join(&template.source).display(),
-            config_relative_dir.join(&template.target).display()
-        );
+        let (source, source_display) =
+            resolve_path(main_worktree, config_relative_dir, &template.source);
+        let (target, target_display) =
+            resolve_path(target_worktree, config_relative_dir, &template.target);
+        let display_path = format!("{source_display} -> {target_display}");
 
         on_progress(current_op, total_ops, &display_path, None);
 
@@ -531,5 +563,144 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].operation_type, OperationType::Unstaged);
         assert_eq!(ops[1].operation_type, OperationType::Unstaged);
+    }
+
+    #[test]
+    fn test_plan_operations_repo_root_relative_paths() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create repo structure:
+        // main_dir/
+        //   .nix/
+        //     flake.nix
+        //   .envrc
+        //   apps/
+        //     myapp/
+        //       worktree.config.toml (config is here)
+
+        // Create root-level files
+        fs::create_dir_all(main_dir.path().join(".nix")).unwrap();
+        fs::write(main_dir.path().join(".nix/flake.nix"), "{}").unwrap();
+        fs::write(main_dir.path().join(".envrc"), "use flake").unwrap();
+
+        // Create app directory structure
+        let app_dir = main_dir.path().join("apps/myapp");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Config in subdirectory referencing root files with /
+        let config = LoadedConfig {
+            config: Config {
+                copy: vec!["/.nix".to_string(), "/.envrc".to_string()],
+                ..Default::default()
+            },
+            config_path: app_dir.join("worktree.config.toml"),
+            config_dir: app_dir.clone(),
+            relative_path: "apps/myapp/worktree.config.toml".to_string(),
+        };
+        let options = ApplyConfigOptions::default();
+
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 2);
+
+        // Check .nix directory
+        assert_eq!(ops[0].display_path, ".nix");
+        assert_eq!(ops[0].source, main_dir.path().join(".nix"));
+        assert_eq!(ops[0].target, target_dir.path().join(".nix"));
+        assert!(ops[0].is_directory);
+        assert!(!ops[0].will_skip);
+
+        // Check .envrc file
+        assert_eq!(ops[1].display_path, ".envrc");
+        assert_eq!(ops[1].source, main_dir.path().join(".envrc"));
+        assert_eq!(ops[1].target, target_dir.path().join(".envrc"));
+        assert!(!ops[1].is_directory);
+        assert!(!ops[1].will_skip);
+    }
+
+    #[test]
+    fn test_plan_operations_mixed_paths() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create repo structure with both root and app-level files
+        fs::write(main_dir.path().join(".envrc"), "use flake").unwrap();
+
+        let app_dir = main_dir.path().join("apps/myapp");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("local.config"), "app config").unwrap();
+
+        // Config with mixed paths: one root-relative, one config-relative
+        let config = LoadedConfig {
+            config: Config {
+                copy: vec![
+                    "/.envrc".to_string(),      // root-relative
+                    "local.config".to_string(), // config-relative
+                ],
+                ..Default::default()
+            },
+            config_path: app_dir.join("worktree.config.toml"),
+            config_dir: app_dir.clone(),
+            relative_path: "apps/myapp/worktree.config.toml".to_string(),
+        };
+        let options = ApplyConfigOptions::default();
+
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 2);
+
+        // Root-relative path: /.envrc -> .envrc
+        assert_eq!(ops[0].display_path, ".envrc");
+        assert_eq!(ops[0].source, main_dir.path().join(".envrc"));
+        assert_eq!(ops[0].target, target_dir.path().join(".envrc"));
+
+        // Config-relative path: local.config -> apps/myapp/local.config
+        assert_eq!(ops[1].display_path, "apps/myapp/local.config");
+        assert_eq!(ops[1].source, app_dir.join("local.config"));
+        assert_eq!(
+            ops[1].target,
+            target_dir.path().join("apps/myapp/local.config")
+        );
+    }
+
+    #[test]
+    fn test_plan_operations_template_with_root_paths() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create template at root
+        fs::write(main_dir.path().join(".env.template"), "KEY=value").unwrap();
+
+        let app_dir = main_dir.path().join("apps/myapp");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                templates: vec![worktree_setup_config::TemplateMapping {
+                    source: "/.env.template".to_string(), // root-relative source
+                    target: ".env.local".to_string(),     // config-relative target
+                }],
+                ..Default::default()
+            },
+            config_path: app_dir.join("worktree.config.toml"),
+            config_dir: app_dir.clone(),
+            relative_path: "apps/myapp/worktree.config.toml".to_string(),
+        };
+        let options = ApplyConfigOptions::default();
+
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].operation_type, OperationType::Template);
+        assert_eq!(
+            ops[0].display_path,
+            ".env.template -> apps/myapp/.env.local"
+        );
+        assert_eq!(ops[0].source, main_dir.path().join(".env.template"));
+        assert_eq!(
+            ops[0].target,
+            target_dir.path().join("apps/myapp/.env.local")
+        );
     }
 }

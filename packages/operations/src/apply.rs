@@ -12,11 +12,10 @@ use worktree_setup_git::{get_unstaged_and_untracked_files, open_repo};
 
 use crate::OperationResult;
 use crate::copy::{
-    copy_directory_with_progress, copy_file, copy_file_with_progress, overwrite_file,
-    overwrite_file_with_progress,
+    copy_directory_with_progress, copy_file_with_progress, overwrite_file_with_progress,
 };
 use crate::error::OperationError;
-use crate::plan::{OperationType, PlannedOperation};
+use crate::plan::{OperationType, PlannedOperation, plan_operations, plan_unstaged_operations};
 use crate::symlink::create_symlink;
 
 /// Record of a single file operation.
@@ -52,6 +51,8 @@ pub struct ApplyResult {
 
 /// Apply a loaded configuration to a target worktree.
 ///
+/// This is a convenience wrapper around `plan_operations` + `execute_operation`.
+///
 /// # Arguments
 ///
 /// * `config` - The loaded configuration
@@ -77,96 +78,26 @@ pub fn apply_config(
 
     let mut result = ApplyResult::default();
 
-    // Calculate relative path from repo root to config directory
-    let config_relative_dir = config
-        .config_dir
-        .strip_prefix(main_worktree)
-        .unwrap_or(&config.config_dir);
+    // Plan and execute regular operations
+    let operations = plan_operations(config, main_worktree, target_worktree, options)?;
 
-    // Process symlinks
-    for symlink_path in &config.config.symlinks {
-        let source = main_worktree.join(config_relative_dir).join(symlink_path);
-        let target = target_worktree.join(config_relative_dir).join(symlink_path);
-        let display_path = config_relative_dir.join(symlink_path);
-
-        let op_result = create_symlink(&source, &target)?;
-        result.symlinks.push(OperationRecord {
-            path: display_path.to_string_lossy().to_string(),
+    for op in &operations {
+        let op_result = execute_operation(op, |_, _| {})?;
+        let record = OperationRecord {
+            path: op.display_path.clone(),
             result: op_result,
-        });
-    }
+        };
 
-    // Process explicit copies
-    for copy_path in &config.config.copy {
-        let source = main_worktree.join(config_relative_dir).join(copy_path);
-        let target = target_worktree.join(config_relative_dir).join(copy_path);
-        let display_path = config_relative_dir.join(copy_path);
-
-        let op_result = copy_file(&source, &target)?;
-        result.copies.push(OperationRecord {
-            path: display_path.to_string_lossy().to_string(),
-            result: op_result,
-        });
-    }
-
-    // Process overwrites
-    for overwrite_path in &config.config.overwrite {
-        let source = main_worktree.join(config_relative_dir).join(overwrite_path);
-        let target = target_worktree
-            .join(config_relative_dir)
-            .join(overwrite_path);
-        let display_path = config_relative_dir.join(overwrite_path);
-
-        let op_result = overwrite_file(&source, &target)?;
-        result.overwrites.push(OperationRecord {
-            path: display_path.to_string_lossy().to_string(),
-            result: op_result,
-        });
-    }
-
-    // Process glob copies
-    for pattern in &config.config.copy_glob {
-        let search_dir = main_worktree.join(config_relative_dir);
-        let full_pattern = search_dir.join(pattern).to_string_lossy().to_string();
-
-        for entry in glob::glob(&full_pattern)? {
-            if let Ok(source) = entry {
-                if let Ok(rel_path) = source.strip_prefix(&search_dir) {
-                    let target = target_worktree.join(config_relative_dir).join(rel_path);
-                    let display_path = config_relative_dir.join(rel_path);
-
-                    let op_result = copy_file(&source, &target)?;
-                    result.copies.push(OperationRecord {
-                        path: display_path.to_string_lossy().to_string(),
-                        result: op_result,
-                    });
-                }
-            }
+        match op.operation_type {
+            OperationType::Symlink => result.symlinks.push(record),
+            OperationType::Copy | OperationType::CopyGlob => result.copies.push(record),
+            OperationType::Overwrite => result.overwrites.push(record),
+            OperationType::Template => result.templates.push(record),
+            OperationType::Unstaged => result.unstaged.push(record),
         }
     }
 
-    // Process templates
-    for template in &config.config.templates {
-        let source = main_worktree
-            .join(config_relative_dir)
-            .join(&template.source);
-        let target = target_worktree
-            .join(config_relative_dir)
-            .join(&template.target);
-        let display_path = format!(
-            "{} -> {}",
-            config_relative_dir.join(&template.source).display(),
-            config_relative_dir.join(&template.target).display()
-        );
-
-        let op_result = copy_file(&source, &target)?;
-        result.templates.push(OperationRecord {
-            path: display_path,
-            result: op_result,
-        });
-    }
-
-    // Process unstaged files
+    // Handle unstaged files separately (requires git operations)
     let should_copy_unstaged = options.copy_unstaged.unwrap_or(config.config.copy_unstaged);
 
     if should_copy_unstaged {
@@ -174,19 +105,14 @@ pub fn apply_config(
 
         let repo = open_repo(main_worktree)?;
         let files = get_unstaged_and_untracked_files(&repo)?;
+        let unstaged_ops = plan_unstaged_operations(&files, main_worktree, target_worktree);
 
-        for file in files {
-            let source = main_worktree.join(&file);
-            let target = target_worktree.join(&file);
-
-            // Only copy if source still exists (might have been deleted)
-            if source.exists() {
-                let op_result = overwrite_file(&source, &target)?;
-                result.unstaged.push(OperationRecord {
-                    path: file,
-                    result: op_result,
-                });
-            }
+        for op in &unstaged_ops {
+            let op_result = execute_operation(op, |_, _| {})?;
+            result.unstaged.push(OperationRecord {
+                path: op.display_path.clone(),
+                result: op_result,
+            });
         }
     }
 

@@ -99,18 +99,52 @@ postSetup = [
 ]
 ```
 
+### Repo-Root-Relative Paths
+
+By default, paths in the config are relative to the config file's directory. If you need to reference files at the repository root from a config in a subdirectory, prefix the path with `/`:
+
+```toml
+# Config in apps/frontend/worktree.config.toml
+
+# These paths are relative to apps/frontend/
+copy = [
+    ".env.local",           # -> apps/frontend/.env.local
+    "config/settings.json", # -> apps/frontend/config/settings.json
+]
+
+# These paths are relative to the repo root
+symlinks = [
+    "/.nix",                # -> .nix (at repo root)
+    "/.envrc",              # -> .envrc (at repo root)
+]
+```
+
+This is especially useful for:
+- Referencing root-level nix/direnv configuration from app-specific configs
+- Symlinking shared directories that live at the repo root
+- Templates that are stored at the root but used by multiple apps
+
+Templates also support mixed paths:
+```toml
+templates = [
+    { source = "/.env.template", target = ".env.local" },  # source from root, target in config dir
+]
+```
+
 ## Config Reference
 
-| Field          | Type     | Description                                        |
-| -------------- | -------- | -------------------------------------------------- |
-| `description`  | string   | Label shown during config selection                |
-| `symlinks`     | string[] | Paths to symlink from master worktree              |
-| `copy`         | string[] | Paths to copy (skipped if target exists)           |
-| `overwrite`    | string[] | Paths to copy (always overwrites)                  |
-| `copyGlob`     | string[] | Glob patterns to copy                              |
-| `copyUnstaged` | bool     | Copy modified/untracked files from master worktree |
-| `templates`    | array    | Copy source to target if target doesn't exist      |
-| `postSetup`    | string[] | Commands to run after setup                        |
+| Field          | Type     | Description                                                   |
+| -------------- | -------- | ------------------------------------------------------------- |
+| `description`  | string   | Label shown during config selection                           |
+| `symlinks`     | string[] | Paths to symlink from master worktree                         |
+| `copy`         | string[] | Paths to copy (skipped if target exists)                      |
+| `overwrite`    | string[] | Paths to copy (always overwrites)                             |
+| `copyGlob`     | string[] | Glob patterns to copy                                         |
+| `copyUnstaged` | bool     | Copy modified/untracked files from master worktree            |
+| `templates`    | array    | Copy source to target if target doesn't exist                 |
+| `postSetup`    | string[] | Commands to run after setup                                   |
+
+**Path resolution:** All paths are relative to the config file's directory by default. Prefix with `/` for repo-root-relative paths (e.g., `"/.envrc"` → `<repo-root>/.envrc`).
 
 ## CLI Flags
 

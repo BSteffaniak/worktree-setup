@@ -120,11 +120,13 @@ symlinks = [
 ```
 
 This is especially useful for:
+
 - Referencing root-level nix/direnv configuration from app-specific configs
 - Symlinking shared directories that live at the repo root
 - Templates that are stored at the root but used by multiple apps
 
 Templates also support mixed paths:
+
 ```toml
 templates = [
     { source = "/.env.template", target = ".env.local" },  # source from root, target in config dir
@@ -133,16 +135,16 @@ templates = [
 
 ## Config Reference
 
-| Field          | Type     | Description                                                   |
-| -------------- | -------- | ------------------------------------------------------------- |
-| `description`  | string   | Label shown during config selection                           |
-| `symlinks`     | string[] | Paths to symlink from master worktree                         |
-| `copy`         | string[] | Paths to copy (skipped if target exists)                      |
-| `overwrite`    | string[] | Paths to copy (always overwrites)                             |
-| `copyGlob`     | string[] | Glob patterns to copy                                         |
-| `copyUnstaged` | bool     | Copy modified/untracked files from master worktree            |
-| `templates`    | array    | Copy source to target if target doesn't exist                 |
-| `postSetup`    | string[] | Commands to run after setup                                   |
+| Field          | Type     | Description                                        |
+| -------------- | -------- | -------------------------------------------------- |
+| `description`  | string   | Label shown during config selection                |
+| `symlinks`     | string[] | Paths to symlink from master worktree              |
+| `copy`         | string[] | Paths to copy (skipped if target exists)           |
+| `overwrite`    | string[] | Paths to copy (always overwrites)                  |
+| `copyGlob`     | string[] | Glob patterns to copy                              |
+| `copyUnstaged` | bool     | Copy modified/untracked files from master worktree |
+| `templates`    | array    | Copy source to target if target doesn't exist      |
+| `postSetup`    | string[] | Commands to run after setup                        |
 
 **Path resolution:** All paths are relative to the config file's directory by default. Prefix with `/` for repo-root-relative paths (e.g., `"/.envrc"` → `<repo-root>/.envrc`).
 
@@ -180,24 +182,73 @@ Requires [bun](https://bun.sh) or [deno](https://deno.land) to be installed.
 
 ## Multiple Configs
 
-You can have multiple config files in different directories. The tool discovers all of them and lets you choose which to apply.
+### Discovery
+
+The tool discovers all `worktree.config.{toml,ts}` and `worktree.*.config.{toml,ts}` files in your repo:
 
 ```
 my-monorepo/
-├── worktree.config.toml        # Root config
-├── packages/
-│   ├── frontend/
-│   │   └── worktree.config.toml  # Frontend-specific
-│   └── backend/
-│       └── worktree.config.toml  # Backend-specific
+├── worktree.config.toml           # Shared setup
+├── worktree.local.config.ts       # Personal setup (gitignored)
+├── apps/
+│   ├── web/
+│   │   └── worktree.config.ts     # Web-specific
+│   └── api/
+│       └── worktree.config.ts     # API-specific
 ```
+
+### Composing Configs
+
+Select multiple configs during setup and they all get applied. This lets you layer different concerns:
+
+| Config                     | Purpose                                              | Tracked |
+| -------------------------- | ---------------------------------------------------- | ------- |
+| `worktree.config.ts`       | Team defaults (symlinks, env files, post-setup)      | ✓       |
+| `worktree.local.config.ts` | Personal setup (editor configs, copy unstaged files) | ✗       |
+
+**Example workflow:**
+
+1. Select both configs when prompted
+2. First config symlinks `node_modules` and copies `.env` template
+3. Second config copies your uncommitted work-in-progress files
+
+In a monorepo, you might also have app-specific configs:
 
 ```bash
 $ worktree-setup --list
-Found 3 configs:
-  • worktree.config.toml - Root workspace
-  • packages/frontend/worktree.config.toml - Frontend workspace
-  • packages/backend/worktree.config.toml - Backend workspace
+Found 4 configs:
+  • worktree.config.toml - Shared workspace setup
+  • worktree.local.config.ts - Personal configuration
+  • apps/web/worktree.config.ts - Web app
+  • apps/api/worktree.config.ts - API server
+```
+
+Select the shared config plus whichever app(s) you're working on.
+
+### Gitignore Pattern
+
+To keep personal configs untracked while preserving team configs:
+
+```gitignore
+# Ignore personal/machine-specific configs
+worktree.*.config.ts
+worktree.*.config.toml
+
+# Keep the main config tracked
+!worktree.config.ts
+!worktree.config.toml
+```
+
+### Filtering Configs
+
+Use `-c/--config` to filter by pattern instead of interactive selection:
+
+```bash
+# Only apply configs matching "web"
+worktree-setup ../new-wt -c web
+
+# Apply multiple specific configs
+worktree-setup ../new-wt -c shared -c web
 ```
 
 ## How operations work

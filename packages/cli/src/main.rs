@@ -60,71 +60,73 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     output::print_repo_info(&repo_root.to_string_lossy());
     println!();
 
-    // Discover configs
+    // Discover and load configs
     let config_paths = discover_configs(&repo_root)?;
 
-    if config_paths.is_empty() {
-        println!("No worktree.config.toml or worktree.config.ts files found.");
-        println!("Create a worktree.config.toml file to define your setup configuration.");
-        return Ok(());
-    }
-
-    // Load all configs
     let mut all_configs: Vec<LoadedConfig> = Vec::new();
-    for path in config_paths {
-        match load_config(&path, &repo_root) {
-            Ok(config) => all_configs.push(config),
-            Err(e) => {
-                output::print_warning(&format!("Failed to load {}: {}", path.display(), e));
+    if config_paths.is_empty() {
+        println!("No config files found. Creating worktree without setup.\n");
+    } else {
+        // Load all configs
+        for path in config_paths {
+            match load_config(&path, &repo_root) {
+                Ok(config) => all_configs.push(config),
+                Err(e) => {
+                    output::print_warning(&format!("Failed to load {}: {}", path.display(), e));
+                }
             }
+        }
+
+        if all_configs.is_empty() {
+            output::print_warning(
+                "All config files failed to load. Creating worktree without setup.\n",
+            );
+        } else {
+            // Print config list
+            let config_display: Vec<(String, String)> = all_configs
+                .iter()
+                .map(|c| (c.relative_path.clone(), c.config.description.clone()))
+                .collect();
+            output::print_config_list(&config_display);
         }
     }
 
-    if all_configs.is_empty() {
-        output::print_error("No valid configurations found.");
-        return Ok(());
-    }
-
-    // Print config list
-    let config_display: Vec<(String, String)> = all_configs
-        .iter()
-        .map(|c| (c.relative_path.clone(), c.config.description.clone()))
-        .collect();
-    output::print_config_list(&config_display);
-
-    // If --list, exit
+    // If --list, exit (after printing any discovered configs above)
     if args.list {
         return Ok(());
     }
 
-    // Select configs
-    let selected_indices = if !args.configs.is_empty() {
-        // Filter by provided patterns
-        all_configs
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                args.configs.iter().any(|p| {
-                    c.relative_path.contains(p) || c.config_path.to_string_lossy().contains(p)
-                })
-            })
-            .map(|(i, _)| i)
-            .collect()
-    } else if args.non_interactive {
-        // Use all configs in non-interactive mode
-        (0..all_configs.len()).collect()
+    // Select configs (only if we have valid configs to select from)
+    let selected_configs: Vec<&LoadedConfig> = if all_configs.is_empty() {
+        Vec::new()
     } else {
-        // Interactive selection
-        interactive::select_configs(&all_configs)?
+        let selected_indices = if !args.configs.is_empty() {
+            // Filter by provided patterns
+            all_configs
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    args.configs.iter().any(|p| {
+                        c.relative_path.contains(p) || c.config_path.to_string_lossy().contains(p)
+                    })
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else if args.non_interactive {
+            // Use all configs in non-interactive mode
+            (0..all_configs.len()).collect()
+        } else {
+            // Interactive selection
+            interactive::select_configs(&all_configs)?
+        };
+
+        if selected_indices.is_empty() {
+            println!("No configs selected. Exiting.");
+            return Ok(());
+        }
+
+        selected_indices.iter().map(|&i| &all_configs[i]).collect()
     };
-
-    if selected_indices.is_empty() {
-        println!("No configs selected. Exiting.");
-        return Ok(());
-    }
-
-    let selected_configs: Vec<&LoadedConfig> =
-        selected_indices.iter().map(|&i| &all_configs[i]).collect();
 
     // Get target path
     let target_path = if let Some(ref path) = args.target_path {
@@ -195,159 +197,162 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("\nSetting up worktree: {}", target_path.display());
-    println!("Main worktree: {}\n", main_worktree.path.display());
+    // Apply config setup operations (only if configs were selected)
+    if !selected_configs.is_empty() {
+        println!("\nSetting up worktree: {}", target_path.display());
+        println!("Main worktree: {}\n", main_worktree.path.display());
 
-    // Create progress manager
-    let progress_mgr = ProgressManager::new(args.should_show_progress());
+        // Create progress manager
+        let progress_mgr = ProgressManager::new(args.should_show_progress());
 
-    // Build options
-    let options = ApplyConfigOptions {
-        copy_unstaged: args.copy_unstaged_override(),
-    };
-
-    // Calculate total operations across all configs for scanning progress
-    let config_op_counts: Vec<usize> = selected_configs
-        .iter()
-        .map(|c| {
-            c.config.symlinks.len()
-                + c.config.copy.len()
-                + c.config.overwrite.len()
-                + c.config.copy_glob.len()
-                + c.config.templates.len()
-        })
-        .collect();
-    let total_ops: usize = config_op_counts.iter().sum();
-
-    // Create scanning progress bar
-    let scanning_bar = progress_mgr.create_scanning_bar(total_ops as u64);
-
-    // Plan all operations across all configs with progress
-    let mut all_operations = Vec::new();
-    let mut offset = 0usize;
-    for (config, &config_count) in selected_configs.iter().zip(&config_op_counts) {
-        let current_offset = offset;
-        let ops = plan_operations_with_progress(
-            config,
-            &main_worktree.path,
-            &target_path,
-            &options,
-            &|current, _total, path, file_count| {
-                scanning_bar.set_position((current_offset + current) as u64);
-                match file_count {
-                    Some(n) => scanning_bar.set_message(format!("{path} ({n} files)")),
-                    None => scanning_bar.set_message(path.to_string()),
-                }
-            },
-        )?;
-        offset += config_count;
-        all_operations.extend(ops);
-    }
-
-    // Clear scanning progress bar
-    scanning_bar.finish_and_clear();
-
-    // Handle copyUnstaged - check if any selected config enables it
-    let should_copy_unstaged = selected_configs.iter().any(|c| {
-        args.copy_unstaged_override()
-            .unwrap_or(c.config.copy_unstaged)
-    });
-
-    if should_copy_unstaged {
-        println!("Checking for unstaged files...");
-        let unstaged_files = get_unstaged_and_untracked_files(&repo)?;
-        if !unstaged_files.is_empty() {
-            println!(
-                "Found {} unstaged/untracked files to copy",
-                unstaged_files.len()
-            );
-            let unstaged_ops =
-                plan_unstaged_operations(&unstaged_files, &main_worktree.path, &target_path);
-            all_operations.extend(unstaged_ops);
-        }
-    }
-
-    // Execute operations with progress
-    for op in &all_operations {
-        if op.will_skip {
-            // Print skipped status
-            let reason = op.skip_reason.as_deref().unwrap_or("skipped");
-            progress_mgr.print_result(&op.display_path, reason, false);
-            continue;
-        }
-
-        // Determine if this is a directory operation that needs a progress bar
-        let needs_progress_bar = op.is_directory && op.file_count > 1;
-
-        if needs_progress_bar {
-            // Create and show progress bar for directory operations
-            let bar = progress_mgr.create_file_bar(&op.display_path, op.file_count);
-
-            let result = execute_operation(op, |completed, _total| {
-                bar.set_position(completed);
-            })?;
-
-            // Clear the progress bar
-            bar.finish_and_clear();
-
-            // Print the final result with file count
-            let result_str = format_result_string(result, op.operation_type);
-            progress_mgr.print_result_with_count(&op.display_path, &result_str, op.file_count);
-        } else {
-            // Single file or symlink - just execute and print result
-            let result = execute_operation(op, |_, _| {})?;
-            let result_str = format_result_string(result, op.operation_type);
-            progress_mgr.print_result(&op.display_path, &result_str, true);
-        }
-    }
-
-    // Clear any remaining progress bars
-    progress_mgr.clear();
-
-    println!();
-
-    // Collect all post-setup commands
-    let all_post_setup: Vec<&str> = selected_configs
-        .iter()
-        .flat_map(|c| c.config.post_setup.iter().map(String::as_str))
-        .collect();
-
-    // Deduplicate commands
-    let mut unique_commands: Vec<&str> = Vec::new();
-    for cmd in all_post_setup {
-        if !unique_commands.contains(&cmd) {
-            unique_commands.push(cmd);
-        }
-    }
-
-    // Run post-setup commands
-    if !unique_commands.is_empty() && args.should_run_install() {
-        let should_run = if args.non_interactive {
-            true
-        } else {
-            interactive::prompt_run_install(true)?
+        // Build options
+        let options = ApplyConfigOptions {
+            copy_unstaged: args.copy_unstaged_override(),
         };
 
-        if should_run {
-            println!("Running post-setup commands:");
-            for cmd in &unique_commands {
-                output::print_command(cmd);
+        // Calculate total operations across all configs for scanning progress
+        let config_op_counts: Vec<usize> = selected_configs
+            .iter()
+            .map(|c| {
+                c.config.symlinks.len()
+                    + c.config.copy.len()
+                    + c.config.overwrite.len()
+                    + c.config.copy_glob.len()
+                    + c.config.templates.len()
+            })
+            .collect();
+        let total_ops: usize = config_op_counts.iter().sum();
 
-                let mut child = Command::new("sh")
-                    .args(["-c", cmd])
-                    .current_dir(&target_path)
-                    .stdin(std::process::Stdio::inherit())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()?;
+        // Create scanning progress bar
+        let scanning_bar = progress_mgr.create_scanning_bar(total_ops as u64);
 
-                let status = child.wait()?;
+        // Plan all operations across all configs with progress
+        let mut all_operations = Vec::new();
+        let mut offset = 0usize;
+        for (config, &config_count) in selected_configs.iter().zip(&config_op_counts) {
+            let current_offset = offset;
+            let ops = plan_operations_with_progress(
+                config,
+                &main_worktree.path,
+                &target_path,
+                &options,
+                &|current, _total, path, file_count| {
+                    scanning_bar.set_position((current_offset + current) as u64);
+                    match file_count {
+                        Some(n) => scanning_bar.set_message(format!("{path} ({n} files)")),
+                        None => scanning_bar.set_message(path.to_string()),
+                    }
+                },
+            )?;
+            offset += config_count;
+            all_operations.extend(ops);
+        }
 
-                if !status.success() {
-                    output::print_warning(&format!("Command failed: {cmd}"));
-                }
+        // Clear scanning progress bar
+        scanning_bar.finish_and_clear();
+
+        // Handle copyUnstaged - check if any selected config enables it
+        let should_copy_unstaged = selected_configs.iter().any(|c| {
+            args.copy_unstaged_override()
+                .unwrap_or(c.config.copy_unstaged)
+        });
+
+        if should_copy_unstaged {
+            println!("Checking for unstaged files...");
+            let unstaged_files = get_unstaged_and_untracked_files(&repo)?;
+            if !unstaged_files.is_empty() {
+                println!(
+                    "Found {} unstaged/untracked files to copy",
+                    unstaged_files.len()
+                );
+                let unstaged_ops =
+                    plan_unstaged_operations(&unstaged_files, &main_worktree.path, &target_path);
+                all_operations.extend(unstaged_ops);
             }
-            println!();
+        }
+
+        // Execute operations with progress
+        for op in &all_operations {
+            if op.will_skip {
+                // Print skipped status
+                let reason = op.skip_reason.as_deref().unwrap_or("skipped");
+                progress_mgr.print_result(&op.display_path, reason, false);
+                continue;
+            }
+
+            // Determine if this is a directory operation that needs a progress bar
+            let needs_progress_bar = op.is_directory && op.file_count > 1;
+
+            if needs_progress_bar {
+                // Create and show progress bar for directory operations
+                let bar = progress_mgr.create_file_bar(&op.display_path, op.file_count);
+
+                let result = execute_operation(op, |completed, _total| {
+                    bar.set_position(completed);
+                })?;
+
+                // Clear the progress bar
+                bar.finish_and_clear();
+
+                // Print the final result with file count
+                let result_str = format_result_string(result, op.operation_type);
+                progress_mgr.print_result_with_count(&op.display_path, &result_str, op.file_count);
+            } else {
+                // Single file or symlink - just execute and print result
+                let result = execute_operation(op, |_, _| {})?;
+                let result_str = format_result_string(result, op.operation_type);
+                progress_mgr.print_result(&op.display_path, &result_str, true);
+            }
+        }
+
+        // Clear any remaining progress bars
+        progress_mgr.clear();
+
+        println!();
+
+        // Collect all post-setup commands
+        let all_post_setup: Vec<&str> = selected_configs
+            .iter()
+            .flat_map(|c| c.config.post_setup.iter().map(String::as_str))
+            .collect();
+
+        // Deduplicate commands
+        let mut unique_commands: Vec<&str> = Vec::new();
+        for cmd in all_post_setup {
+            if !unique_commands.contains(&cmd) {
+                unique_commands.push(cmd);
+            }
+        }
+
+        // Run post-setup commands
+        if !unique_commands.is_empty() && args.should_run_install() {
+            let should_run = if args.non_interactive {
+                true
+            } else {
+                interactive::prompt_run_install(true)?
+            };
+
+            if should_run {
+                println!("Running post-setup commands:");
+                for cmd in &unique_commands {
+                    output::print_command(cmd);
+
+                    let mut child = Command::new("sh")
+                        .args(["-c", cmd])
+                        .current_dir(&target_path)
+                        .stdin(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::inherit())
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn()?;
+
+                    let status = child.wait()?;
+
+                    if !status.success() {
+                        output::print_warning(&format!("Command failed: {cmd}"));
+                    }
+                }
+                println!();
+            }
         }
     }
 

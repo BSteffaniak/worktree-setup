@@ -18,10 +18,10 @@ worktree_setup_git = { version = "0.2.0", path = "packages/git", default-feature
 worktree_setup_operations = { version = "0.2.0", path = "packages/operations", default-features = false }
 
 # Git
-git2 = { version = "0.20.3", default-features = false }
+git2 = { version = "0.20.4", default-features = false }
 
 # CLI
-clap = { version = "4.5.37", default-features = false, features = [
+clap = { version = "4.5.59", default-features = false, features = [
   "derive",
   "std",
   "help",
@@ -29,32 +29,32 @@ clap = { version = "4.5.37", default-features = false, features = [
   "error-context",
 ] }
 dialoguer = { version = "0.12.0", default-features = false }
-indicatif = { version = "0.17.11", default-features = false }
-colored = { version = "3.0.0", default-features = false }
+indicatif = { version = "0.18.4", default-features = false }
+colored = { version = "3.1.1", default-features = false }
 
 # Serialization
-serde = { version = "1.0.219", default-features = false, features = ["derive"] }
-serde_json = { version = "1.0.140", default-features = false, features = [
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.149", default-features = false, features = [
   "std",
 ] }
-toml = { version = "0.8.22", default-features = false, features = ["parse"] }
+toml = { version = "1.0.2", default-features = false, features = ["parse"] }
 
 # Error handling
-thiserror = { version = "2.0.17", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
 
 # File operations
-glob = { version = "0.3.2", default-features = false }
+glob = { version = "0.3.3", default-features = false }
 jwalk = { version = "0.8.1", default-features = false }
 path-clean = { version = "1.0.1", default-features = false }
-rayon = { version = "1.10.0", default-features = false }
-reflink-copy = { version = "0.1.20", default-features = false }
+rayon = { version = "1.11.0", default-features = false }
+reflink-copy = { version = "0.1.28", default-features = false }
 
 # Logging
-log = { version = "0.4.27", default-features = false }
+log = { version = "0.4.29", default-features = false }
 pretty_env_logger = { version = "0.5.0", default-features = false }
 
 # Testing
-tempfile = { version = "3.19.1", default-features = false }
+tempfile = { version = "3.25.0", default-features = false }
 
 [profile.release]
 codegen-units = 1

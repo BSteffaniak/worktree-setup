@@ -258,3 +258,74 @@ pub fn prompt_run_install(default: bool) -> io::Result<bool> {
         .default(default)
         .interact()?)
 }
+
+/// Result of the setup operations prompt.
+#[derive(Debug, Clone)]
+pub struct SetupOperationChoices {
+    /// Whether to run file operations (symlinks, copies, templates).
+    pub run_files: bool,
+    /// Whether to run post-setup commands.
+    pub run_post_setup: bool,
+}
+
+/// Prompt the user to select which setup operations to run.
+///
+/// Shows an interactive checklist with file operations and post-setup commands.
+/// Items are pre-checked based on defaults (which can be influenced by CLI flags).
+///
+/// # Arguments
+///
+/// * `is_secondary_worktree` - Whether the target is a secondary worktree
+///   (file operations are hidden when `false`)
+/// * `default_files` - Default checked state for file operations
+/// * `default_post_setup` - Default checked state for post-setup commands
+/// * `post_setup_commands` - List of post-setup commands (shown inline for context)
+///
+/// # Errors
+///
+/// * If the user cancels the prompt
+pub fn prompt_setup_operations(
+    is_secondary_worktree: bool,
+    default_files: bool,
+    default_post_setup: bool,
+    post_setup_commands: &[&str],
+) -> io::Result<SetupOperationChoices> {
+    let mut items: Vec<String> = Vec::new();
+    let mut defaults: Vec<bool> = Vec::new();
+
+    // Track which index maps to which operation
+    let mut file_ops_index: Option<usize> = None;
+    let mut post_setup_index: Option<usize> = None;
+
+    if is_secondary_worktree {
+        file_ops_index = Some(items.len());
+        items.push("Apply file operations (symlinks, copies, templates)".to_string());
+        defaults.push(default_files);
+    }
+
+    if !post_setup_commands.is_empty() {
+        post_setup_index = Some(items.len());
+        let cmds_display = post_setup_commands.join(", ");
+        items.push(format!("Run post-setup commands ({cmds_display})"));
+        defaults.push(default_post_setup);
+    }
+
+    if items.is_empty() {
+        // Nothing to prompt for
+        return Ok(SetupOperationChoices {
+            run_files: false,
+            run_post_setup: false,
+        });
+    }
+
+    let selections = MultiSelect::new()
+        .with_prompt("Select what to run")
+        .items(&items)
+        .defaults(&defaults)
+        .interact()?;
+
+    Ok(SetupOperationChoices {
+        run_files: file_ops_index.is_some_and(|i| selections.contains(&i)),
+        run_post_setup: post_setup_index.is_some_and(|i| selections.contains(&i)),
+    })
+}

@@ -47,7 +47,11 @@ pub fn discover_repo(path: &Path) -> Result<Repository, GitError> {
     })
 }
 
-/// Get the root directory of a repository.
+/// Get the root directory of the main worktree for a repository.
+///
+/// This always returns the main worktree root, even when the repository
+/// was opened from a secondary worktree. It uses the git common directory
+/// (the shared `.git` directory) to resolve the main worktree path.
 ///
 /// # Arguments
 ///
@@ -57,6 +61,31 @@ pub fn discover_repo(path: &Path) -> Result<Repository, GitError> {
 ///
 /// * If the repository is bare (has no working directory)
 pub fn get_repo_root(repo: &Repository) -> Result<PathBuf, GitError> {
+    // repo.commondir() always returns the shared .git directory,
+    // even when opened from a secondary worktree.
+    // Its parent is the main worktree root.
+    let common_dir = repo.commondir();
+    common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or(GitError::BareRepository)
+}
+
+/// Get the working directory of the current worktree.
+///
+/// Unlike `get_repo_root`, this returns the working directory of whichever
+/// worktree the repository was opened from. For the main worktree this is
+/// the same as `get_repo_root`; for a secondary worktree it returns that
+/// worktree's directory.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+///
+/// # Errors
+///
+/// * If the repository is bare (has no working directory)
+pub fn get_workdir(repo: &Repository) -> Result<PathBuf, GitError> {
     repo.workdir()
         .map(Path::to_path_buf)
         .ok_or(GitError::BareRepository)
@@ -248,5 +277,42 @@ mod tests {
         let branch = get_current_branch(&repo).unwrap();
         // Git defaults to "master" or "main" depending on config
         assert!(branch.is_some());
+    }
+
+    #[test]
+    fn test_get_repo_root_from_secondary_worktree() {
+        let (dir, _repo) = create_test_repo();
+
+        // Create a secondary worktree
+        let wt_path = dir.path().join("../test-secondary-wt");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "test-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Open the repo from the secondary worktree
+        let wt_repo = Repository::open(&wt_path).unwrap();
+
+        // get_repo_root should return the MAIN worktree root, not the secondary one
+        let root = get_repo_root(&wt_repo).unwrap();
+        let expected_main = dir.path().canonicalize().unwrap();
+        let actual = root.canonicalize().unwrap();
+        assert_eq!(actual, expected_main);
+
+        // get_workdir should return the secondary worktree's own directory
+        let workdir = get_workdir(&wt_repo).unwrap();
+        let expected_wt = wt_path.canonicalize().unwrap();
+        let actual_wt = workdir.canonicalize().unwrap();
+        assert_eq!(actual_wt, expected_wt);
+
+        // Clean up the worktree
+        Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
     }
 }

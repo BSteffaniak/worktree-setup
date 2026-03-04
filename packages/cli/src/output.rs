@@ -48,3 +48,8 @@ pub fn print_error(message: &str) {
 pub fn print_warning(message: &str) {
     println!("{} {}", "Warning:".yellow().bold(), message);
 }
+
+/// Print an informational message.
+pub fn print_info(message: &str) {
+    println!("{} {}", "Info:".cyan().bold(), message);
+}

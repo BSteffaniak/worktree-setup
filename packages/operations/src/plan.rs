@@ -33,9 +33,8 @@ impl std::fmt::Display for OperationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Symlink => write!(f, "symlink"),
-            Self::Copy => write!(f, "copy"),
+            Self::Copy | Self::CopyGlob => write!(f, "copy"),
             Self::Overwrite => write!(f, "overwrite"),
-            Self::CopyGlob => write!(f, "copy"),
             Self::Template => write!(f, "template"),
             Self::Unstaged => write!(f, "unstaged"),
         }
@@ -80,14 +79,17 @@ pub struct PlannedOperation {
 ///
 /// A tuple of (`resolved_path`, `display_path`)
 fn resolve_path(base: &Path, config_relative_dir: &Path, path: &str) -> (PathBuf, String) {
-    if let Some(stripped) = path.strip_prefix('/') {
-        // Repo-root-relative path (e.g., "/.nix" -> ".nix")
-        (base.join(stripped), stripped.to_string())
-    } else {
-        // Config-relative path (e.g., "data" -> "apps/myapp/data")
-        let display = config_relative_dir.join(path);
-        (base.join(&display), display.to_string_lossy().to_string())
-    }
+    path.strip_prefix('/').map_or_else(
+        || {
+            // Config-relative path (e.g., "data" -> "apps/myapp/data")
+            let display = config_relative_dir.join(path);
+            (base.join(&display), display.to_string_lossy().to_string())
+        },
+        |stripped| {
+            // Repo-root-relative path (e.g., "/.nix" -> ".nix")
+            (base.join(stripped), stripped.to_string())
+        },
+    )
 }
 
 /// Plan all operations for a config without executing.
@@ -118,6 +120,16 @@ pub fn plan_operations(
         options,
         &|_, _, _, _| {},
     )
+}
+
+/// Shared context for planning operations.
+struct PlanContext<'a, F> {
+    config_relative_dir: &'a Path,
+    main_worktree: &'a Path,
+    target_worktree: &'a Path,
+    overwrite: bool,
+    on_progress: &'a F,
+    total_ops: usize,
 }
 
 /// Plan all operations for a config with progress reporting.
@@ -152,36 +164,77 @@ pub fn plan_operations_with_progress<F>(
 where
     F: Fn(usize, usize, &str, Option<u64>),
 {
-    let mut operations = Vec::new();
-    let overwrite = options.overwrite_existing;
-
-    // Calculate relative path from repo root to config directory
     let config_relative_dir = config
         .config_dir
         .strip_prefix(main_worktree)
         .unwrap_or(&config.config_dir);
 
-    // Calculate total operations (excluding unstaged - those are handled separately)
     let total_ops = config.config.symlinks.len()
         + config.config.copy.len()
         + config.config.overwrite.len()
         + config.config.copy_glob.len()
         + config.config.templates.len();
 
+    let ctx = PlanContext {
+        config_relative_dir,
+        main_worktree,
+        target_worktree,
+        overwrite: options.overwrite_existing,
+        on_progress,
+        total_ops,
+    };
+
     let mut current_op = 0usize;
+    let mut operations = Vec::new();
 
-    // Plan symlinks
-    for symlink_path in &config.config.symlinks {
-        current_op += 1;
-        let (source, display_str) = resolve_path(main_worktree, config_relative_dir, symlink_path);
-        let (target, _) = resolve_path(target_worktree, config_relative_dir, symlink_path);
+    operations.extend(plan_symlink_ops(
+        &ctx,
+        &mut current_op,
+        &config.config.symlinks,
+    ));
+    operations.extend(plan_copy_ops(&ctx, &mut current_op, &config.config.copy));
+    operations.extend(plan_overwrite_ops(
+        &ctx,
+        &mut current_op,
+        &config.config.overwrite,
+    ));
+    operations.extend(plan_glob_ops(
+        &ctx,
+        &mut current_op,
+        &config.config.copy_glob,
+    )?);
+    operations.extend(plan_template_ops(
+        &ctx,
+        &mut current_op,
+        &config.config.templates,
+    ));
 
-        on_progress(current_op, total_ops, &display_str, None);
+    Ok(operations)
+}
+
+/// Plan symlink operations.
+fn plan_symlink_ops<F>(
+    ctx: &PlanContext<'_, F>,
+    current_op: &mut usize,
+    symlinks: &[String],
+) -> Vec<PlannedOperation>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let mut operations = Vec::new();
+
+    for symlink_path in symlinks {
+        *current_op += 1;
+        let (source, display_str) =
+            resolve_path(ctx.main_worktree, ctx.config_relative_dir, symlink_path);
+        let (target, _) = resolve_path(ctx.target_worktree, ctx.config_relative_dir, symlink_path);
+
+        (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
         let (will_skip, skip_reason, force) = if !source.exists() {
             (true, Some("not found".to_string()), false)
         } else if target.exists() || target.is_symlink() {
-            if overwrite {
+            if ctx.overwrite {
                 (false, None, true)
             } else {
                 (true, Some("exists".to_string()), false)
@@ -195,7 +248,7 @@ where
             operation_type: OperationType::Symlink,
             source,
             target,
-            file_count: 0, // Symlinks don't have file counts
+            file_count: 0,
             is_directory: false,
             will_skip,
             skip_reason,
@@ -203,13 +256,27 @@ where
         });
     }
 
-    // Plan explicit copies
-    for copy_path in &config.config.copy {
-        current_op += 1;
-        let (source, display_str) = resolve_path(main_worktree, config_relative_dir, copy_path);
-        let (target, _) = resolve_path(target_worktree, config_relative_dir, copy_path);
+    operations
+}
 
-        on_progress(current_op, total_ops, &display_str, None);
+/// Plan explicit copy operations.
+fn plan_copy_ops<F>(
+    ctx: &PlanContext<'_, F>,
+    current_op: &mut usize,
+    copies: &[String],
+) -> Vec<PlannedOperation>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let mut operations = Vec::new();
+
+    for copy_path in copies {
+        *current_op += 1;
+        let (source, display_str) =
+            resolve_path(ctx.main_worktree, ctx.config_relative_dir, copy_path);
+        let (target, _) = resolve_path(ctx.target_worktree, ctx.config_relative_dir, copy_path);
+
+        (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
         let (will_skip, skip_reason, file_count, is_directory, op_type) = if !source.exists() {
             (
@@ -220,11 +287,11 @@ where
                 OperationType::Copy,
             )
         } else if target.exists() {
-            if overwrite {
+            if ctx.overwrite {
                 let is_dir = source.is_dir();
                 let count = if is_dir {
                     count_files_with_progress(&source, |n| {
-                        on_progress(current_op, total_ops, &display_str, Some(n));
+                        (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
                     })
                 } else {
                     1
@@ -243,7 +310,7 @@ where
             let is_dir = source.is_dir();
             let count = if is_dir {
                 count_files_with_progress(&source, |n| {
-                    on_progress(current_op, total_ops, &display_str, Some(n));
+                    (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
                 })
             } else {
                 1
@@ -264,20 +331,34 @@ where
         });
     }
 
-    // Plan overwrites
-    for overwrite_path in &config.config.overwrite {
-        current_op += 1;
-        let (source, display_str) =
-            resolve_path(main_worktree, config_relative_dir, overwrite_path);
-        let (target, _) = resolve_path(target_worktree, config_relative_dir, overwrite_path);
+    operations
+}
 
-        on_progress(current_op, total_ops, &display_str, None);
+/// Plan overwrite operations.
+fn plan_overwrite_ops<F>(
+    ctx: &PlanContext<'_, F>,
+    current_op: &mut usize,
+    overwrites: &[String],
+) -> Vec<PlannedOperation>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let mut operations = Vec::new();
+
+    for overwrite_path in overwrites {
+        *current_op += 1;
+        let (source, display_str) =
+            resolve_path(ctx.main_worktree, ctx.config_relative_dir, overwrite_path);
+        let (target, _) =
+            resolve_path(ctx.target_worktree, ctx.config_relative_dir, overwrite_path);
+
+        (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
         let (will_skip, skip_reason, file_count, is_directory) = if source.exists() {
             let is_dir = source.is_dir();
             let count = if is_dir {
                 count_files_with_progress(&source, |n| {
-                    on_progress(current_op, total_ops, &display_str, Some(n));
+                    (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
                 })
             } else {
                 1
@@ -300,34 +381,52 @@ where
         });
     }
 
-    // Plan glob copies (each pattern counts as 1 operation for progress)
-    for pattern in &config.config.copy_glob {
-        current_op += 1;
+    operations
+}
 
-        // Handle repo-root-relative glob patterns
-        let (search_dir, display_prefix, glob_pattern) =
-            if let Some(stripped) = pattern.strip_prefix('/') {
-                (main_worktree.to_path_buf(), PathBuf::new(), stripped)
-            } else {
+/// Plan glob copy operations.
+///
+/// # Errors
+///
+/// * If glob pattern matching fails
+fn plan_glob_ops<F>(
+    ctx: &PlanContext<'_, F>,
+    current_op: &mut usize,
+    patterns: &[String],
+) -> Result<Vec<PlannedOperation>, OperationError>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let mut operations = Vec::new();
+
+    for pattern in patterns {
+        *current_op += 1;
+
+        let (search_dir, display_prefix, glob_pattern) = pattern.strip_prefix('/').map_or_else(
+            || {
                 (
-                    main_worktree.join(config_relative_dir),
-                    config_relative_dir.to_path_buf(),
+                    ctx.main_worktree.join(ctx.config_relative_dir),
+                    ctx.config_relative_dir.to_path_buf(),
                     pattern.as_str(),
                 )
-            };
+            },
+            |stripped| (ctx.main_worktree.to_path_buf(), PathBuf::new(), stripped),
+        );
 
         let full_pattern = search_dir.join(glob_pattern).to_string_lossy().to_string();
 
-        on_progress(current_op, total_ops, pattern, None);
+        (ctx.on_progress)(*current_op, ctx.total_ops, pattern, None);
 
         for entry in glob::glob(&full_pattern)? {
             if let Ok(source) = entry
                 && let Ok(rel_path) = source.strip_prefix(&search_dir)
             {
                 let target = if pattern.starts_with('/') {
-                    target_worktree.join(rel_path)
+                    ctx.target_worktree.join(rel_path)
                 } else {
-                    target_worktree.join(config_relative_dir).join(rel_path)
+                    ctx.target_worktree
+                        .join(ctx.config_relative_dir)
+                        .join(rel_path)
                 };
                 let display_path = if display_prefix.as_os_str().is_empty() {
                     rel_path.to_path_buf()
@@ -336,7 +435,7 @@ where
                 };
 
                 let (will_skip, skip_reason, op_type) = if target.exists() {
-                    if overwrite {
+                    if ctx.overwrite {
                         (false, None, OperationType::Overwrite)
                     } else {
                         (true, Some("exists".to_string()), OperationType::CopyGlob)
@@ -345,7 +444,6 @@ where
                     (false, None, OperationType::CopyGlob)
                 };
 
-                // Glob matches are always files (globs don't match directories well)
                 operations.push(PlannedOperation {
                     display_path: display_path.to_string_lossy().to_string(),
                     operation_type: op_type,
@@ -361,21 +459,37 @@ where
         }
     }
 
-    // Plan templates
-    for template in &config.config.templates {
-        current_op += 1;
+    Ok(operations)
+}
+
+/// Plan template operations.
+fn plan_template_ops<F>(
+    ctx: &PlanContext<'_, F>,
+    current_op: &mut usize,
+    templates: &[worktree_setup_config::TemplateMapping],
+) -> Vec<PlannedOperation>
+where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let mut operations = Vec::new();
+
+    for template in templates {
+        *current_op += 1;
         let (source, source_display) =
-            resolve_path(main_worktree, config_relative_dir, &template.source);
-        let (target, target_display) =
-            resolve_path(target_worktree, config_relative_dir, &template.target);
+            resolve_path(ctx.main_worktree, ctx.config_relative_dir, &template.source);
+        let (target, target_display) = resolve_path(
+            ctx.target_worktree,
+            ctx.config_relative_dir,
+            &template.target,
+        );
         let display_path = format!("{source_display} -> {target_display}");
 
-        on_progress(current_op, total_ops, &display_path, None);
+        (ctx.on_progress)(*current_op, ctx.total_ops, &display_path, None);
 
         let (will_skip, skip_reason, op_type) = if !source.exists() {
             (true, Some("not found".to_string()), OperationType::Template)
         } else if target.exists() {
-            if overwrite {
+            if ctx.overwrite {
                 (false, None, OperationType::Overwrite)
             } else {
                 (true, Some("exists".to_string()), OperationType::Template)
@@ -397,11 +511,7 @@ where
         });
     }
 
-    // Note: Unstaged files are NOT planned here - they should be handled separately
-    // by the caller who can show a "Checking git status..." spinner first.
-    // This avoids the git operation being part of the planning progress bar.
-
-    Ok(operations)
+    operations
 }
 
 /// Plan unstaged file operations.

@@ -50,6 +50,7 @@ impl ProgressManager {
     /// Print a completed operation result line.
     ///
     /// Shows a checkmark for success, bullet for skipped.
+    #[allow(clippy::unused_self)]
     pub fn print_result(&self, label: &str, result: &str, is_success: bool) {
         if is_success {
             println!("{} {:<30} {}", "✓".green(), label, result.dimmed());
@@ -61,6 +62,7 @@ impl ProgressManager {
     }
 
     /// Print a result with file count for directory operations.
+    #[allow(clippy::unused_self)]
     pub fn print_result_with_count(&self, label: &str, result: &str, file_count: u64) {
         println!(
             "{} {:<30} {} ({} files)",

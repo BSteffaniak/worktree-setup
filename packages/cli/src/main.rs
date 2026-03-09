@@ -49,8 +49,8 @@ fn main() {
     pretty_env_logger::init();
 
     let result = match args.command {
-        Some(args::Command::Setup(setup_args)) => run_setup(setup_args),
-        None => run_create(args),
+        Some(args::Command::Setup(ref setup_args)) => run_setup(setup_args),
+        None => run_create(&args),
     };
 
     if let Err(e) = result {
@@ -294,7 +294,7 @@ fn collect_post_setup_commands<'a>(configs: &[&'a LoadedConfig]) -> Vec<&'a str>
 /// Applies worktree configs to an existing directory. On a secondary worktree,
 /// this runs file operations and post-setup commands. On the main worktree or
 /// a regular clone, only post-setup commands are run.
-fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
     // Resolve target path (default to CWD)
@@ -380,10 +380,12 @@ fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         let default_post_setup = !args.no_install;
 
         let choices = interactive::prompt_setup_operations(
-            is_secondary_worktree,
-            default_files,
-            default_overwrite,
-            default_post_setup,
+            &interactive::SetupOperationDefaults {
+                is_secondary_worktree,
+                files: default_files,
+                overwrite: default_overwrite,
+                post_setup: default_post_setup,
+            },
             &unique_commands,
         )?;
 
@@ -431,7 +433,7 @@ fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Main application logic for the default (no subcommand) flow.
 ///
 /// This is the original create-worktree-and-setup-it flow.
-fn run_create(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Discover repository
     let cwd = env::current_dir()?;
     let repo = discover_repo(&cwd)?;
@@ -578,12 +580,14 @@ fn format_result_string(
 
     match (result, op_type) {
         (OperationResult::Created, OperationType::Symlink) => "symlink".to_string(),
-        (OperationResult::Created, OperationType::Copy | OperationType::CopyGlob) => {
-            "copied".to_string()
-        }
         (OperationResult::Created, OperationType::Template) => "created".to_string(),
-        (OperationResult::Created, OperationType::Unstaged) => "copied".to_string(),
-        (OperationResult::Created, OperationType::Overwrite) => "copied".to_string(),
+        (
+            OperationResult::Created,
+            OperationType::Copy
+            | OperationType::CopyGlob
+            | OperationType::Unstaged
+            | OperationType::Overwrite,
+        ) => "copied".to_string(),
         (OperationResult::Overwritten, _) => "overwritten".to_string(),
         (OperationResult::Exists, _) => "exists".to_string(),
         (OperationResult::Skipped, _) => "skipped".to_string(),

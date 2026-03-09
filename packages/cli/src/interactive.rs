@@ -5,7 +5,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use worktree_setup_config::LoadedConfig;
@@ -125,7 +125,7 @@ fn prompt_base_branch(
 ///
 /// * If the user cancels the prompts
 pub fn prompt_worktree_create(
-    target_path: &PathBuf,
+    target_path: &Path,
     current_branch: Option<&str>,
     branches: &[String],
     default_branch: Option<&str>,
@@ -270,6 +270,20 @@ pub struct SetupOperationChoices {
     pub run_post_setup: bool,
 }
 
+/// Default values for setup operation checkboxes.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SetupOperationDefaults {
+    /// Whether the target is a secondary worktree (shows file ops when `true`).
+    pub is_secondary_worktree: bool,
+    /// Default checked state for file operations.
+    pub files: bool,
+    /// Default checked state for overwrite existing files.
+    pub overwrite: bool,
+    /// Default checked state for post-setup commands.
+    pub post_setup: bool,
+}
+
 /// Prompt the user to select which setup operations to run.
 ///
 /// Shows an interactive checklist with file operations, overwrite toggle,
@@ -278,46 +292,39 @@ pub struct SetupOperationChoices {
 ///
 /// # Arguments
 ///
-/// * `is_secondary_worktree` - Whether the target is a secondary worktree
-///   (file operations are hidden when `false`)
-/// * `default_files` - Default checked state for file operations
-/// * `default_overwrite` - Default checked state for overwrite existing files
-/// * `default_post_setup` - Default checked state for post-setup commands
+/// * `defaults` - Default checked states for each operation
 /// * `post_setup_commands` - List of post-setup commands (shown inline for context)
 ///
 /// # Errors
 ///
 /// * If the user cancels the prompt
 pub fn prompt_setup_operations(
-    is_secondary_worktree: bool,
-    default_files: bool,
-    default_overwrite: bool,
-    default_post_setup: bool,
+    defaults: &SetupOperationDefaults,
     post_setup_commands: &[&str],
 ) -> io::Result<SetupOperationChoices> {
     let mut items: Vec<String> = Vec::new();
-    let mut defaults: Vec<bool> = Vec::new();
+    let mut checked: Vec<bool> = Vec::new();
 
     // Track which index maps to which operation
     let mut file_ops_index: Option<usize> = None;
     let mut overwrite_index: Option<usize> = None;
     let mut post_setup_index: Option<usize> = None;
 
-    if is_secondary_worktree {
+    if defaults.is_secondary_worktree {
         file_ops_index = Some(items.len());
         items.push("Apply file operations (symlinks, copies, templates)".to_string());
-        defaults.push(default_files);
+        checked.push(defaults.files);
 
         overwrite_index = Some(items.len());
         items.push("Overwrite existing files".to_string());
-        defaults.push(default_overwrite);
+        checked.push(defaults.overwrite);
     }
 
     if !post_setup_commands.is_empty() {
         post_setup_index = Some(items.len());
         let cmds_display = post_setup_commands.join(", ");
         items.push(format!("Run post-setup commands ({cmds_display})"));
-        defaults.push(default_post_setup);
+        checked.push(defaults.post_setup);
     }
 
     if items.is_empty() {
@@ -332,7 +339,7 @@ pub fn prompt_setup_operations(
     let selections = MultiSelect::new()
         .with_prompt("Select what to run")
         .items(&items)
-        .defaults(&defaults)
+        .defaults(&checked)
         .interact()?;
 
     let run_files = file_ops_index.is_some_and(|i| selections.contains(&i));

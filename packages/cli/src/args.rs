@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 
 /// CLI arguments for worktree-setup.
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 #[command(
     name = "worktree-setup",
     about = "Set up git worktrees with project-specific configurations",
@@ -78,6 +79,7 @@ pub enum Command {
 
 /// Arguments for the `setup` subcommand.
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SetupArgs {
     /// Path to the target directory (defaults to current directory).
     #[arg(index = 1)]

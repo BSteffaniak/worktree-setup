@@ -314,7 +314,6 @@ fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<(), CopyError>
     // Try reflink first (copy-on-write, instant on APFS/Btrfs/ReFS)
     if matches!(reflink_copy::reflink(source, target), Ok(())) {
         log::trace!("Reflinked {} -> {}", source.display(), target.display());
-        Ok(())
     } else {
         // Fall back to regular copy
         fs::copy(source, target).map_err(|e| CopyError::FileCopyError {
@@ -323,8 +322,8 @@ fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<(), CopyError>
             io_error: e,
         })?;
         log::trace!("Copied {} -> {}", source.display(), target.display());
-        Ok(())
     }
+    Ok(())
 }
 
 /// Copy a symlink, preserving it as a symlink.

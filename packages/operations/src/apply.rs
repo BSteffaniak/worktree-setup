@@ -150,7 +150,6 @@ where
     if op.will_skip {
         return Ok(match op.skip_reason.as_deref() {
             Some("exists") => OperationResult::Exists,
-            Some("not found") => OperationResult::Skipped,
             _ => OperationResult::Skipped,
         });
     }

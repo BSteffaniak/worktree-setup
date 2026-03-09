@@ -31,6 +31,7 @@ impl CopyProgress {
 
     /// Calculate progress as a percentage (0.0 to 100.0).
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn percentage(&self) -> f64 {
         if self.files_total == 0 {
             100.0

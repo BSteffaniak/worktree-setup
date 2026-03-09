@@ -53,7 +53,7 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>, GitError> {
 
     // First, add the main worktree
     let main_path = get_repo_root(repo)?;
-    let main_info = get_worktree_info_from_repo(repo, &main_path, true)?;
+    let main_info = get_worktree_info_from_repo(repo, &main_path, true);
     worktrees.push(main_info);
 
     // Then add linked worktrees
@@ -64,10 +64,8 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>, GitError> {
             && let Some(wt_path) = wt.path().parent()
         {
             // Open the worktree as a repo to get branch info
-            if let Ok(wt_repo) = Repository::open(wt_path)
-                && let Ok(info) = get_worktree_info_from_repo(&wt_repo, wt_path, false)
-            {
-                worktrees.push(info);
+            if let Ok(wt_repo) = Repository::open(wt_path) {
+                worktrees.push(get_worktree_info_from_repo(&wt_repo, wt_path, false));
             }
         }
     }
@@ -77,33 +75,26 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>, GitError> {
 }
 
 /// Get worktree info from a repository.
-fn get_worktree_info_from_repo(
-    repo: &Repository,
-    path: &Path,
-    is_main: bool,
-) -> Result<WorktreeInfo, GitError> {
-    let branch = if let Ok(head) = repo.head() {
+fn get_worktree_info_from_repo(repo: &Repository, path: &Path, is_main: bool) -> WorktreeInfo {
+    let branch = repo.head().ok().and_then(|head| {
         if head.is_branch() {
             head.shorthand().map(String::from)
         } else {
             None
         }
-    } else {
-        None
-    };
+    });
 
-    let commit = if let Ok(head) = repo.head() {
-        head.target().map(|oid| oid.to_string()[..8].to_string())
-    } else {
-        None
-    };
+    let commit = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target().map(|oid| oid.to_string()[..8].to_string()));
 
-    Ok(WorktreeInfo {
+    WorktreeInfo {
         path: path.to_path_buf(),
         is_main,
         branch,
         commit,
-    })
+    }
 }
 
 /// Get the main worktree.

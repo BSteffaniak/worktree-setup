@@ -61,6 +61,8 @@ pub struct PlannedOperation {
     pub will_skip: bool,
     /// Reason for skipping (if applicable).
     pub skip_reason: Option<String>,
+    /// Whether to force-overwrite existing targets.
+    pub force_overwrite: bool,
 }
 
 /// Resolve a path from config, handling repo-root-relative paths.
@@ -70,13 +72,13 @@ pub struct PlannedOperation {
 ///
 /// # Arguments
 ///
-/// * `base` - The base path (main_worktree or target_worktree)
+/// * `base` - The base path (`main_worktree` or `target_worktree`)
 /// * `config_relative_dir` - Relative path from repo root to config directory
 /// * `path` - The path from the config file
 ///
 /// # Returns
 ///
-/// A tuple of (resolved_path, display_path)
+/// A tuple of (`resolved_path`, `display_path`)
 fn resolve_path(base: &Path, config_relative_dir: &Path, path: &str) -> (PathBuf, String) {
     if let Some(stripped) = path.strip_prefix('/') {
         // Repo-root-relative path (e.g., "/.nix" -> ".nix")
@@ -144,13 +146,14 @@ pub fn plan_operations_with_progress<F>(
     config: &LoadedConfig,
     main_worktree: &Path,
     target_worktree: &Path,
-    _options: &ApplyConfigOptions,
+    options: &ApplyConfigOptions,
     on_progress: &F,
 ) -> Result<Vec<PlannedOperation>, OperationError>
 where
     F: Fn(usize, usize, &str, Option<u64>),
 {
     let mut operations = Vec::new();
+    let overwrite = options.overwrite_existing;
 
     // Calculate relative path from repo root to config directory
     let config_relative_dir = config
@@ -175,12 +178,16 @@ where
 
         on_progress(current_op, total_ops, &display_str, None);
 
-        let (will_skip, skip_reason) = if !source.exists() {
-            (true, Some("not found".to_string()))
+        let (will_skip, skip_reason, force) = if !source.exists() {
+            (true, Some("not found".to_string()), false)
         } else if target.exists() || target.is_symlink() {
-            (true, Some("exists".to_string()))
+            if overwrite {
+                (false, None, true)
+            } else {
+                (true, Some("exists".to_string()), false)
+            }
         } else {
-            (false, None)
+            (false, None, false)
         };
 
         operations.push(PlannedOperation {
@@ -192,6 +199,7 @@ where
             is_directory: false,
             will_skip,
             skip_reason,
+            force_overwrite: force,
         });
     }
 
@@ -203,10 +211,34 @@ where
 
         on_progress(current_op, total_ops, &display_str, None);
 
-        let (will_skip, skip_reason, file_count, is_directory) = if !source.exists() {
-            (true, Some("not found".to_string()), 0, false)
+        let (will_skip, skip_reason, file_count, is_directory, op_type) = if !source.exists() {
+            (
+                true,
+                Some("not found".to_string()),
+                0,
+                false,
+                OperationType::Copy,
+            )
         } else if target.exists() {
-            (true, Some("exists".to_string()), 0, false)
+            if overwrite {
+                let is_dir = source.is_dir();
+                let count = if is_dir {
+                    count_files_with_progress(&source, |n| {
+                        on_progress(current_op, total_ops, &display_str, Some(n));
+                    })
+                } else {
+                    1
+                };
+                (false, None, count, is_dir, OperationType::Overwrite)
+            } else {
+                (
+                    true,
+                    Some("exists".to_string()),
+                    0,
+                    false,
+                    OperationType::Copy,
+                )
+            }
         } else {
             let is_dir = source.is_dir();
             let count = if is_dir {
@@ -216,18 +248,19 @@ where
             } else {
                 1
             };
-            (false, None, count, is_dir)
+            (false, None, count, is_dir, OperationType::Copy)
         };
 
         operations.push(PlannedOperation {
             display_path: display_str,
-            operation_type: OperationType::Copy,
+            operation_type: op_type,
             source,
             target,
             file_count,
             is_directory,
             will_skip,
             skip_reason,
+            force_overwrite: false,
         });
     }
 
@@ -240,9 +273,7 @@ where
 
         on_progress(current_op, total_ops, &display_str, None);
 
-        let (will_skip, skip_reason, file_count, is_directory) = if !source.exists() {
-            (true, Some("not found".to_string()), 0, false)
-        } else {
+        let (will_skip, skip_reason, file_count, is_directory) = if source.exists() {
             let is_dir = source.is_dir();
             let count = if is_dir {
                 count_files_with_progress(&source, |n| {
@@ -252,6 +283,8 @@ where
                 1
             };
             (false, None, count, is_dir)
+        } else {
+            (true, Some("not found".to_string()), 0, false)
         };
 
         operations.push(PlannedOperation {
@@ -263,6 +296,7 @@ where
             is_directory,
             will_skip,
             skip_reason,
+            force_overwrite: false,
         });
     }
 
@@ -287,37 +321,42 @@ where
         on_progress(current_op, total_ops, pattern, None);
 
         for entry in glob::glob(&full_pattern)? {
-            if let Ok(source) = entry {
-                if let Ok(rel_path) = source.strip_prefix(&search_dir) {
-                    let target = if pattern.starts_with('/') {
-                        target_worktree.join(rel_path)
-                    } else {
-                        target_worktree.join(config_relative_dir).join(rel_path)
-                    };
-                    let display_path = if display_prefix.as_os_str().is_empty() {
-                        rel_path.to_path_buf()
-                    } else {
-                        display_prefix.join(rel_path)
-                    };
+            if let Ok(source) = entry
+                && let Ok(rel_path) = source.strip_prefix(&search_dir)
+            {
+                let target = if pattern.starts_with('/') {
+                    target_worktree.join(rel_path)
+                } else {
+                    target_worktree.join(config_relative_dir).join(rel_path)
+                };
+                let display_path = if display_prefix.as_os_str().is_empty() {
+                    rel_path.to_path_buf()
+                } else {
+                    display_prefix.join(rel_path)
+                };
 
-                    let (will_skip, skip_reason) = if target.exists() {
-                        (true, Some("exists".to_string()))
+                let (will_skip, skip_reason, op_type) = if target.exists() {
+                    if overwrite {
+                        (false, None, OperationType::Overwrite)
                     } else {
-                        (false, None)
-                    };
+                        (true, Some("exists".to_string()), OperationType::CopyGlob)
+                    }
+                } else {
+                    (false, None, OperationType::CopyGlob)
+                };
 
-                    // Glob matches are always files (globs don't match directories well)
-                    operations.push(PlannedOperation {
-                        display_path: display_path.to_string_lossy().to_string(),
-                        operation_type: OperationType::CopyGlob,
-                        source,
-                        target,
-                        file_count: 1,
-                        is_directory: false,
-                        will_skip,
-                        skip_reason,
-                    });
-                }
+                // Glob matches are always files (globs don't match directories well)
+                operations.push(PlannedOperation {
+                    display_path: display_path.to_string_lossy().to_string(),
+                    operation_type: op_type,
+                    source,
+                    target,
+                    file_count: 1,
+                    is_directory: false,
+                    will_skip,
+                    skip_reason,
+                    force_overwrite: false,
+                });
             }
         }
     }
@@ -333,23 +372,28 @@ where
 
         on_progress(current_op, total_ops, &display_path, None);
 
-        let (will_skip, skip_reason) = if !source.exists() {
-            (true, Some("not found".to_string()))
+        let (will_skip, skip_reason, op_type) = if !source.exists() {
+            (true, Some("not found".to_string()), OperationType::Template)
         } else if target.exists() {
-            (true, Some("exists".to_string()))
+            if overwrite {
+                (false, None, OperationType::Overwrite)
+            } else {
+                (true, Some("exists".to_string()), OperationType::Template)
+            }
         } else {
-            (false, None)
+            (false, None, OperationType::Template)
         };
 
         operations.push(PlannedOperation {
             display_path,
-            operation_type: OperationType::Template,
+            operation_type: op_type,
             source,
             target,
             file_count: 1,
             is_directory: false,
             will_skip,
             skip_reason,
+            force_overwrite: false,
         });
     }
 
@@ -374,6 +418,7 @@ where
 /// # Returns
 ///
 /// Vector of planned operations for unstaged files
+#[must_use]
 pub fn plan_unstaged_operations(
     unstaged_files: &[String],
     main_worktree: &Path,
@@ -396,6 +441,7 @@ pub fn plan_unstaged_operations(
                 is_directory: false,
                 will_skip: false,
                 skip_reason: None,
+                force_overwrite: false,
             });
         }
     }

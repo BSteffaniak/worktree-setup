@@ -8,7 +8,7 @@ use colored::Colorize;
 
 /// Print a header message.
 pub fn print_header(message: &str) {
-    println!("\n{} {}\n", "🌳", message.bold());
+    println!("\n🌳 {}\n", message.bold());
 }
 
 /// Print repository info.
@@ -36,7 +36,7 @@ pub fn print_command(cmd: &str) {
 
 /// Print success message.
 pub fn print_success() {
-    println!("{} Worktree setup complete!", "✅");
+    println!("✅ Worktree setup complete!");
 }
 
 /// Print error message.

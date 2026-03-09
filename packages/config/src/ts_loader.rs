@@ -47,11 +47,10 @@ fn try_load_with_bun(path: &Path) -> Result<Config, ConfigError> {
 
     // Use dynamic import and handle both default and named exports
     let script = format!(
-        r#"const m = await import("file://{}"); console.log(JSON.stringify(m.default ?? m));"#,
-        path_str
+        r#"const m = await import("file://{path_str}"); console.log(JSON.stringify(m.default ?? m));"#
     );
 
-    log::debug!("Evaluating with bun: {}", script);
+    log::debug!("Evaluating with bun: {script}");
 
     let output = Command::new("bun")
         .args(["-e", &script])
@@ -84,11 +83,10 @@ fn try_load_with_deno(path: &Path) -> Result<Config, ConfigError> {
 
     // Deno script with explicit allow flags
     let script = format!(
-        r#"const m = await import("file://{}"); console.log(JSON.stringify(m.default ?? m));"#,
-        path_str
+        r#"const m = await import("file://{path_str}"); console.log(JSON.stringify(m.default ?? m));"#
     );
 
-    log::debug!("Evaluating with deno: {}", script);
+    log::debug!("Evaluating with deno: {script}");
 
     let output = Command::new("deno")
         .args(["eval", "--allow-read", &script])

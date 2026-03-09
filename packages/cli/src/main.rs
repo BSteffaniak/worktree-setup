@@ -137,11 +137,13 @@ fn execute_file_operations(
     main_worktree_path: &Path,
     target_path: &Path,
     copy_unstaged_override: Option<bool>,
+    overwrite_existing: bool,
     show_progress: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress_mgr = ProgressManager::new(show_progress);
     let options = ApplyConfigOptions {
         copy_unstaged: copy_unstaged_override,
+        overwrite_existing,
     };
 
     // Calculate total operations across all configs for scanning progress
@@ -304,7 +306,7 @@ fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         .clean()
     } else {
-        cwd.clone()
+        cwd
     };
 
     // Verify target exists
@@ -365,24 +367,31 @@ fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let unique_commands = collect_post_setup_commands(&selected_configs);
 
     // Determine what to run
-    let (run_files, run_post_setup) = if args.non_interactive {
+    let (run_files, overwrite_existing, run_post_setup) = if args.non_interactive {
         // Non-interactive: use defaults as modified by flags
         let run_files = is_secondary_worktree && !args.no_files;
         let run_post_setup = !args.no_install;
-        (run_files, run_post_setup)
+        let overwrite = args.overwrite;
+        (run_files, overwrite, run_post_setup)
     } else {
         // Interactive: show checklist
         let default_files = is_secondary_worktree && !args.no_files;
+        let default_overwrite = args.overwrite;
         let default_post_setup = !args.no_install;
 
         let choices = interactive::prompt_setup_operations(
             is_secondary_worktree,
             default_files,
+            default_overwrite,
             default_post_setup,
             &unique_commands,
         )?;
 
-        (choices.run_files, choices.run_post_setup)
+        (
+            choices.run_files,
+            choices.overwrite_existing,
+            choices.run_post_setup,
+        )
     };
 
     // Nothing selected
@@ -401,6 +410,7 @@ fn run_setup(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             &main_worktree.path,
             &target_path,
             args.copy_unstaged_override(),
+            overwrite_existing,
             args.should_show_progress(),
         )?;
 
@@ -532,6 +542,7 @@ fn run_create(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             &main_worktree.path,
             &target_path,
             args.copy_unstaged_override(),
+            false, // No overwrite in create flow (fresh worktree)
             args.should_show_progress(),
         )?;
 

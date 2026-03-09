@@ -60,14 +60,14 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>, GitError> {
     let worktree_names = repo.worktrees().map_err(GitError::WorktreeListError)?;
 
     for name in worktree_names.iter().flatten() {
-        if let Ok(wt) = repo.find_worktree(name) {
-            if let Some(wt_path) = wt.path().parent() {
-                // Open the worktree as a repo to get branch info
-                if let Ok(wt_repo) = Repository::open(wt_path) {
-                    if let Ok(info) = get_worktree_info_from_repo(&wt_repo, wt_path, false) {
-                        worktrees.push(info);
-                    }
-                }
+        if let Ok(wt) = repo.find_worktree(name)
+            && let Some(wt_path) = wt.path().parent()
+        {
+            // Open the worktree as a repo to get branch info
+            if let Ok(wt_repo) = Repository::open(wt_path)
+                && let Ok(info) = get_worktree_info_from_repo(&wt_repo, wt_path, false)
+            {
+                worktrees.push(info);
             }
         }
     }

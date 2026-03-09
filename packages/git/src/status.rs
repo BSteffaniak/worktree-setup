@@ -45,10 +45,8 @@ pub fn get_unstaged_and_untracked_files(repo: &Repository) -> Result<Vec<String>
                 | Status::WT_NEW,
         );
 
-        if dominated_by_unstaged {
-            if let Some(path) = entry.path() {
-                files.push(path.to_string());
-            }
+        if dominated_by_unstaged && let Some(path) = entry.path() {
+            files.push(path.to_string());
         }
     }
 

@@ -149,20 +149,20 @@ pub fn get_local_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
 #[must_use]
 pub fn get_default_branch(repo: &Repository) -> Option<String> {
     // Try origin/HEAD first (most accurate for cloned repos)
-    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(target) = reference.symbolic_target() {
-            // target is "refs/remotes/origin/main" -> extract "main"
-            if let Some(branch) = target.strip_prefix("refs/remotes/origin/") {
-                return Some(branch.to_string());
-            }
+    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD")
+        && let Some(target) = reference.symbolic_target()
+    {
+        // target is "refs/remotes/origin/main" -> extract "main"
+        if let Some(branch) = target.strip_prefix("refs/remotes/origin/") {
+            return Some(branch.to_string());
         }
     }
 
     // Try init.defaultBranch config
-    if let Ok(config) = repo.config() {
-        if let Ok(default) = config.get_string("init.defaultBranch") {
-            return Some(default);
-        }
+    if let Ok(config) = repo.config()
+        && let Ok(default) = config.get_string("init.defaultBranch")
+    {
+        return Some(default);
     }
 
     // Fall back to checking for common branches locally
@@ -188,17 +188,17 @@ pub fn get_recent_branches(repo: &Repository, limit: usize) -> Vec<String> {
     if let Ok(reflog) = repo.reflog("HEAD") {
         for entry in reflog.iter() {
             // Reflog message format: "checkout: moving from X to Y"
-            if let Some(msg) = entry.message() {
-                if let Some(rest) = msg.strip_prefix("checkout: moving from ") {
-                    // Extract the "to" branch
-                    if let Some(to_branch) = rest.split(" to ").nth(1) {
-                        let branch = to_branch.to_string();
-                        // Deduplicate and skip detached HEAD descriptions (contain spaces)
-                        if !recent.contains(&branch) && !branch.contains(' ') {
-                            recent.push(branch);
-                            if recent.len() >= limit {
-                                break;
-                            }
+            if let Some(msg) = entry.message()
+                && let Some(rest) = msg.strip_prefix("checkout: moving from ")
+            {
+                // Extract the "to" branch
+                if let Some(to_branch) = rest.split(" to ").nth(1) {
+                    let branch = to_branch.to_string();
+                    // Deduplicate and skip detached HEAD descriptions (contain spaces)
+                    if !recent.contains(&branch) && !branch.contains(' ') {
+                        recent.push(branch);
+                        if recent.len() >= limit {
+                            break;
                         }
                     }
                 }

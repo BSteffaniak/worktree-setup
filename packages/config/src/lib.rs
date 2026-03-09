@@ -64,10 +64,10 @@ pub fn load_config(path: &Path, repo_root: &Path) -> Result<LoadedConfig, Config
         .ok_or_else(|| ConfigError::InvalidPath(path.to_path_buf()))?
         .to_path_buf();
 
-    let relative_path = path
-        .strip_prefix(repo_root)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    let relative_path = path.strip_prefix(repo_root).map_or_else(
+        |_| path.to_string_lossy().to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
 
     Ok(LoadedConfig {
         config,

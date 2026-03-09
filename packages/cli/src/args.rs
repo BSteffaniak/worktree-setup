@@ -95,6 +95,10 @@ pub struct SetupArgs {
     #[arg(long = "no-install")]
     pub no_install: bool,
 
+    /// Default overwrite existing files checkbox to checked.
+    #[arg(long)]
+    pub overwrite: bool,
+
     /// Copy unstaged and untracked files from main worktree.
     #[arg(long)]
     pub unstaged: bool,
@@ -122,7 +126,7 @@ impl Args {
     /// Returns `Some(true)` if `--unstaged`, `Some(false)` if `--no-unstaged`,
     /// or `None` to use the config default.
     #[must_use]
-    pub fn copy_unstaged_override(&self) -> Option<bool> {
+    pub const fn copy_unstaged_override(&self) -> Option<bool> {
         if self.no_unstaged {
             Some(false)
         } else if self.unstaged {
@@ -134,13 +138,13 @@ impl Args {
 
     /// Determine if we should run post-setup commands.
     #[must_use]
-    pub fn should_run_install(&self) -> bool {
+    pub const fn should_run_install(&self) -> bool {
         !self.no_install
     }
 
     /// Determine if we should show progress bars.
     #[must_use]
-    pub fn should_show_progress(&self) -> bool {
+    pub const fn should_show_progress(&self) -> bool {
         !self.no_progress
     }
 }
@@ -151,7 +155,7 @@ impl SetupArgs {
     /// Returns `Some(true)` if `--unstaged`, `Some(false)` if `--no-unstaged`,
     /// or `None` to use the config default.
     #[must_use]
-    pub fn copy_unstaged_override(&self) -> Option<bool> {
+    pub const fn copy_unstaged_override(&self) -> Option<bool> {
         if self.no_unstaged {
             Some(false)
         } else if self.unstaged {
@@ -163,7 +167,7 @@ impl SetupArgs {
 
     /// Determine if we should show progress bars.
     #[must_use]
-    pub fn should_show_progress(&self) -> bool {
+    pub const fn should_show_progress(&self) -> bool {
         !self.no_progress
     }
 }

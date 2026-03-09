@@ -45,7 +45,7 @@ pub use plan::{
     OperationType, PlannedOperation, plan_operations, plan_operations_with_progress,
     plan_unstaged_operations,
 };
-pub use symlink::create_symlink;
+pub use symlink::{create_symlink, force_create_symlink};
 pub use worktree_setup_copy::CopyProgress;
 
 /// Result of a single file operation.

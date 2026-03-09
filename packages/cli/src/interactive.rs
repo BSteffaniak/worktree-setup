@@ -264,20 +264,24 @@ pub fn prompt_run_install(default: bool) -> io::Result<bool> {
 pub struct SetupOperationChoices {
     /// Whether to run file operations (symlinks, copies, templates).
     pub run_files: bool,
+    /// Whether to overwrite existing files during file operations.
+    pub overwrite_existing: bool,
     /// Whether to run post-setup commands.
     pub run_post_setup: bool,
 }
 
 /// Prompt the user to select which setup operations to run.
 ///
-/// Shows an interactive checklist with file operations and post-setup commands.
-/// Items are pre-checked based on defaults (which can be influenced by CLI flags).
+/// Shows an interactive checklist with file operations, overwrite toggle,
+/// and post-setup commands. Items are pre-checked based on defaults
+/// (which can be influenced by CLI flags).
 ///
 /// # Arguments
 ///
 /// * `is_secondary_worktree` - Whether the target is a secondary worktree
 ///   (file operations are hidden when `false`)
 /// * `default_files` - Default checked state for file operations
+/// * `default_overwrite` - Default checked state for overwrite existing files
 /// * `default_post_setup` - Default checked state for post-setup commands
 /// * `post_setup_commands` - List of post-setup commands (shown inline for context)
 ///
@@ -287,6 +291,7 @@ pub struct SetupOperationChoices {
 pub fn prompt_setup_operations(
     is_secondary_worktree: bool,
     default_files: bool,
+    default_overwrite: bool,
     default_post_setup: bool,
     post_setup_commands: &[&str],
 ) -> io::Result<SetupOperationChoices> {
@@ -295,12 +300,17 @@ pub fn prompt_setup_operations(
 
     // Track which index maps to which operation
     let mut file_ops_index: Option<usize> = None;
+    let mut overwrite_index: Option<usize> = None;
     let mut post_setup_index: Option<usize> = None;
 
     if is_secondary_worktree {
         file_ops_index = Some(items.len());
         items.push("Apply file operations (symlinks, copies, templates)".to_string());
         defaults.push(default_files);
+
+        overwrite_index = Some(items.len());
+        items.push("Overwrite existing files".to_string());
+        defaults.push(default_overwrite);
     }
 
     if !post_setup_commands.is_empty() {
@@ -314,6 +324,7 @@ pub fn prompt_setup_operations(
         // Nothing to prompt for
         return Ok(SetupOperationChoices {
             run_files: false,
+            overwrite_existing: false,
             run_post_setup: false,
         });
     }
@@ -324,8 +335,12 @@ pub fn prompt_setup_operations(
         .defaults(&defaults)
         .interact()?;
 
+    let run_files = file_ops_index.is_some_and(|i| selections.contains(&i));
+
     Ok(SetupOperationChoices {
-        run_files: file_ops_index.is_some_and(|i| selections.contains(&i)),
+        run_files,
+        // Overwrite only matters if file operations are selected
+        overwrite_existing: run_files && overwrite_index.is_some_and(|i| selections.contains(&i)),
         run_post_setup: post_setup_index.is_some_and(|i| selections.contains(&i)),
     })
 }

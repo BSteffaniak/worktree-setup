@@ -16,7 +16,7 @@ use crate::copy::{
 };
 use crate::error::OperationError;
 use crate::plan::{OperationType, PlannedOperation, plan_operations, plan_unstaged_operations};
-use crate::symlink::create_symlink;
+use crate::symlink::{create_symlink, force_create_symlink};
 
 /// Record of a single file operation.
 #[derive(Debug, Clone)]
@@ -32,6 +32,8 @@ pub struct OperationRecord {
 pub struct ApplyConfigOptions {
     /// Override `copy_unstaged` setting from config.
     pub copy_unstaged: Option<bool>,
+    /// Overwrite existing files instead of skipping them.
+    pub overwrite_existing: bool,
 }
 
 /// Result of applying a configuration.
@@ -123,7 +125,7 @@ pub fn apply_config(
 ///
 /// This function executes one operation that was previously planned by `plan_operations`.
 /// For directory operations, the progress callback will be called periodically with
-/// (files_completed, files_total).
+/// (`files_completed`, `files_total`).
 ///
 /// # Arguments
 ///
@@ -154,7 +156,13 @@ where
     }
 
     match op.operation_type {
-        OperationType::Symlink => create_symlink(&op.source, &op.target),
+        OperationType::Symlink => {
+            if op.force_overwrite {
+                force_create_symlink(&op.source, &op.target)
+            } else {
+                create_symlink(&op.source, &op.target)
+            }
+        }
         OperationType::Copy | OperationType::CopyGlob | OperationType::Template => {
             if op.is_directory {
                 // Directory copy with progress

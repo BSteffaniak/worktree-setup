@@ -194,7 +194,7 @@ where
     let entries = enumerate_directory(source, target)?;
     let total_files = entries.len() as u64;
 
-    log::debug!("Found {} files to copy", total_files);
+    log::debug!("Found {total_files} files to copy");
 
     if total_files == 0 {
         // Empty directory - just create the target
@@ -246,7 +246,7 @@ where
 
             // Report progress (not every file to avoid overhead)
             let copied = tracker_ref.copied();
-            if copied % 100 == 0 || copied == total_files {
+            if copied.is_multiple_of(100) || copied == total_files {
                 on_progress_ref(
                     &tracker_ref.snapshot(Some(entry.source.to_string_lossy().to_string())),
                 );
@@ -294,13 +294,13 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
             source_path
                 .strip_prefix(source)
                 .map_err(|_| CopyError::EnumerationError {
-                    path: source_path.to_path_buf(),
+                    path: source_path.clone(),
                     message: "Failed to strip prefix".to_string(),
                 })?;
         let target_path = target.join(rel_path);
 
         entries.push(FileEntry {
-            source: source_path.to_path_buf(),
+            source: source_path.clone(),
             target: target_path,
             is_symlink: file_type.is_symlink(),
         });
@@ -312,21 +312,18 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
 /// Copy a single file, trying reflink first then falling back to regular copy.
 fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<(), CopyError> {
     // Try reflink first (copy-on-write, instant on APFS/Btrfs/ReFS)
-    match reflink_copy::reflink(source, target) {
-        Ok(()) => {
-            log::trace!("Reflinked {} -> {}", source.display(), target.display());
-            Ok(())
-        }
-        Err(_) => {
-            // Fall back to regular copy
-            fs::copy(source, target).map_err(|e| CopyError::FileCopyError {
-                source_path: source.to_path_buf(),
-                target_path: target.to_path_buf(),
-                io_error: e,
-            })?;
-            log::trace!("Copied {} -> {}", source.display(), target.display());
-            Ok(())
-        }
+    if matches!(reflink_copy::reflink(source, target), Ok(())) {
+        log::trace!("Reflinked {} -> {}", source.display(), target.display());
+        Ok(())
+    } else {
+        // Fall back to regular copy
+        fs::copy(source, target).map_err(|e| CopyError::FileCopyError {
+            source_path: source.to_path_buf(),
+            target_path: target.to_path_buf(),
+            io_error: e,
+        })?;
+        log::trace!("Copied {} -> {}", source.display(), target.display());
+        Ok(())
     }
 }
 

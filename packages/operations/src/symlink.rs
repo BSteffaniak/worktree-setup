@@ -26,17 +26,45 @@ use crate::error::OperationError;
 /// * If the symlink cannot be created
 /// * If an existing file/directory cannot be removed
 pub fn create_symlink(source: &Path, target: &Path) -> Result<OperationResult, OperationError> {
+    create_symlink_inner(source, target, false)
+}
+
+/// Create a symlink from source to target, optionally overwriting existing targets.
+///
+/// When `force` is `true`, existing symlinks, files, and directories at the
+/// target path are removed before creating the new symlink. Returns
+/// `Overwritten` instead of `Created` when a target was replaced.
+///
+/// When `force` is `false`, behaves identically to `create_symlink`.
+///
+/// # Arguments
+///
+/// * `source` - Path to the source (what the symlink points to)
+/// * `target` - Path where the symlink will be created
+/// * `force` - If `true`, overwrite existing targets
+///
+/// # Errors
+///
+/// * If the symlink cannot be created
+/// * If an existing file/directory cannot be removed
+pub fn force_create_symlink(
+    source: &Path,
+    target: &Path,
+) -> Result<OperationResult, OperationError> {
+    create_symlink_inner(source, target, true)
+}
+
+/// Inner implementation for symlink creation.
+fn create_symlink_inner(
+    source: &Path,
+    target: &Path,
+    force: bool,
+) -> Result<OperationResult, OperationError> {
     log::debug!(
-        "Creating symlink: {} -> {}",
+        "Creating symlink: {} -> {} (force: {force})",
         target.display(),
         source.display()
     );
-
-    // Check if target is already a symlink
-    if target.is_symlink() {
-        log::debug!("Target is already a symlink");
-        return Ok(OperationResult::Exists);
-    }
 
     // Check if source exists
     if !source.exists() {
@@ -44,16 +72,22 @@ pub fn create_symlink(source: &Path, target: &Path) -> Result<OperationResult, O
         return Ok(OperationResult::Skipped);
     }
 
-    // Ensure parent directory exists
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| OperationError::IoError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
+    // Check if target already exists
+    let target_existed = target.exists() || target.is_symlink();
 
-    // Remove existing file/directory if it exists (but not symlink - handled above)
-    if target.exists() {
+    if target.is_symlink() {
+        if force {
+            log::debug!("Force: removing existing symlink at {}", target.display());
+            fs::remove_file(target).map_err(|e| OperationError::IoError {
+                path: target.to_path_buf(),
+                source: e,
+            })?;
+        } else {
+            log::debug!("Target is already a symlink");
+            return Ok(OperationResult::Exists);
+        }
+    } else if target.exists() {
+        // Non-symlink file/directory at target path
         log::debug!("Removing existing path: {}", target.display());
         if target.is_dir() {
             fs::remove_dir_all(target).map_err(|e| OperationError::IoError {
@@ -66,6 +100,14 @@ pub fn create_symlink(source: &Path, target: &Path) -> Result<OperationResult, O
                 source: e,
             })?;
         }
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| OperationError::IoError {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
 
     // Create the symlink
@@ -99,8 +141,13 @@ pub fn create_symlink(source: &Path, target: &Path) -> Result<OperationResult, O
         }
     }
 
-    log::debug!("Created symlink successfully");
-    Ok(OperationResult::Created)
+    if target_existed {
+        log::debug!("Overwritten symlink successfully");
+        Ok(OperationResult::Overwritten)
+    } else {
+        log::debug!("Created symlink successfully");
+        Ok(OperationResult::Created)
+    }
 }
 
 #[cfg(test)]

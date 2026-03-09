@@ -21,7 +21,7 @@ pub struct CopyProgress {
 impl CopyProgress {
     /// Create a new progress report.
     #[must_use]
-    pub fn new(files_total: u64, files_copied: u64, current_file: Option<String>) -> Self {
+    pub const fn new(files_total: u64, files_copied: u64, current_file: Option<String>) -> Self {
         Self {
             files_total,
             files_copied,

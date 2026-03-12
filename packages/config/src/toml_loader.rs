@@ -84,7 +84,6 @@ postSetup = ["npm install"]
         assert!(config.copy.is_empty());
         assert!(!config.copy_unstaged);
         assert!(config.profiles.is_empty());
-        assert!(config.profile_defaults.is_empty());
     }
 
     #[test]
@@ -95,13 +94,12 @@ postSetup = ["npm install"]
             r#"
 description = "Config with profiles"
 symlinks = [".env"]
-profiles = ["dev", "ci"]
 
-[profileDefaults.dev]
+[profiles.dev]
 copyUnstaged = true
 baseBranch = "develop"
 
-[profileDefaults.ci]
+[profiles.ci]
 postSetup = "none"
 "#
         )
@@ -110,22 +108,23 @@ postSetup = "none"
         let config = load_toml_config(file.path()).unwrap();
 
         assert_eq!(config.description, "Config with profiles");
-        assert_eq!(config.profiles, vec!["dev", "ci"]);
-        assert_eq!(config.profile_defaults.len(), 2);
+        assert_eq!(config.profiles.len(), 2);
+        assert!(config.profiles.contains_key("dev"));
+        assert!(config.profiles.contains_key("ci"));
 
-        let dev_defaults = &config.profile_defaults["dev"];
-        assert_eq!(dev_defaults.copy_unstaged, Some(true));
-        assert_eq!(dev_defaults.base_branch.as_deref(), Some("develop"));
-        assert_eq!(dev_defaults.post_setup, None);
+        let dev = &config.profiles["dev"];
+        assert_eq!(dev.defaults.copy_unstaged, Some(true));
+        assert_eq!(dev.defaults.base_branch.as_deref(), Some("develop"));
+        assert_eq!(dev.defaults.post_setup, None);
 
-        let ci_defaults = &config.profile_defaults["ci"];
+        let ci = &config.profiles["ci"];
         assert_eq!(
-            ci_defaults.post_setup,
+            ci.defaults.post_setup,
             Some(crate::types::PostSetupMode::Keyword(
                 crate::types::PostSetupKeyword::None
             ))
         );
-        assert_eq!(ci_defaults.copy_unstaged, None);
+        assert_eq!(ci.defaults.copy_unstaged, None);
     }
 
     #[test]
@@ -135,9 +134,8 @@ postSetup = "none"
             file,
             r#"
 description = "Config with all Phase 3 fields"
-profiles = ["full"]
 
-[profileDefaults.full]
+[profiles.full]
 autoCreate = true
 creationMethod = "remote"
 baseBranch = "master"
@@ -153,7 +151,7 @@ skipPostSetup = ["bun generate", "bun build"]
 
         let config = load_toml_config(file.path()).unwrap();
 
-        let defaults = &config.profile_defaults["full"];
+        let defaults = &config.profiles["full"].defaults;
         assert_eq!(defaults.auto_create, Some(true));
         assert_eq!(
             defaults.creation_method,
@@ -183,9 +181,8 @@ skipPostSetup = ["bun generate", "bun build"]
             file,
             r#"
 description = "Config with commands list"
-profiles = ["selective"]
 
-[profileDefaults.selective]
+[profiles.selective]
 postSetup = ["bun install", "bun migrate"]
 "#
         )
@@ -193,7 +190,7 @@ postSetup = ["bun install", "bun migrate"]
 
         let config = load_toml_config(file.path()).unwrap();
 
-        let defaults = &config.profile_defaults["selective"];
+        let defaults = &config.profiles["selective"].defaults;
         assert_eq!(
             defaults.post_setup,
             Some(crate::types::PostSetupMode::Commands(vec![

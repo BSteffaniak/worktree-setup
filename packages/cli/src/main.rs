@@ -21,8 +21,8 @@ use path_clean::PathClean;
 use args::{Args, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
-    CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ProfilesFile, ResolvedProfile,
-    discover_configs, discover_profiles_file, load_config, load_profiles_file, resolve_profiles,
+    CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ResolvedProfile,
+    discover_configs, load_config, resolve_profiles,
 };
 use worktree_setup_git::{
     GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
@@ -131,24 +131,6 @@ fn select_configs(
     }
 }
 
-/// Load the profiles file from the repo root (if it exists).
-///
-/// Returns `None` if no profiles file is found. Prints a warning if
-/// the file exists but fails to load.
-fn load_profiles(repo_root: &Path) -> Option<ProfilesFile> {
-    let path = discover_profiles_file(repo_root)?;
-    match load_profiles_file(&path) {
-        Ok(profiles) => {
-            log::debug!("Loaded {} profiles", profiles.profiles.len());
-            Some(profiles)
-        }
-        Err(e) => {
-            output::print_warning(&format!("Failed to load profiles file: {e}"));
-            None
-        }
-    }
-}
-
 /// Resolve profiles and select configs, applying profile defaults.
 ///
 /// When `--profile` is used, this resolves the named profiles against the
@@ -161,10 +143,10 @@ fn load_profiles(repo_root: &Path) -> Option<ProfilesFile> {
 /// * If any requested profile is not found
 fn resolve_and_print_profile(
     profile_names: &[String],
-    profiles_file: Option<&ProfilesFile>,
     all_configs: &[LoadedConfig],
+    repo_root: &Path,
 ) -> Result<ResolvedProfile, Box<dyn std::error::Error>> {
-    let resolved = resolve_profiles(profile_names, profiles_file, all_configs)?;
+    let resolved = resolve_profiles(profile_names, all_configs, repo_root)?;
 
     output::print_using_profile(&resolved.names);
 
@@ -488,15 +470,14 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Load profiles and resolve if --profile was provided
-    let profiles_file = load_profiles(&repo_root);
+    // Resolve profiles if --profile was provided
     let resolved_profile = if args.profile.is_empty() {
         None
     } else {
         Some(resolve_and_print_profile(
             &args.profile,
-            profiles_file.as_ref(),
             &all_configs,
+            &repo_root,
         )?)
     };
 
@@ -634,6 +615,32 @@ fn select_configs_or_profile(
         return Ok(None);
     }
     Ok(Some(indices))
+}
+
+/// Collect profile display info from all loaded configs for `--list`.
+///
+/// Aggregates profile names across all configs, deduplicates, and
+/// uses the last description found for each profile name.
+fn collect_profile_display_info(all_configs: &[LoadedConfig]) -> Vec<(String, String, usize)> {
+    use std::collections::BTreeMap;
+
+    // Aggregate: name -> (description, declaring_config_count)
+    let mut profiles: BTreeMap<String, (String, usize)> = BTreeMap::new();
+
+    for config in all_configs {
+        for (name, def) in &config.config.profiles {
+            let entry = profiles.entry(name.clone()).or_default();
+            if !def.description.is_empty() {
+                entry.0.clone_from(&def.description);
+            }
+            entry.1 += 1;
+        }
+    }
+
+    profiles
+        .into_iter()
+        .map(|(name, (desc, count))| (name, desc, count))
+        .collect()
 }
 
 // ─── Default flow (create + setup) ─────────────────────────────────────────
@@ -902,17 +909,10 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Discover and load configs
     let all_configs = discover_and_load_configs(&repo_root)?;
 
-    // Load profiles file (if it exists)
-    let profiles_file = load_profiles(&repo_root);
-
-    // If --list, print profiles too and exit
+    // If --list, print available profiles and exit
     if args.list {
-        if let Some(ref pf) = profiles_file {
-            let profile_display: Vec<(String, String, usize)> = pf
-                .profiles
-                .iter()
-                .map(|(name, def)| (name.clone(), def.description.clone(), def.configs.len()))
-                .collect();
+        let profile_display = collect_profile_display_info(&all_configs);
+        if !profile_display.is_empty() {
             output::print_profile_list(&profile_display);
         }
         return Ok(());
@@ -924,8 +924,8 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Some(resolve_and_print_profile(
             &args.profile,
-            profiles_file.as_ref(),
             &all_configs,
+            &repo_root,
         )?)
     };
 

@@ -56,17 +56,11 @@ pub struct Config {
 
     /// Profile names this config belongs to.
     ///
-    /// When a user runs `--profile foo`, any config that lists `"foo"` here
-    /// will be auto-selected (in addition to central profiles file matches).
+    /// Keys are profile names. When a user runs `--profile foo`, any config
+    /// that has a `"foo"` key here is auto-selected. The `ProfileDefinition`
+    /// value carries optional defaults and additional config patterns.
     #[serde(default)]
-    pub profiles: Vec<String>,
-
-    /// Per-profile default overrides declared by this config.
-    ///
-    /// Keys are profile names, values are `ProfileDefaults`. These override
-    /// the central profiles file defaults for the same profile name.
-    #[serde(default)]
-    pub profile_defaults: BTreeMap<String, ProfileDefaults>,
+    pub profiles: BTreeMap<String, ProfileDefinition>,
 }
 
 /// A loaded configuration with metadata.
@@ -195,28 +189,25 @@ impl ProfileDefaults {
     }
 }
 
-/// A profile definition as declared in the central profiles file.
+/// A profile definition as declared in a configuration file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileDefinition {
     /// Human-readable description.
     #[serde(default)]
     pub description: String,
-    /// Config file patterns to auto-select (substring match on relative paths).
+    /// Additional config file patterns to auto-select.
+    ///
+    /// Patterns without a leading `/` are matched relative to the declaring
+    /// config's directory. Patterns with a leading `/` are matched relative
+    /// to the repository root. Uses glob syntax (e.g., `"*.config.toml"`).
+    ///
+    /// The declaring config is always implicitly included.
     #[serde(default)]
     pub configs: Vec<String>,
     /// Default settings for this profile.
     #[serde(default, flatten)]
     pub defaults: ProfileDefaults,
-}
-
-/// Top-level structure of a `worktree.profiles.toml` / `.ts` file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfilesFile {
-    /// Named profiles.
-    #[serde(default)]
-    pub profiles: BTreeMap<String, ProfileDefinition>,
 }
 
 /// A fully resolved profile ready for use by the CLI.

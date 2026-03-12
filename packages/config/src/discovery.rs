@@ -65,23 +65,6 @@ pub fn discover_configs(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(configs)
 }
 
-/// Discover the profiles file at the repository root.
-///
-/// Looks for `worktree.profiles.toml` first, then `worktree.profiles.ts`.
-/// Returns `None` if no profiles file is found.
-#[must_use]
-pub fn discover_profiles_file(repo_root: &Path) -> Option<PathBuf> {
-    for filename in ["worktree.profiles.toml", "worktree.profiles.ts"] {
-        let path = repo_root.join(filename);
-        if path.is_file() {
-            log::debug!("Found profiles file: {}", path.display());
-            return Some(path);
-        }
-    }
-    log::debug!("No profiles file found at {}", repo_root.display());
-    None
-}
-
 /// Get a display name for a loaded configuration.
 ///
 /// Returns a short, human-readable name based on the config's directory.

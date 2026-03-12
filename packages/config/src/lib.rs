@@ -31,14 +31,14 @@ mod toml_loader;
 mod ts_loader;
 mod types;
 
-pub use discovery::{discover_configs, discover_profiles_file, get_config_display_name};
+pub use discovery::{discover_configs, get_config_display_name};
 pub use error::ConfigError;
-pub use profiles::{load_profiles_file, resolve_profiles};
+pub use profiles::resolve_profiles;
 pub use toml_loader::load_toml_config;
 pub use ts_loader::load_ts_config;
 pub use types::{
     Config, CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ProfileDefaults,
-    ProfileDefinition, ProfilesFile, ResolvedProfile, TemplateMapping,
+    ProfileDefinition, ResolvedProfile, TemplateMapping,
 };
 
 use std::path::Path;

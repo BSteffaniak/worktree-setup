@@ -41,6 +41,14 @@ pub struct Args {
     #[arg(long)]
     pub remote: Option<String>,
 
+    /// Disable automatic branch inference from worktree directory name.
+    ///
+    /// When a profile sets `trackRemoteBranch = true`, the branch name is
+    /// normally inferred from the worktree directory name. This flag disables
+    /// that inference so you can pick from the full list of remote branches.
+    #[arg(long = "no-infer-branch")]
+    pub no_infer_branch: bool,
+
     /// Force worktree creation even if the path is already registered.
     #[arg(long, short = 'f')]
     pub force: bool,

@@ -101,6 +101,12 @@ pub struct ProfileDefaults {
     pub new_branch: Option<bool>,
     /// Remote name to use for remote branch operations.
     pub remote: Option<String>,
+    /// Default to tracking a remote branch when creating a worktree.
+    ///
+    /// When `true`, the interactive creation picker defaults to
+    /// "Track remote branch..." and the branch name is inferred from
+    /// the worktree directory name.
+    pub track_remote_branch: Option<bool>,
 }
 
 impl ProfileDefaults {
@@ -125,6 +131,9 @@ impl ProfileDefaults {
         }
         if other.remote.is_some() {
             self.remote.clone_from(&other.remote);
+        }
+        if other.track_remote_branch.is_some() {
+            self.track_remote_branch = other.track_remote_branch;
         }
     }
 }

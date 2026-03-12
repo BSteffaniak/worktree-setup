@@ -167,10 +167,14 @@ fn resolve_remote(repo: &Repository, override_name: Option<&str>) -> io::Result<
 /// presents a picker of remote branches. Falls back to default options
 /// if no remote branches are found.
 ///
+/// When `inferred_branch` is provided and a matching remote branch exists,
+/// a confirm prompt is shown instead of the full branch picker.
+///
 /// # Arguments
 ///
 /// * `repo` - The repository (needed for fetching and listing remote branches)
 /// * `remote_override` - If set, use this remote name instead of auto-detecting
+/// * `inferred_branch` - Branch name inferred from worktree directory (for auto-selection)
 ///
 /// # Errors
 ///
@@ -179,6 +183,7 @@ fn resolve_remote(repo: &Repository, override_name: Option<&str>) -> io::Result<
 fn prompt_remote_branch(
     repo: &Repository,
     remote_override: Option<&str>,
+    inferred_branch: Option<&str>,
 ) -> io::Result<WorktreeCreateOptions> {
     let remote = resolve_remote(repo, remote_override)?;
 
@@ -201,6 +206,29 @@ fn prompt_remote_branch(
         return Ok(WorktreeCreateOptions::default());
     }
 
+    let remote_prefix = format!("{remote}/");
+
+    // Try to auto-select from inferred branch name
+    if let Some(inferred) = inferred_branch {
+        let inferred_remote = format!("{remote_prefix}{inferred}");
+        if remote_branches.iter().any(|b| b == &inferred_remote) {
+            let use_inferred = Confirm::new()
+                .with_prompt(format!("Use inferred remote branch '{inferred_remote}'?"))
+                .default(true)
+                .interact()?;
+
+            if use_inferred {
+                return Ok(WorktreeCreateOptions {
+                    branch: Some(inferred.to_string()),
+                    ..Default::default()
+                });
+            }
+            // User declined — fall through to the full picker
+        } else {
+            println!("No remote branch matching '{inferred_remote}' found. Showing all branches.");
+        }
+    }
+
     let branch_idx = Select::new()
         .with_prompt("Select remote branch")
         .items(&remote_branches)
@@ -210,7 +238,6 @@ fn prompt_remote_branch(
     // We use strip_prefix with the exact remote name rather than splitting on '/'
     // to correctly handle branch names that contain slashes.
     let selected = &remote_branches[branch_idx];
-    let remote_prefix = format!("{remote}/");
     let local_name = selected
         .strip_prefix(&remote_prefix)
         .unwrap_or(selected.as_str());
@@ -219,6 +246,49 @@ fn prompt_remote_branch(
         branch: Some(local_name.to_string()),
         ..Default::default()
     })
+}
+
+/// Build the creation method options list and determine the default choice.
+///
+/// Returns `(display_labels, value_keys, default_index)`.
+fn build_creation_options(
+    worktree_name: &str,
+    current_branch: Option<&str>,
+    profile_track_remote: bool,
+) -> (Vec<String>, Vec<&'static str>, usize) {
+    let mut options: Vec<String> = Vec::new();
+    let mut option_values: Vec<&str> = Vec::new();
+
+    options.push(format!("New branch (auto-named '{worktree_name}')"));
+    option_values.push("auto");
+
+    options.push("New branch (custom name)...".to_string());
+    option_values.push("new");
+
+    if let Some(branch) = current_branch {
+        options.push(format!("Use current branch ({branch})"));
+        option_values.push("current");
+    }
+
+    options.push("Use existing branch...".to_string());
+    option_values.push("existing");
+
+    options.push("Track remote branch...".to_string());
+    option_values.push("remote");
+
+    options.push("Detached HEAD (current commit)".to_string());
+    option_values.push("detach");
+
+    let default_choice = if profile_track_remote {
+        option_values
+            .iter()
+            .position(|v| *v == "remote")
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    (options, option_values, default_choice)
 }
 
 /// Prompt for worktree creation options.
@@ -236,6 +306,8 @@ fn prompt_remote_branch(
 /// * `remote_override` - If set, use this remote name instead of auto-detecting
 /// * `profile_base_branch` - If set by a profile, preselect this as the base branch
 /// * `profile_new_branch` - If `true` (from profile), default to auto-named branch creation
+/// * `profile_track_remote` - If `true` (from profile), default to "Track remote branch..."
+/// * `inferred_branch` - Branch name inferred from worktree dir (for remote tracking)
 ///
 /// # Errors
 ///
@@ -252,6 +324,8 @@ pub fn prompt_worktree_create(
     remote_override: Option<&str>,
     profile_base_branch: Option<&str>,
     profile_new_branch: bool,
+    profile_track_remote: bool,
+    inferred_branch: Option<&str>,
 ) -> io::Result<Option<WorktreeCreateOptions>> {
     let should_create = Confirm::new()
         .with_prompt(format!(
@@ -265,46 +339,18 @@ pub fn prompt_worktree_create(
         return Ok(None);
     }
 
-    // Get the worktree name from the path (for auto-named branch option)
     let worktree_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
 
-    // Build the options list dynamically
-    let mut options: Vec<String> = Vec::new();
-    let mut option_values: Vec<&str> = Vec::new();
-
-    // Option 0: Auto-named branch (git's default behavior) - ALWAYS FIRST/DEFAULT
-    options.push(format!("New branch (auto-named '{worktree_name}')"));
-    option_values.push("auto");
-
-    // Option 1: Custom-named branch
-    options.push("New branch (custom name)...".to_string());
-    option_values.push("new");
-
-    // Option 2: Use current branch (only if we're on a branch)
-    if let Some(branch) = current_branch {
-        options.push(format!("Use current branch ({branch})"));
-        option_values.push("current");
-    }
-
-    // Option 3: Use existing branch
-    options.push("Use existing branch...".to_string());
-    option_values.push("existing");
-
-    // Option 4: Track remote branch
-    options.push("Track remote branch...".to_string());
-    option_values.push("remote");
-
-    // Option 5: Detached HEAD (advanced)
-    options.push("Detached HEAD (current commit)".to_string());
-    option_values.push("detach");
+    let (options, option_values, default_choice) =
+        build_creation_options(worktree_name, current_branch, profile_track_remote);
 
     let choice = Select::new()
         .with_prompt("How should the worktree be created?")
         .items(&options)
-        .default(0) // Default to auto-named branch
+        .default(default_choice)
         .interact()?;
 
     let selected_value = option_values[choice];
@@ -369,7 +415,7 @@ pub fn prompt_worktree_create(
                 }
             }
         }
-        "remote" => prompt_remote_branch(repo, remote_override)?,
+        "remote" => prompt_remote_branch(repo, remote_override, inferred_branch)?,
         "detach" => WorktreeCreateOptions {
             detach: true,
             ..Default::default()

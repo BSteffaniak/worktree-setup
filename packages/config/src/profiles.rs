@@ -291,18 +291,30 @@ description = "My app development"
 configs = ["apps/my-app/worktree.config.ts"]
 copyUnstaged = true
 baseBranch = "main"
+
+[profiles.remote]
+description = "Remote branch tracking"
+configs = ["apps/my-app/"]
+trackRemoteBranch = true
+remote = "origin"
 "#
         )
         .unwrap();
 
         let profiles = load_profiles_file(file.path()).unwrap();
-        assert_eq!(profiles.profiles.len(), 1);
+        assert_eq!(profiles.profiles.len(), 2);
 
         let profile = &profiles.profiles["my-app"];
         assert_eq!(profile.description, "My app development");
         assert_eq!(profile.configs, vec!["apps/my-app/worktree.config.ts"]);
         assert_eq!(profile.defaults.copy_unstaged, Some(true));
         assert_eq!(profile.defaults.base_branch.as_deref(), Some("main"));
+        assert_eq!(profile.defaults.track_remote_branch, None);
+
+        let remote_profile = &profiles.profiles["remote"];
+        assert_eq!(remote_profile.description, "Remote branch tracking");
+        assert_eq!(remote_profile.defaults.track_remote_branch, Some(true));
+        assert_eq!(remote_profile.defaults.remote.as_deref(), Some("origin"));
     }
 
     #[test]
@@ -409,6 +421,7 @@ baseBranch = "main"
         let overlay = ProfileDefaults {
             skip_post_setup: Some(true),
             remote: Some("upstream".to_string()),
+            track_remote_branch: Some(true),
             ..Default::default()
         };
 
@@ -419,6 +432,7 @@ baseBranch = "main"
         assert_eq!(base.base_branch.as_deref(), Some("main")); // kept
         assert_eq!(base.remote.as_deref(), Some("upstream")); // new
         assert_eq!(base.new_branch, None); // still None
+        assert_eq!(base.track_remote_branch, Some(true)); // new
     }
 
     // ─── Phase 2: Per-config profile declarations ──────────────────────────

@@ -21,8 +21,8 @@ use path_clean::PathClean;
 use args::{Args, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
-    LoadedConfig, ProfilesFile, ResolvedProfile, discover_configs, discover_profiles_file,
-    load_config, load_profiles_file, resolve_profiles,
+    LoadedConfig, ProfileDefaults, ProfilesFile, ResolvedProfile, discover_configs,
+    discover_profiles_file, load_config, load_profiles_file, resolve_profiles,
 };
 use worktree_setup_git::{
     GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
@@ -592,6 +592,8 @@ fn select_configs_or_profile(
 /// * `remote` — remote name for `--remote-branch` fetch
 /// * `base_branch` — base branch for new branch creation
 /// * `new_branch` — when `true`, auto-create a branch named after the worktree
+/// * `track_remote_branch` — when `true`, default to remote branch tracking and
+///   infer branch name from worktree directory
 fn handle_worktree_creation(
     args: &Args,
     repo: &worktree_setup_git::Repository,
@@ -599,79 +601,150 @@ fn handle_worktree_creation(
     profile: Option<&ResolvedProfile>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let profile_defaults = profile.map(|p| &p.defaults);
+    let track_remote = profile_defaults
+        .and_then(|d| d.track_remote_branch)
+        .unwrap_or(false);
+    let worktree_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
 
     let options = if args.non_interactive {
-        // Resolve remote: CLI --remote > profile remote > auto-detect
-        let effective_remote = args
-            .remote
-            .as_deref()
-            .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
-
-        // Handle --remote-branch: fetch first, then set branch to the remote ref
-        let branch = if let Some(ref remote_branch) = args.remote_branch {
-            let remote = resolve_remote_non_interactive(repo, effective_remote)?;
-            println!("Fetching from {remote}...");
-            fetch_remote(repo, &remote)?;
-            Some(remote_branch.clone())
-        } else {
-            // CLI --branch > profile base_branch > None
-            args.branch
-                .clone()
-                .or_else(|| profile_defaults.and_then(|d| d.base_branch.clone()))
-        };
-
-        // CLI --new-branch > profile new_branch (auto-name from worktree dir) > None
-        let new_branch = args.new_branch.clone().or_else(|| {
-            if profile_defaults.and_then(|d| d.new_branch) == Some(true) {
-                target_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(String::from)
-            } else {
-                None
-            }
-        });
-
-        println!("Creating worktree at {}...", target_path.display());
-        WorktreeCreateOptions {
-            branch,
-            new_branch,
-            force: args.force,
-            ..Default::default()
-        }
-    } else {
-        // Interactive creation — pass profile defaults to the prompt
-        let effective_remote = args
-            .remote
-            .as_deref()
-            .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
-        let profile_base_branch = profile_defaults.and_then(|d| d.base_branch.as_deref());
-        let profile_new_branch = profile_defaults.and_then(|d| d.new_branch).unwrap_or(false);
-
-        let current_branch = get_current_branch(repo)?;
-        let branches = get_local_branches(repo)?;
-        let default_branch = get_default_branch(repo);
-        let recent_branches = get_recent_branches(repo, 5);
-        match interactive::prompt_worktree_create(
+        handle_creation_non_interactive(
+            args,
             repo,
             target_path,
-            current_branch.as_deref(),
-            &branches,
-            default_branch.as_deref(),
-            &recent_branches,
-            effective_remote,
-            profile_base_branch,
-            profile_new_branch,
-        )? {
-            Some(options) => {
-                println!("\nCreating worktree at {}...", target_path.display());
-                options
-            }
-            None => return Ok(()),
-        }
+            profile_defaults,
+            track_remote,
+            worktree_name,
+        )?
+    } else {
+        let result = handle_creation_interactive(
+            args,
+            repo,
+            target_path,
+            profile_defaults,
+            track_remote,
+            worktree_name,
+        )?;
+        let Some(options) = result else {
+            return Ok(());
+        };
+        println!("\nCreating worktree at {}...", target_path.display());
+        options
     };
 
     create_worktree_with_recovery(repo, target_path, &options, args.non_interactive)
+}
+
+/// Non-interactive worktree creation.
+fn handle_creation_non_interactive(
+    args: &Args,
+    repo: &worktree_setup_git::Repository,
+    target_path: &Path,
+    profile_defaults: Option<&ProfileDefaults>,
+    track_remote: bool,
+    worktree_name: &str,
+) -> Result<WorktreeCreateOptions, Box<dyn std::error::Error>> {
+    // Resolve remote: CLI --remote > profile remote > auto-detect
+    let effective_remote = args
+        .remote
+        .as_deref()
+        .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+
+    // Handle --remote-branch or track_remote_branch profile default
+    let branch = if let Some(ref remote_branch) = args.remote_branch {
+        // Explicit --remote-branch: always use it
+        let remote = resolve_remote_non_interactive(repo, effective_remote)?;
+        println!("Fetching from {remote}...");
+        fetch_remote(repo, &remote)?;
+        Some(remote_branch.clone())
+    } else if track_remote && !args.no_infer_branch {
+        // Profile says track remote — infer branch from directory name
+        let remote = resolve_remote_non_interactive(repo, effective_remote)?;
+        println!("Fetching from {remote}...");
+        fetch_remote(repo, &remote)?;
+        println!("Inferred remote branch: {remote}/{worktree_name}");
+        Some(worktree_name.to_string())
+    } else if track_remote && args.no_infer_branch {
+        return Err(
+            "Profile sets trackRemoteBranch but --no-infer-branch is set. \
+             Use --remote-branch <name> to specify the branch explicitly."
+                .into(),
+        );
+    } else {
+        // CLI --branch > profile base_branch > None
+        args.branch
+            .clone()
+            .or_else(|| profile_defaults.and_then(|d| d.base_branch.clone()))
+    };
+
+    // CLI --new-branch > profile new_branch (auto-name from worktree dir) > None
+    // (not used when tracking a remote branch)
+    let new_branch = if track_remote || args.remote_branch.is_some() {
+        None
+    } else {
+        args.new_branch.clone().or_else(|| {
+            if profile_defaults.and_then(|d| d.new_branch) == Some(true) {
+                Some(worktree_name.to_string())
+            } else {
+                None
+            }
+        })
+    };
+
+    println!("Creating worktree at {}...", target_path.display());
+    Ok(WorktreeCreateOptions {
+        branch,
+        new_branch,
+        force: args.force,
+        ..Default::default()
+    })
+}
+
+/// Interactive worktree creation.
+///
+/// Returns `None` if the user declines to create the worktree.
+fn handle_creation_interactive(
+    args: &Args,
+    repo: &worktree_setup_git::Repository,
+    target_path: &Path,
+    profile_defaults: Option<&ProfileDefaults>,
+    track_remote: bool,
+    worktree_name: &str,
+) -> Result<Option<WorktreeCreateOptions>, Box<dyn std::error::Error>> {
+    let effective_remote = args
+        .remote
+        .as_deref()
+        .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+    let profile_base_branch = profile_defaults.and_then(|d| d.base_branch.as_deref());
+    let profile_new_branch = profile_defaults.and_then(|d| d.new_branch).unwrap_or(false);
+
+    // Infer branch name for remote tracking (unless --no-infer-branch)
+    let inferred_branch = if track_remote && !args.no_infer_branch {
+        Some(worktree_name)
+    } else {
+        None
+    };
+
+    let current_branch = get_current_branch(repo)?;
+    let branches = get_local_branches(repo)?;
+    let default_branch = get_default_branch(repo);
+    let recent_branches = get_recent_branches(repo, 5);
+
+    Ok(interactive::prompt_worktree_create(
+        repo,
+        target_path,
+        current_branch.as_deref(),
+        &branches,
+        default_branch.as_deref(),
+        &recent_branches,
+        effective_remote,
+        profile_base_branch,
+        profile_new_branch,
+        track_remote,
+        inferred_branch,
+    )?)
 }
 
 /// Attempt to create a worktree, recovering from stale registrations.

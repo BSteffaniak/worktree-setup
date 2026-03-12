@@ -57,6 +57,7 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 ///
 /// * `default_branch` - The detected default branch (e.g., "main" or "master")
 /// * `recent_branches` - Recently checked-out branches from reflog
+/// * `profile_base` - If set by a profile, this branch is preselected as the default
 ///
 /// # Returns
 ///
@@ -68,6 +69,7 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 fn prompt_base_branch(
     default_branch: Option<&str>,
     recent_branches: &[String],
+    profile_base: Option<&str>,
 ) -> io::Result<Option<String>> {
     use std::collections::BTreeSet;
 
@@ -88,12 +90,25 @@ fn prompt_base_branch(
         }
     }
 
+    // Add the profile base branch if it's not already in the list
+    if let Some(base) = profile_base
+        && !seen.contains(base)
+    {
+        options.push(base.to_string());
+        seen.insert(base.to_string());
+    }
+
     options.push("Enter custom branch/ref...".to_string());
+
+    // Determine default selection: profile base branch if set, otherwise Current HEAD
+    let default_idx = profile_base
+        .and_then(|base| options.iter().position(|o| o == base))
+        .unwrap_or(0);
 
     let choice = Select::new()
         .with_prompt("Base the new branch off")
         .items(&options)
-        .default(0)
+        .default(default_idx)
         .interact()?;
 
     let last_idx = options.len() - 1;
@@ -219,11 +234,14 @@ fn prompt_remote_branch(
 /// * `default_branch` - The detected default branch (e.g., "main" or "master")
 /// * `recent_branches` - Recently checked-out branches from reflog
 /// * `remote_override` - If set, use this remote name instead of auto-detecting
+/// * `profile_base_branch` - If set by a profile, preselect this as the base branch
+/// * `profile_new_branch` - If `true` (from profile), default to auto-named branch creation
 ///
 /// # Errors
 ///
 /// * If the user cancels the prompts
 /// * If fetching remote branches fails
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn prompt_worktree_create(
     repo: &Repository,
     target_path: &Path,
@@ -232,6 +250,8 @@ pub fn prompt_worktree_create(
     default_branch: Option<&str>,
     recent_branches: &[String],
     remote_override: Option<&str>,
+    profile_base_branch: Option<&str>,
+    profile_new_branch: bool,
 ) -> io::Result<Option<WorktreeCreateOptions>> {
     let should_create = Confirm::new()
         .with_prompt(format!(
@@ -291,8 +311,13 @@ pub fn prompt_worktree_create(
 
     let result = match selected_value {
         "auto" => {
-            // Let git create an auto-named branch, but ask what to base it off
-            let base_branch = prompt_base_branch(default_branch, recent_branches)?;
+            // If profile sets both new_branch and base_branch, use the base
+            // branch directly without prompting
+            let base_branch = if profile_new_branch && profile_base_branch.is_some() {
+                profile_base_branch.map(String::from)
+            } else {
+                prompt_base_branch(default_branch, recent_branches, profile_base_branch)?
+            };
 
             // For auto-named branch with a custom base, we need to explicitly
             // create the branch with -b, otherwise git just checks out the base branch
@@ -312,7 +337,8 @@ pub fn prompt_worktree_create(
                 .with_prompt("Enter new branch name")
                 .interact_text()?;
 
-            let base_branch = prompt_base_branch(default_branch, recent_branches)?;
+            let base_branch =
+                prompt_base_branch(default_branch, recent_branches, profile_base_branch)?;
 
             WorktreeCreateOptions {
                 new_branch: Some(branch_name),

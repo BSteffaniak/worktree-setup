@@ -584,31 +584,70 @@ fn select_configs_or_profile(
 // ─── Default flow (create + setup) ─────────────────────────────────────────
 
 /// Handle worktree creation (both interactive and non-interactive).
+///
+/// Profile defaults are applied with the following priority:
+/// * CLI flag > profile default > interactive prompt / builtin default
+///
+/// Profile defaults used:
+/// * `remote` — remote name for `--remote-branch` fetch
+/// * `base_branch` — base branch for new branch creation
+/// * `new_branch` — when `true`, auto-create a branch named after the worktree
 fn handle_worktree_creation(
     args: &Args,
     repo: &worktree_setup_git::Repository,
     target_path: &Path,
+    profile: Option<&ResolvedProfile>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let profile_defaults = profile.map(|p| &p.defaults);
+
     let options = if args.non_interactive {
+        // Resolve remote: CLI --remote > profile remote > auto-detect
+        let effective_remote = args
+            .remote
+            .as_deref()
+            .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+
         // Handle --remote-branch: fetch first, then set branch to the remote ref
         let branch = if let Some(ref remote_branch) = args.remote_branch {
-            let remote = resolve_remote_non_interactive(repo, args.remote.as_deref())?;
+            let remote = resolve_remote_non_interactive(repo, effective_remote)?;
             println!("Fetching from {remote}...");
             fetch_remote(repo, &remote)?;
             Some(remote_branch.clone())
         } else {
-            args.branch.clone()
+            // CLI --branch > profile base_branch > None
+            args.branch
+                .clone()
+                .or_else(|| profile_defaults.and_then(|d| d.base_branch.clone()))
         };
+
+        // CLI --new-branch > profile new_branch (auto-name from worktree dir) > None
+        let new_branch = args.new_branch.clone().or_else(|| {
+            if profile_defaults.and_then(|d| d.new_branch) == Some(true) {
+                target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            } else {
+                None
+            }
+        });
 
         println!("Creating worktree at {}...", target_path.display());
         WorktreeCreateOptions {
             branch,
-            new_branch: args.new_branch.clone(),
+            new_branch,
             force: args.force,
             ..Default::default()
         }
     } else {
-        // Interactive creation
+        // Interactive creation — pass profile defaults to the prompt
+        let effective_remote = args
+            .remote
+            .as_deref()
+            .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+        let profile_base_branch = profile_defaults.and_then(|d| d.base_branch.as_deref());
+        let profile_new_branch = profile_defaults.and_then(|d| d.new_branch).unwrap_or(false);
+
         let current_branch = get_current_branch(repo)?;
         let branches = get_local_branches(repo)?;
         let default_branch = get_default_branch(repo);
@@ -620,7 +659,9 @@ fn handle_worktree_creation(
             &branches,
             default_branch.as_deref(),
             &recent_branches,
-            args.remote.as_deref(),
+            effective_remote,
+            profile_base_branch,
+            profile_new_branch,
         )? {
             Some(options) => {
                 println!("\nCreating worktree at {}...", target_path.display());
@@ -806,7 +847,7 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle worktree creation
     if !target_path.exists() {
-        handle_worktree_creation(args, &repo, &target_path)?;
+        handle_worktree_creation(args, &repo, &target_path, resolved_profile.as_ref())?;
     }
 
     // Verify target exists

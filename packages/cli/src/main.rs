@@ -22,8 +22,8 @@ use args::{Args, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
 use worktree_setup_git::{
-    WorktreeCreateOptions, create_worktree, discover_repo, get_current_branch, get_default_branch,
-    get_local_branches, get_main_worktree, get_recent_branches, get_repo_root,
+    WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote, get_current_branch,
+    get_default_branch, get_local_branches, get_main_worktree, get_recent_branches, get_repo_root,
     get_unstaged_and_untracked_files,
 };
 use worktree_setup_operations::{
@@ -430,6 +430,53 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── Default flow (create + setup) ─────────────────────────────────────────
 
+/// Handle worktree creation (both interactive and non-interactive).
+fn handle_worktree_creation(
+    args: &Args,
+    repo: &worktree_setup_git::Repository,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.non_interactive {
+        // Handle --remote-branch: fetch first, then set branch to the remote ref
+        let branch = if let Some(ref remote_branch) = args.remote_branch {
+            println!("Fetching from origin...");
+            fetch_remote(repo, "origin")?;
+            // Pass the remote ref directly; git will create a local tracking branch
+            Some(format!("origin/{remote_branch}"))
+        } else {
+            args.branch.clone()
+        };
+
+        // Create with provided options
+        // Default behavior: let git create an auto-named branch (don't set detach: true)
+        println!("Creating worktree at {}...", target_path.display());
+        let options = WorktreeCreateOptions {
+            branch,
+            new_branch: args.new_branch.clone(),
+            detach: false,
+        };
+        create_worktree(repo, target_path, &options)?;
+    } else {
+        // Interactive creation
+        let current_branch = get_current_branch(repo)?;
+        let branches = get_local_branches(repo)?;
+        let default_branch = get_default_branch(repo);
+        let recent_branches = get_recent_branches(repo, 5);
+        if let Some(options) = interactive::prompt_worktree_create(
+            repo,
+            target_path,
+            current_branch.as_deref(),
+            &branches,
+            default_branch.as_deref(),
+            &recent_branches,
+        )? {
+            println!("\nCreating worktree at {}...", target_path.display());
+            create_worktree(repo, target_path, &options)?;
+        }
+    }
+    Ok(())
+}
+
 /// Main application logic for the default (no subcommand) flow.
 ///
 /// This is the original create-worktree-and-setup-it flow.
@@ -496,33 +543,7 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle worktree creation
     if !target_path.exists() {
-        if args.non_interactive {
-            // Create with provided options
-            // Default behavior: let git create an auto-named branch (don't set detach: true)
-            println!("Creating worktree at {}...", target_path.display());
-            let options = WorktreeCreateOptions {
-                branch: args.branch.clone(),
-                new_branch: args.new_branch.clone(),
-                detach: false, // Don't default to detached HEAD - let git create auto-named branch
-            };
-            create_worktree(&repo, &target_path, &options)?;
-        } else {
-            // Interactive creation
-            let current_branch = get_current_branch(&repo)?;
-            let branches = get_local_branches(&repo)?;
-            let default_branch = get_default_branch(&repo);
-            let recent_branches = get_recent_branches(&repo, 5);
-            if let Some(options) = interactive::prompt_worktree_create(
-                &target_path,
-                current_branch.as_deref(),
-                &branches,
-                default_branch.as_deref(),
-                &recent_branches,
-            )? {
-                println!("\nCreating worktree at {}...", target_path.display());
-                create_worktree(&repo, &target_path, &options)?;
-            }
-        }
+        handle_worktree_creation(args, &repo, &target_path)?;
     }
 
     // Verify target exists

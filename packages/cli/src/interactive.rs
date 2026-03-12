@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use worktree_setup_config::LoadedConfig;
-use worktree_setup_git::WorktreeCreateOptions;
+use worktree_setup_git::{Repository, WorktreeCreateOptions, fetch_remote, get_remote_branches};
 
 /// Select which configs to apply from a list.
 ///
@@ -109,12 +109,57 @@ fn prompt_base_branch(
     }
 }
 
+/// Prompt for tracking a remote branch.
+///
+/// Optionally fetches from origin, then presents a picker of remote branches.
+/// Falls back to default options if no remote branches are found.
+///
+/// # Arguments
+///
+/// * `repo` - The repository (needed for fetching and listing remote branches)
+///
+/// # Errors
+///
+/// * If the user cancels the prompts
+/// * If fetching or listing remote branches fails
+fn prompt_remote_branch(repo: &Repository) -> io::Result<WorktreeCreateOptions> {
+    let should_fetch = Confirm::new()
+        .with_prompt("Fetch latest from remote?")
+        .default(true)
+        .interact()?;
+
+    if should_fetch {
+        println!("Fetching from origin...");
+        fetch_remote(repo, "origin")
+            .map_err(|e| io::Error::other(format!("Failed to fetch: {e}")))?;
+    }
+
+    let remote_branches = get_remote_branches(repo)
+        .map_err(|e| io::Error::other(format!("Failed to list remote branches: {e}")))?;
+
+    if remote_branches.is_empty() {
+        println!("No remote branches found. Using auto-named branch instead.");
+        return Ok(WorktreeCreateOptions::default());
+    }
+
+    let branch_idx = Select::new()
+        .with_prompt("Select remote branch")
+        .items(&remote_branches)
+        .interact()?;
+
+    Ok(WorktreeCreateOptions {
+        branch: Some(remote_branches[branch_idx].clone()),
+        ..Default::default()
+    })
+}
+
 /// Prompt for worktree creation options.
 ///
 /// Returns `None` if the user doesn't want to create a worktree.
 ///
 /// # Arguments
 ///
+/// * `repo` - The repository (needed for fetching remote branches)
 /// * `target_path` - The path where the worktree will be created
 /// * `current_branch` - The current branch name, if on a branch (None if detached HEAD)
 /// * `branches` - List of available local branches
@@ -124,7 +169,9 @@ fn prompt_base_branch(
 /// # Errors
 ///
 /// * If the user cancels the prompts
+/// * If fetching remote branches fails
 pub fn prompt_worktree_create(
+    repo: &Repository,
     target_path: &Path,
     current_branch: Option<&str>,
     branches: &[String],
@@ -171,7 +218,11 @@ pub fn prompt_worktree_create(
     options.push("Use existing branch...".to_string());
     option_values.push("existing");
 
-    // Option 4: Detached HEAD (advanced)
+    // Option 4: Track remote branch
+    options.push("Track remote branch...".to_string());
+    option_values.push("remote");
+
+    // Option 5: Detached HEAD (advanced)
     options.push("Detached HEAD (current commit)".to_string());
     option_values.push("detach");
 
@@ -237,6 +288,7 @@ pub fn prompt_worktree_create(
                 }
             }
         }
+        "remote" => prompt_remote_branch(repo)?,
         "detach" => WorktreeCreateOptions {
             detach: true,
             ..Default::default()

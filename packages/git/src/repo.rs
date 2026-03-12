@@ -177,6 +177,75 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
     None
 }
 
+/// Get a list of remote branch names.
+///
+/// Returns branch names in the format `origin/branch-name`.
+/// Filters out `HEAD` pointer refs like `origin/HEAD`.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+///
+/// # Errors
+///
+/// * If the branch list cannot be retrieved
+pub fn get_remote_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
+    let branches = repo
+        .branches(Some(git2::BranchType::Remote))
+        .map_err(GitError::BranchListError)?;
+
+    let mut names = Vec::new();
+    for branch in branches {
+        let (branch, _) = branch.map_err(GitError::BranchListError)?;
+        if let Some(name) = branch.name().map_err(GitError::BranchListError)? {
+            // Skip HEAD pointer refs (e.g., "origin/HEAD")
+            if name.ends_with("/HEAD") {
+                continue;
+            }
+            names.push(name.to_string());
+        }
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+/// Fetch from a remote using the git CLI.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+/// * `remote` - The remote name to fetch from (e.g., `"origin"`)
+///
+/// # Errors
+///
+/// * If the fetch command fails
+pub fn fetch_remote(repo: &Repository, remote: &str) -> Result<(), GitError> {
+    let repo_root = get_repo_root(repo)?;
+
+    log::debug!("Fetching from remote '{remote}'");
+
+    let output = std::process::Command::new("git")
+        .args(["fetch", remote])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| GitError::FetchError {
+            remote: remote.to_string(),
+            source: git2::Error::from_str(&e.to_string()),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitError::FetchError {
+            remote: remote.to_string(),
+            source: git2::Error::from_str(&stderr),
+        });
+    }
+
+    log::info!("Fetched from remote '{remote}'");
+    Ok(())
+}
+
 /// Get recently checked-out branches from the reflog.
 ///
 /// Returns up to `limit` unique branch names, most recent first.

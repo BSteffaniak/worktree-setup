@@ -26,9 +26,10 @@ mod status;
 mod worktree;
 
 pub use error::GitError;
+pub use git2::Repository;
 pub use repo::{
-    discover_repo, get_current_branch, get_default_branch, get_local_branches, get_recent_branches,
-    get_repo_root, get_workdir, open_repo,
+    discover_repo, fetch_remote, get_current_branch, get_default_branch, get_local_branches,
+    get_recent_branches, get_remote_branches, get_repo_root, get_workdir, open_repo,
 };
 pub use status::get_unstaged_and_untracked_files;
 pub use worktree::{

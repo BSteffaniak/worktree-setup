@@ -33,6 +33,10 @@ pub struct Args {
     #[arg(long)]
     pub new_branch: Option<String>,
 
+    /// Track a remote branch (fetches from origin first).
+    #[arg(long)]
+    pub remote_branch: Option<String>,
+
     /// Specific config file to use (can be specified multiple times).
     #[arg(long = "config", short = 'c')]
     pub configs: Vec<String>,

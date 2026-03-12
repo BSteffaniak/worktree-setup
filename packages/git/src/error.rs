@@ -61,6 +61,16 @@ pub enum GitError {
     #[error("Failed to list branches: {0}")]
     BranchListError(#[source] git2::Error),
 
+    /// Failed to fetch from remote.
+    #[error("Failed to fetch from remote '{remote}': {source}")]
+    FetchError {
+        /// The remote that was being fetched.
+        remote: String,
+        /// The underlying git2 error.
+        #[source]
+        source: git2::Error,
+    },
+
     /// No main worktree found.
     #[error("No main worktree found")]
     NoMainWorktree,

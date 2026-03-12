@@ -29,6 +29,59 @@ pub fn print_config_list(configs: &[(String, String)]) {
     println!();
 }
 
+/// Print a list of available profiles.
+pub fn print_profile_list(profiles: &[(String, String, usize)]) {
+    if profiles.is_empty() {
+        return;
+    }
+    println!(
+        "Available profile{}:",
+        if profiles.len() == 1 { "" } else { "s" }
+    );
+    for (name, description, config_count) in profiles {
+        let config_label = if *config_count == 1 {
+            "config".to_string()
+        } else {
+            format!("{config_count} configs")
+        };
+        if description.is_empty() {
+            println!("  {} {} ({})", "•".dimmed(), name.cyan(), config_label);
+        } else {
+            println!(
+                "  {} {} - {} ({})",
+                "•".dimmed(),
+                name.cyan(),
+                description,
+                config_label
+            );
+        }
+    }
+    println!();
+}
+
+/// Print profile usage info.
+pub fn print_using_profile(names: &[String]) {
+    let label = if names.len() == 1 {
+        format!("Using profile: {}", names[0])
+    } else {
+        format!("Using profiles: {}", names.join(", "))
+    };
+    println!("{}", label.cyan());
+}
+
+/// Print the configs selected by a profile.
+pub fn print_profile_configs(configs: &[(String, String)]) {
+    println!(
+        "Using {} config{}:",
+        configs.len(),
+        if configs.len() == 1 { "" } else { "s" }
+    );
+    for (path, description) in configs {
+        println!("  {} {} - {}", "•".dimmed(), path.yellow(), description);
+    }
+    println!();
+}
+
 /// Print a post-setup command being run.
 pub fn print_command(cmd: &str) {
     println!("  {} {}", "$".dimmed(), cmd);

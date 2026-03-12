@@ -49,6 +49,10 @@ pub struct Args {
     #[arg(long = "config", short = 'c')]
     pub configs: Vec<String>,
 
+    /// Use a named profile for config selection and defaults (repeatable).
+    #[arg(long)]
+    pub profile: Vec<String>,
+
     /// Skip running post-setup commands.
     #[arg(long = "no-install")]
     pub no_install: bool,
@@ -101,6 +105,10 @@ pub struct SetupArgs {
     #[arg(long = "config", short = 'c')]
     pub configs: Vec<String>,
 
+    /// Use a named profile for config selection and defaults (repeatable).
+    #[arg(long)]
+    pub profile: Vec<String>,
+
     /// Default file operations checkbox to unchecked.
     #[arg(long = "no-files")]
     pub no_files: bool,
@@ -148,12 +156,6 @@ impl Args {
         } else {
             None
         }
-    }
-
-    /// Determine if we should run post-setup commands.
-    #[must_use]
-    pub const fn should_run_install(&self) -> bool {
-        !self.no_install
     }
 
     /// Determine if we should show progress bars.

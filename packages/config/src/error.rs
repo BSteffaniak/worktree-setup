@@ -65,4 +65,8 @@ pub enum ConfigError {
     /// IO error during config discovery.
     #[error("IO error during config discovery: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// Profile not found.
+    #[error("Profile not found: '{0}'. Use --list to see available profiles.")]
+    ProfileNotFound(String),
 }

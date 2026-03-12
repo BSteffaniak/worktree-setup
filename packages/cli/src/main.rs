@@ -20,7 +20,10 @@ use path_clean::PathClean;
 
 use args::{Args, SetupArgs};
 use progress::ProgressManager;
-use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
+use worktree_setup_config::{
+    LoadedConfig, ProfilesFile, ResolvedProfile, discover_configs, discover_profiles_file,
+    load_config, load_profiles_file, resolve_profiles,
+};
 use worktree_setup_git::{
     GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
     get_current_branch, get_default_branch, get_local_branches, get_main_worktree,
@@ -126,6 +129,58 @@ fn select_configs(
         // Interactive selection
         Ok(interactive::select_configs(all_configs)?)
     }
+}
+
+/// Load the profiles file from the repo root (if it exists).
+///
+/// Returns `None` if no profiles file is found. Prints a warning if
+/// the file exists but fails to load.
+fn load_profiles(repo_root: &Path) -> Option<ProfilesFile> {
+    let path = discover_profiles_file(repo_root)?;
+    match load_profiles_file(&path) {
+        Ok(profiles) => {
+            log::debug!("Loaded {} profiles", profiles.profiles.len());
+            Some(profiles)
+        }
+        Err(e) => {
+            output::print_warning(&format!("Failed to load profiles file: {e}"));
+            None
+        }
+    }
+}
+
+/// Resolve profiles and select configs, applying profile defaults.
+///
+/// When `--profile` is used, this resolves the named profiles against the
+/// profiles file and loaded configs, returning the resolved profile with
+/// config indices and merged defaults. Prints the profile info and selected
+/// configs.
+///
+/// # Errors
+///
+/// * If any requested profile is not found
+fn resolve_and_print_profile(
+    profile_names: &[String],
+    profiles_file: Option<&ProfilesFile>,
+    all_configs: &[LoadedConfig],
+) -> Result<ResolvedProfile, Box<dyn std::error::Error>> {
+    let resolved = resolve_profiles(profile_names, profiles_file, all_configs)?;
+
+    output::print_using_profile(&resolved.names);
+
+    let config_display: Vec<(String, String)> = resolved
+        .config_indices
+        .iter()
+        .map(|&i| {
+            (
+                all_configs[i].relative_path.clone(),
+                all_configs[i].config.description.clone(),
+            )
+        })
+        .collect();
+    output::print_profile_configs(&config_display);
+
+    Ok(resolved)
 }
 
 /// Execute file operations for the given configs against a target worktree.
@@ -290,6 +345,67 @@ fn collect_post_setup_commands<'a>(configs: &[&'a LoadedConfig]) -> Vec<&'a str>
 
 // ─── Subcommand: setup ──────────────────────────────────────────────────────
 
+/// Resolve whether post-setup should run based on CLI flag and profile default.
+///
+/// Priority: CLI `--no-install` flag > profile `skip_post_setup` > default (true).
+const fn should_run_post_setup(no_install: bool, profile: Option<&ResolvedProfile>) -> bool {
+    if no_install {
+        return false;
+    }
+    if let Some(p) = profile
+        && let Some(skip) = p.defaults.skip_post_setup
+    {
+        return !skip;
+    }
+    true
+}
+
+/// Resolve whether overwrite should be enabled based on CLI flag and profile default.
+fn should_overwrite(overwrite_flag: bool, profile: Option<&ResolvedProfile>) -> bool {
+    overwrite_flag
+        || profile
+            .and_then(|p| p.defaults.overwrite_existing)
+            .unwrap_or(false)
+}
+
+/// Determine what operations to run in `setup` mode.
+///
+/// Returns `(run_files, overwrite_existing, run_post_setup)`.
+fn determine_setup_operations(
+    args: &SetupArgs,
+    resolved_profile: Option<&ResolvedProfile>,
+    is_secondary_worktree: bool,
+    unique_commands: &[&str],
+) -> Result<(bool, bool, bool), Box<dyn std::error::Error>> {
+    if args.non_interactive {
+        let run_files = is_secondary_worktree && !args.no_files;
+        let run_post_setup = should_run_post_setup(args.no_install, resolved_profile);
+        let overwrite = should_overwrite(args.overwrite, resolved_profile);
+        return Ok((run_files, overwrite, run_post_setup));
+    }
+
+    // Interactive: show checklist (profile defaults affect initial checkbox states)
+    let default_files = is_secondary_worktree && !args.no_files;
+    let default_overwrite = should_overwrite(args.overwrite, resolved_profile);
+    let default_post_setup = should_run_post_setup(args.no_install, resolved_profile);
+
+    let choices = interactive::prompt_setup_operations(
+        &interactive::SetupOperationDefaults {
+            is_secondary_worktree,
+            files: default_files,
+            overwrite: default_overwrite,
+            post_setup: default_post_setup,
+        },
+        unique_commands,
+    )?;
+
+    Ok((
+        choices.run_files,
+        choices.overwrite_existing,
+        choices.run_post_setup,
+    ))
+}
+
 /// Run the `setup` subcommand.
 ///
 /// Applies worktree configs to an existing directory. On a secondary worktree,
@@ -297,27 +413,7 @@ fn collect_post_setup_commands<'a>(configs: &[&'a LoadedConfig]) -> Vec<&'a str>
 /// a regular clone, only post-setup commands are run.
 fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-
-    // Resolve target path (default to CWD)
-    let target_path = if let Some(ref path) = args.target_path {
-        if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        }
-        .clean()
-    } else {
-        cwd
-    };
-
-    // Verify target exists
-    if !target_path.exists() {
-        output::print_error(&format!(
-            "Target path does not exist: {}",
-            target_path.display()
-        ));
-        std::process::exit(1);
-    }
+    let target_path = resolve_setup_target(&cwd, args.target_path.as_ref());
 
     // Discover repository from the target directory
     let repo = discover_repo(&target_path)?;
@@ -329,16 +425,7 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine if the target is a secondary worktree
     let main_worktree = get_main_worktree(&repo)?;
-    let is_secondary_worktree = {
-        let target_canonical = target_path
-            .canonicalize()
-            .unwrap_or_else(|_| target_path.clone());
-        let main_canonical = main_worktree
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| main_worktree.path.clone());
-        target_canonical != main_canonical
-    };
+    let is_secondary_worktree = is_secondary(&target_path, &main_worktree.path);
 
     if !is_secondary_worktree {
         output::print_info("Not a secondary worktree. File operations will be skipped.");
@@ -353,13 +440,29 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Select configs
-    let selected_indices = select_configs(&all_configs, &args.configs, args.non_interactive)?;
+    // Load profiles and resolve if --profile was provided
+    let profiles_file = load_profiles(&repo_root);
+    let resolved_profile = if args.profile.is_empty() {
+        None
+    } else {
+        Some(resolve_and_print_profile(
+            &args.profile,
+            profiles_file.as_ref(),
+            &all_configs,
+        )?)
+    };
 
-    if selected_indices.is_empty() {
+    // Select configs: profile overrides normal selection
+    let selected_indices = select_configs_or_profile(
+        &all_configs,
+        args.non_interactive,
+        &args.configs,
+        resolved_profile.as_ref(),
+    )?;
+    let Some(selected_indices) = selected_indices else {
         println!("No configs selected. Exiting.");
         return Ok(());
-    }
+    };
 
     let selected_configs: Vec<&LoadedConfig> =
         selected_indices.iter().map(|&i| &all_configs[i]).collect();
@@ -368,34 +471,12 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let unique_commands = collect_post_setup_commands(&selected_configs);
 
     // Determine what to run
-    let (run_files, overwrite_existing, run_post_setup) = if args.non_interactive {
-        // Non-interactive: use defaults as modified by flags
-        let run_files = is_secondary_worktree && !args.no_files;
-        let run_post_setup = !args.no_install;
-        let overwrite = args.overwrite;
-        (run_files, overwrite, run_post_setup)
-    } else {
-        // Interactive: show checklist
-        let default_files = is_secondary_worktree && !args.no_files;
-        let default_overwrite = args.overwrite;
-        let default_post_setup = !args.no_install;
-
-        let choices = interactive::prompt_setup_operations(
-            &interactive::SetupOperationDefaults {
-                is_secondary_worktree,
-                files: default_files,
-                overwrite: default_overwrite,
-                post_setup: default_post_setup,
-            },
-            &unique_commands,
-        )?;
-
-        (
-            choices.run_files,
-            choices.overwrite_existing,
-            choices.run_post_setup,
-        )
-    };
+    let (run_files, overwrite_existing, run_post_setup) = determine_setup_operations(
+        args,
+        resolved_profile.as_ref(),
+        is_secondary_worktree,
+        &unique_commands,
+    )?;
 
     // Nothing selected
     if !run_files && !run_post_setup {
@@ -405,6 +486,12 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute file operations
     if run_files {
+        let copy_unstaged_override = args.copy_unstaged_override().or_else(|| {
+            resolved_profile
+                .as_ref()
+                .and_then(|p| p.defaults.copy_unstaged)
+        });
+
         println!("\nApplying file operations to: {}", target_path.display());
         println!("Source (main worktree): {}\n", main_worktree.path.display());
 
@@ -412,7 +499,7 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             &selected_configs,
             &main_worktree.path,
             &target_path,
-            args.copy_unstaged_override(),
+            copy_unstaged_override,
             overwrite_existing,
             args.should_show_progress(),
         )?;
@@ -427,6 +514,71 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     output::print_success();
     Ok(())
+}
+
+/// Resolve the target path for the `setup` subcommand.
+///
+/// Defaults to the current working directory if no path is provided.
+/// Exits the process if the resolved path does not exist.
+#[must_use]
+fn resolve_setup_target(cwd: &Path, target: Option<&PathBuf>) -> PathBuf {
+    let target_path = target.map_or_else(
+        || cwd.to_path_buf(),
+        |path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            }
+            .clean()
+        },
+    );
+
+    if !target_path.exists() {
+        output::print_error(&format!(
+            "Target path does not exist: {}",
+            target_path.display()
+        ));
+        std::process::exit(1);
+    }
+
+    target_path
+}
+
+/// Check if the target path is a secondary worktree (not the main one).
+fn is_secondary(target: &Path, main_worktree_path: &Path) -> bool {
+    let target_canonical = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let main_canonical = main_worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| main_worktree_path.to_path_buf());
+    target_canonical != main_canonical
+}
+
+/// Select configs from either a resolved profile or normal selection.
+///
+/// Returns `None` if no configs are selected (caller should exit).
+/// Returns `Some(indices)` with the selected config indices.
+fn select_configs_or_profile(
+    all_configs: &[LoadedConfig],
+    non_interactive: bool,
+    config_patterns: &[String],
+    profile: Option<&ResolvedProfile>,
+) -> Result<Option<Vec<usize>>, Box<dyn std::error::Error>> {
+    if let Some(p) = profile {
+        if p.config_indices.is_empty() {
+            output::print_warning("Profile matched no configs.");
+            return Ok(None);
+        }
+        return Ok(Some(p.config_indices.clone()));
+    }
+
+    let indices = select_configs(all_configs, config_patterns, non_interactive)?;
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(indices))
 }
 
 // ─── Default flow (create + setup) ─────────────────────────────────────────
@@ -581,23 +733,46 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Discover and load configs
     let all_configs = discover_and_load_configs(&repo_root)?;
 
-    // If --list, exit (after printing any discovered configs above)
+    // Load profiles file (if it exists)
+    let profiles_file = load_profiles(&repo_root);
+
+    // If --list, print profiles too and exit
     if args.list {
+        if let Some(ref pf) = profiles_file {
+            let profile_display: Vec<(String, String, usize)> = pf
+                .profiles
+                .iter()
+                .map(|(name, def)| (name.clone(), def.description.clone(), def.configs.len()))
+                .collect();
+            output::print_profile_list(&profile_display);
+        }
         return Ok(());
     }
 
-    // Select configs (only if we have valid configs to select from)
+    // Resolve profiles (if --profile was provided)
+    let resolved_profile = if args.profile.is_empty() {
+        None
+    } else {
+        Some(resolve_and_print_profile(
+            &args.profile,
+            profiles_file.as_ref(),
+            &all_configs,
+        )?)
+    };
+
+    // Select configs: profile overrides normal selection
     let selected_configs: Vec<&LoadedConfig> = if all_configs.is_empty() {
         Vec::new()
+    } else if let Some(indices) = select_configs_or_profile(
+        &all_configs,
+        args.non_interactive,
+        &args.configs,
+        resolved_profile.as_ref(),
+    )? {
+        indices.iter().map(|&i| &all_configs[i]).collect()
     } else {
-        let selected_indices = select_configs(&all_configs, &args.configs, args.non_interactive)?;
-
-        if selected_indices.is_empty() {
-            println!("No configs selected. Exiting.");
-            return Ok(());
-        }
-
-        selected_indices.iter().map(|&i| &all_configs[i]).collect()
+        println!("No configs selected. Exiting.");
+        return Ok(());
     };
 
     // Get target path
@@ -645,38 +820,65 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply config setup operations (only if configs were selected)
     if !selected_configs.is_empty() {
-        println!("\nSetting up worktree: {}", target_path.display());
-        println!("Main worktree: {}\n", main_worktree.path.display());
-
-        execute_file_operations(
+        apply_create_operations(
+            args,
             &selected_configs,
+            resolved_profile.as_ref(),
             &main_worktree.path,
             &target_path,
-            args.copy_unstaged_override(),
-            false, // No overwrite in create flow (fresh worktree)
-            args.should_show_progress(),
         )?;
-
-        println!();
-
-        // Collect all post-setup commands
-        let unique_commands = collect_post_setup_commands(&selected_configs);
-
-        // Run post-setup commands
-        if !unique_commands.is_empty() && args.should_run_install() {
-            let should_run = if args.non_interactive {
-                true
-            } else {
-                interactive::prompt_run_install(true)?
-            };
-
-            if should_run {
-                run_post_setup_commands(&unique_commands, &target_path)?;
-            }
-        }
     }
 
     output::print_success();
+    Ok(())
+}
+
+/// Apply file operations and post-setup commands during worktree creation.
+fn apply_create_operations(
+    args: &Args,
+    selected_configs: &[&LoadedConfig],
+    resolved_profile: Option<&ResolvedProfile>,
+    main_worktree_path: &Path,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\nSetting up worktree: {}", target_path.display());
+    println!("Main worktree: {}\n", main_worktree_path.display());
+
+    // Determine copy_unstaged: CLI flag > profile default > config default
+    let copy_unstaged_override = args
+        .copy_unstaged_override()
+        .or_else(|| resolved_profile.and_then(|p| p.defaults.copy_unstaged));
+
+    execute_file_operations(
+        selected_configs,
+        main_worktree_path,
+        target_path,
+        copy_unstaged_override,
+        false, // No overwrite in create flow (fresh worktree)
+        args.should_show_progress(),
+    )?;
+
+    println!();
+
+    // Collect all post-setup commands
+    let unique_commands = collect_post_setup_commands(selected_configs);
+
+    // Determine if post-setup should run: CLI flag > profile default > prompt
+    let should_run_install = should_run_post_setup(args.no_install, resolved_profile);
+
+    // Run post-setup commands
+    if !unique_commands.is_empty() && should_run_install {
+        let should_run = if args.non_interactive {
+            true
+        } else {
+            interactive::prompt_run_install(true)?
+        };
+
+        if should_run {
+            run_post_setup_commands(&unique_commands, target_path)?;
+        }
+    }
+
     Ok(())
 }
 

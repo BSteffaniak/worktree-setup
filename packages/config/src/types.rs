@@ -54,6 +54,15 @@ pub struct Config {
     #[serde(default)]
     pub post_setup: Vec<String>,
 
+    /// Paths and glob patterns to delete when running `clean`.
+    ///
+    /// Supports exact relative paths (e.g., `"node_modules"`, `".turbo"`) and
+    /// glob patterns (e.g., `"**/dist"`, `"*.log"`). Paths are relative to the
+    /// config directory. Resolved paths must remain within the target worktree
+    /// directory (containment check).
+    #[serde(default)]
+    pub clean: Vec<String>,
+
     /// Profile names this config belongs to.
     ///
     /// Keys are profile names. When a user runs `--profile foo`, any config

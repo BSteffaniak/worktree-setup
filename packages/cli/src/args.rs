@@ -99,6 +99,13 @@ pub enum Command {
     /// (symlinks, copies, templates) and/or runs post-setup commands.
     /// Defaults to the current directory if no path is given.
     Setup(SetupArgs),
+
+    /// Delete files and directories specified in worktree configs.
+    ///
+    /// Resolves `clean` paths from selected config files, shows a preview
+    /// of what will be deleted with sizes, and prompts for confirmation.
+    /// Supports exact paths and glob patterns.
+    Clean(CleanArgs),
 }
 
 /// Arguments for the `setup` subcommand.
@@ -194,4 +201,41 @@ impl SetupArgs {
     pub const fn should_show_progress(&self) -> bool {
         !self.no_progress
     }
+}
+
+/// Arguments for the `clean` subcommand.
+#[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CleanArgs {
+    /// Path to the target directory (defaults to current directory).
+    #[arg(index = 1)]
+    pub target_path: Option<PathBuf>,
+
+    /// Specific config file to use (can be specified multiple times).
+    #[arg(long = "config", short = 'c')]
+    pub configs: Vec<String>,
+
+    /// Use a named profile for config selection and defaults (repeatable).
+    #[arg(long)]
+    pub profile: Vec<String>,
+
+    /// Skip confirmation prompt and delete immediately.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// Preview what would be deleted without actually deleting.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Run without prompts (requires --force or --dry-run).
+    #[arg(long)]
+    pub non_interactive: bool,
+
+    /// Disable progress bars (useful for CI environments).
+    #[arg(long = "no-progress")]
+    pub no_progress: bool,
+
+    /// Enable verbose output.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }

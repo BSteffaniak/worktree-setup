@@ -18,6 +18,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 colored = { workspace = true }
 dialoguer = { workspace = true }
+glob = { workspace = true }
 indicatif = { workspace = true }
 log = { workspace = true }
 path-clean = { workspace = true }
@@ -29,3 +30,6 @@ worktree_setup_operations = { workspace = true }
 [features]
 default = []
 fail-on-warnings = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

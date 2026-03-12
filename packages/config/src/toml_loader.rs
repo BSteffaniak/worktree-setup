@@ -70,6 +70,28 @@ postSetup = ["npm install"]
         assert_eq!(config.copy_glob, vec!["**/*.env"]);
         assert!(config.copy_unstaged);
         assert_eq!(config.post_setup, vec!["npm install"]);
+        assert!(config.clean.is_empty());
+    }
+
+    #[test]
+    fn test_load_toml_config_with_clean() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+description = "Config with clean paths"
+clean = ["node_modules", ".turbo", "**/dist", "*.log"]
+"#
+        )
+        .unwrap();
+
+        let config = load_toml_config(file.path()).unwrap();
+
+        assert_eq!(config.description, "Config with clean paths");
+        assert_eq!(
+            config.clean,
+            vec!["node_modules", ".turbo", "**/dist", "*.log"]
+        );
     }
 
     #[test]
@@ -83,6 +105,7 @@ postSetup = ["npm install"]
         assert!(config.symlinks.is_empty());
         assert!(config.copy.is_empty());
         assert!(!config.copy_unstaged);
+        assert!(config.clean.is_empty());
         assert!(config.profiles.is_empty());
     }
 

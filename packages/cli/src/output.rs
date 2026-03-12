@@ -106,3 +106,80 @@ pub fn print_warning(message: &str) {
 pub fn print_info(message: &str) {
     println!("{} {}", "Info:".cyan().bold(), message);
 }
+
+/// An item resolved for cleaning (deletion).
+pub struct CleanItem {
+    /// Display path relative to the target directory.
+    pub relative_path: String,
+    /// Whether this is a directory (vs a file).
+    pub is_dir: bool,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// Format a byte count as a human-readable size string.
+///
+/// Uses binary units: B, KB, MB, GB.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Print a detailed preview of items that will be cleaned (deleted).
+///
+/// Shows each item with its type (dir/file), relative path, and size.
+/// Prints a summary line with total count and total size.
+pub fn print_clean_preview(items: &[CleanItem]) {
+    if items.is_empty() {
+        println!("Nothing to clean.");
+        return;
+    }
+
+    println!(
+        "Will delete {} item{}:",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" }
+    );
+
+    for item in items {
+        let type_label = if item.is_dir { "dir " } else { "file" };
+        let size_str = format_size(item.size);
+        println!(
+            "  {} {} {} {}",
+            "•".dimmed(),
+            format!("[{type_label}]").dimmed(),
+            item.relative_path.yellow(),
+            format!("({size_str})").dimmed(),
+        );
+    }
+
+    let total_size: u64 = items.iter().map(|i| i.size).sum();
+    println!(
+        "\n  {} {}",
+        "Total:".bold(),
+        format!("{} items, {}", items.len(), format_size(total_size)).bold()
+    );
+}
+
+/// Print a summary after cleaning completes.
+pub fn print_clean_summary(deleted_count: usize, total_size: u64) {
+    println!(
+        "Deleted {} item{}, freed {}",
+        deleted_count,
+        if deleted_count == 1 { "" } else { "s" },
+        format_size(total_size)
+    );
+}

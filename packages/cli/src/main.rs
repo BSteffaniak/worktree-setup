@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Parser;
+use colored::Colorize;
 use path_clean::PathClean;
 
-use args::{Args, SetupArgs};
+use args::{Args, CleanArgs, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
     CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ResolvedProfile,
@@ -41,6 +42,7 @@ fn main() {
     // Set up logging based on top-level or subcommand verbose flag
     let verbose = match &args.command {
         Some(args::Command::Setup(setup_args)) => setup_args.verbose,
+        Some(args::Command::Clean(clean_args)) => clean_args.verbose,
         None => args.verbose,
     };
 
@@ -54,6 +56,7 @@ fn main() {
 
     let result = match args.command {
         Some(args::Command::Setup(ref setup_args)) => run_setup(setup_args),
+        Some(args::Command::Clean(ref clean_args)) => run_clean(clean_args),
         None => run_create(&args),
     };
 
@@ -579,6 +582,332 @@ fn resolve_setup_target(cwd: &Path, target: Option<&PathBuf>) -> PathBuf {
     }
 
     target_path
+}
+
+// ─── Subcommand: clean ──────────────────────────────────────────────────────
+
+/// Check whether a pattern string contains glob metacharacters.
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+/// Calculate the total size of a path (file or directory, recursive).
+fn path_size(path: &Path) -> u64 {
+    if path.is_file() || path.is_symlink() {
+        path.metadata().map_or(0, |m| m.len())
+    } else if path.is_dir() {
+        walkdir(path)
+    } else {
+        0
+    }
+}
+
+/// Recursively sum file sizes in a directory.
+fn walkdir(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += walkdir(&path);
+            } else {
+                total += path.metadata().map_or(0, |m| m.len());
+            }
+        }
+    }
+    total
+}
+
+/// Resolve clean paths from selected configs into concrete items to delete.
+///
+/// For each config's `clean` entries:
+/// * Exact paths are resolved relative to the config's directory as mapped
+///   into the target worktree
+/// * Glob patterns are expanded the same way
+///
+/// All resolved paths must be inside `target_canonical` (containment check).
+/// Paths that don't exist on disk are silently skipped.
+/// Duplicate paths (by canonical path) are deduplicated.
+fn resolve_clean_paths(
+    selected_configs: &[&LoadedConfig],
+    target_path: &Path,
+    target_canonical: &Path,
+    repo_root: &Path,
+) -> Vec<(PathBuf, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut results: Vec<(PathBuf, String)> = Vec::new();
+
+    for config in selected_configs {
+        // Map the config directory into the target worktree.
+        // Config dir is absolute (e.g. /repo/apps/my-app), we need the same
+        // relative offset inside the target worktree.
+        let config_rel = config
+            .config_dir
+            .strip_prefix(repo_root)
+            .unwrap_or(&config.config_dir);
+        let target_config_dir = target_path.join(config_rel);
+
+        for pattern in &config.config.clean {
+            if is_glob_pattern(pattern) {
+                resolve_clean_glob(
+                    pattern,
+                    &target_config_dir,
+                    target_canonical,
+                    &mut seen,
+                    &mut results,
+                );
+            } else {
+                resolve_clean_exact(
+                    pattern,
+                    &target_config_dir,
+                    target_canonical,
+                    &mut seen,
+                    &mut results,
+                );
+            }
+        }
+    }
+
+    results
+}
+
+/// Resolve a single exact clean path.
+fn resolve_clean_exact(
+    pattern: &str,
+    target_config_dir: &Path,
+    target_canonical: &Path,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+    results: &mut Vec<(PathBuf, String)>,
+) {
+    let candidate = target_config_dir.join(pattern);
+
+    if !candidate.exists() {
+        log::debug!(
+            "Clean path does not exist, skipping: {}",
+            candidate.display()
+        );
+        return;
+    }
+
+    let Ok(canonical) = candidate.canonicalize() else {
+        log::warn!("Could not canonicalize clean path: {}", candidate.display());
+        return;
+    };
+
+    if !canonical.starts_with(target_canonical) {
+        log::warn!("Clean path escapes target directory, skipping: {pattern}");
+        return;
+    }
+
+    if seen.insert(canonical.clone()) {
+        let relative = canonical.strip_prefix(target_canonical).map_or_else(
+            |_| candidate.to_string_lossy().to_string(),
+            |r| r.to_string_lossy().to_string(),
+        );
+        results.push((canonical, relative));
+    }
+}
+
+/// Resolve a glob clean pattern.
+fn resolve_clean_glob(
+    pattern: &str,
+    target_config_dir: &Path,
+    target_canonical: &Path,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+    results: &mut Vec<(PathBuf, String)>,
+) {
+    let full_pattern = target_config_dir.join(pattern);
+    let full_pattern_str = full_pattern.to_string_lossy();
+
+    let entries = match glob::glob(&full_pattern_str) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("Invalid glob pattern '{pattern}': {e}");
+            return;
+        }
+    };
+
+    for entry in entries {
+        let Ok(path) = entry else {
+            continue;
+        };
+
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+
+        if !canonical.starts_with(target_canonical) {
+            log::warn!("Clean path escapes target directory, skipping: {pattern}");
+            continue;
+        }
+
+        if seen.insert(canonical.clone()) {
+            let relative = canonical.strip_prefix(target_canonical).map_or_else(
+                |_| path.to_string_lossy().to_string(),
+                |r| r.to_string_lossy().to_string(),
+            );
+            results.push((canonical, relative));
+        }
+    }
+}
+
+/// Run the `clean` subcommand.
+///
+/// Discovers clean paths from selected configs, shows a preview with sizes,
+/// prompts for confirmation (unless `--force` or `--dry-run`), and deletes.
+fn run_clean(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let target_path = resolve_setup_target(&cwd, args.target_path.as_ref());
+
+    // Discover repository from the target directory
+    let repo = discover_repo(&target_path)?;
+    let repo_root = get_repo_root(&repo)?;
+
+    output::print_header("Worktree Clean");
+    output::print_repo_info(&repo_root.to_string_lossy());
+    println!();
+
+    // Discover and load configs
+    let all_configs = discover_and_load_configs(&repo_root)?;
+
+    if all_configs.is_empty() {
+        output::print_warning("No configs found. Nothing to clean.");
+        return Ok(());
+    }
+
+    // Resolve profiles if --profile was provided
+    let resolved_profile = if args.profile.is_empty() {
+        None
+    } else {
+        Some(resolve_and_print_profile(
+            &args.profile,
+            &all_configs,
+            &repo_root,
+        )?)
+    };
+
+    // Select configs: profile overrides normal selection
+    let selected_indices = select_configs_or_profile(
+        &all_configs,
+        args.non_interactive,
+        &args.configs,
+        resolved_profile.as_ref(),
+    )?;
+    let Some(selected_indices) = selected_indices else {
+        println!("No configs selected. Exiting.");
+        return Ok(());
+    };
+
+    let selected_configs: Vec<&LoadedConfig> =
+        selected_indices.iter().map(|&i| &all_configs[i]).collect();
+
+    // Check if any selected config has clean paths
+    let has_clean_paths = selected_configs.iter().any(|c| !c.config.clean.is_empty());
+    if !has_clean_paths {
+        output::print_info("No clean paths defined in selected configs.");
+        return Ok(());
+    }
+
+    // Canonicalize the target for containment checks
+    let target_canonical = target_path.canonicalize().map_err(|e| {
+        format!(
+            "Could not canonicalize target path '{}': {}",
+            target_path.display(),
+            e
+        )
+    })?;
+
+    // Resolve clean paths
+    let resolved = resolve_clean_paths(
+        &selected_configs,
+        &target_path,
+        &target_canonical,
+        &repo_root,
+    );
+
+    if resolved.is_empty() {
+        output::print_info("All clean paths are already clean (nothing exists to delete).");
+        return Ok(());
+    }
+
+    // Build preview items with sizes
+    let items: Vec<output::CleanItem> = resolved
+        .iter()
+        .map(|(abs_path, rel_path)| {
+            let is_dir = abs_path.is_dir();
+            let size = path_size(abs_path);
+            output::CleanItem {
+                relative_path: rel_path.clone(),
+                is_dir,
+                size,
+            }
+        })
+        .collect();
+
+    println!();
+    output::print_clean_preview(&items);
+
+    // Dry run: stop here
+    if args.dry_run {
+        println!("\n{}", "Dry run — nothing was deleted.".dimmed());
+        return Ok(());
+    }
+
+    // Confirm and execute deletion
+    confirm_and_delete(args.force, args.non_interactive, &resolved, &items)
+}
+
+/// Prompt for confirmation (unless forced) and delete the resolved paths.
+fn confirm_and_delete(
+    force: bool,
+    non_interactive: bool,
+    resolved: &[(PathBuf, String)],
+    items: &[output::CleanItem],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !force {
+        if non_interactive {
+            return Err(
+                "Clean requires confirmation. Use --force to skip, or --dry-run to preview.".into(),
+            );
+        }
+
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt("Proceed with deletion?")
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted_count = 0usize;
+    let mut total_size = 0u64;
+
+    for (idx, (abs_path, _rel_path)) in resolved.iter().enumerate() {
+        let item = &items[idx];
+        let result = if abs_path.is_dir() {
+            std::fs::remove_dir_all(abs_path)
+        } else {
+            std::fs::remove_file(abs_path)
+        };
+
+        match result {
+            Ok(()) => {
+                deleted_count += 1;
+                total_size += item.size;
+            }
+            Err(e) => {
+                output::print_warning(&format!("Failed to delete '{}': {}", item.relative_path, e));
+            }
+        }
+    }
+
+    println!();
+    output::print_clean_summary(deleted_count, total_size);
+
+    Ok(())
 }
 
 /// Check if the target path is a secondary worktree (not the main one).
@@ -1255,5 +1584,204 @@ mod tests {
         let profile = make_profile(ProfileDefaults::default());
         let result = resolve_overwrite(false, Some(&profile));
         assert_eq!(result, None);
+    }
+
+    // ─── is_glob_pattern ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_glob_pattern() {
+        assert!(!is_glob_pattern("node_modules"));
+        assert!(!is_glob_pattern(".turbo"));
+        assert!(!is_glob_pattern("path/to/dir"));
+        assert!(is_glob_pattern("**/dist"));
+        assert!(is_glob_pattern("*.log"));
+        assert!(is_glob_pattern("src/[ab]"));
+        assert!(is_glob_pattern("dir?name"));
+    }
+
+    // ─── format_size ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(output::format_size(0), "0 B");
+        assert_eq!(output::format_size(512), "512 B");
+        assert_eq!(output::format_size(1023), "1023 B");
+        assert_eq!(output::format_size(1024), "1.0 KB");
+        assert_eq!(output::format_size(1536), "1.5 KB");
+        assert_eq!(output::format_size(1_048_576), "1.0 MB");
+        assert_eq!(output::format_size(1_572_864), "1.5 MB");
+        assert_eq!(output::format_size(1_073_741_824), "1.0 GB");
+    }
+
+    // ─── resolve_clean_paths ────────────────────────────────────────────
+
+    fn make_loaded_config_with_clean(
+        relative_path: &str,
+        config_dir: &Path,
+        clean: Vec<String>,
+    ) -> LoadedConfig {
+        LoadedConfig {
+            config: worktree_setup_config::Config {
+                clean,
+                ..Default::default()
+            },
+            config_path: config_dir.join("worktree.config.toml"),
+            config_dir: config_dir.to_path_buf(),
+            relative_path: relative_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_clean_exact_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        // Simulate config at repo_root/apps/my-app/
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Simulate target worktree with same structure
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+        std::fs::create_dir_all(&target_app_dir).unwrap();
+
+        // Create files to clean in target
+        std::fs::create_dir_all(target_app_dir.join("node_modules")).unwrap();
+        std::fs::write(target_app_dir.join("node_modules/pkg.js"), "data").unwrap();
+        std::fs::create_dir_all(target_app_dir.join(".turbo")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string(), ".turbo".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert_eq!(resolved.len(), 2);
+        // Check relative paths contain the expected names
+        let rel_paths: Vec<&str> = resolved.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rel_paths.iter().any(|p| p.contains("node_modules")));
+        assert!(rel_paths.iter().any(|p| p.contains(".turbo")));
+    }
+
+    #[test]
+    fn test_resolve_clean_glob_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Create dist directories to match **/dist
+        std::fs::create_dir_all(target_app_dir.join("dist")).unwrap();
+        std::fs::write(target_app_dir.join("dist/bundle.js"), "code").unwrap();
+        std::fs::create_dir_all(target_app_dir.join("src/dist")).unwrap();
+        std::fs::write(target_app_dir.join("src/dist/out.js"), "code").unwrap();
+        // Create a non-matching directory
+        std::fs::create_dir_all(target_app_dir.join("src/lib")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["**/dist".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert_eq!(resolved.len(), 2);
+        let rel_paths: Vec<&str> = resolved.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rel_paths.iter().all(|p| p.contains("dist")));
+        assert!(!rel_paths.iter().any(|p| p.contains("lib")));
+    }
+
+    #[test]
+    fn test_resolve_clean_nonexistent_paths_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+        std::fs::create_dir_all(&target_app_dir).unwrap();
+        // Don't create node_modules — it shouldn't appear in results
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_clean_containment_rejects_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+        std::fs::create_dir_all(&target_app_dir).unwrap();
+
+        // Create a file outside the target that .. would reach
+        std::fs::write(repo_root.join("secret.txt"), "sensitive").unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["../../../secret.txt".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // The escaping path should be rejected
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_clean_dedup_across_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+        std::fs::create_dir_all(target_app_dir.join("node_modules")).unwrap();
+
+        // Two configs both reference the same path
+        let config1 = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string()],
+        );
+        let config2 = make_loaded_config_with_clean(
+            "apps/my-app/worktree.local.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved =
+            resolve_clean_paths(&[&config1, &config2], &target, &target_canonical, repo_root);
+
+        // Should only appear once despite two configs referencing it
+        assert_eq!(resolved.len(), 1);
     }
 }

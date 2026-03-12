@@ -127,4 +127,80 @@ postSetup = "none"
         );
         assert_eq!(ci_defaults.copy_unstaged, None);
     }
+
+    #[test]
+    fn test_load_toml_config_with_all_new_profile_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+description = "Config with all Phase 3 fields"
+profiles = ["full"]
+
+[profileDefaults.full]
+autoCreate = true
+creationMethod = "remote"
+baseBranch = "main"
+newBranch = false
+remote = "upstream"
+overwriteExisting = true
+copyUnstaged = false
+postSetup = "all"
+skipPostSetup = ["bun generate", "bun build"]
+"#
+        )
+        .unwrap();
+
+        let config = load_toml_config(file.path()).unwrap();
+
+        let defaults = &config.profile_defaults["full"];
+        assert_eq!(defaults.auto_create, Some(true));
+        assert_eq!(
+            defaults.creation_method,
+            Some(crate::types::CreationMethod::Remote)
+        );
+        assert_eq!(defaults.base_branch.as_deref(), Some("main"));
+        assert_eq!(defaults.new_branch, Some(false));
+        assert_eq!(defaults.remote.as_deref(), Some("upstream"));
+        assert_eq!(defaults.overwrite_existing, Some(true));
+        assert_eq!(defaults.copy_unstaged, Some(false));
+        assert_eq!(
+            defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All
+            ))
+        );
+        assert_eq!(
+            defaults.skip_post_setup,
+            vec!["bun generate".to_string(), "bun build".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_load_toml_config_with_post_setup_commands_list() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+description = "Config with commands list"
+profiles = ["selective"]
+
+[profileDefaults.selective]
+postSetup = ["bun install", "bun migrate"]
+"#
+        )
+        .unwrap();
+
+        let config = load_toml_config(file.path()).unwrap();
+
+        let defaults = &config.profile_defaults["selective"];
+        assert_eq!(
+            defaults.post_setup,
+            Some(crate::types::PostSetupMode::Commands(vec![
+                "bun install".to_string(),
+                "bun migrate".to_string(),
+            ]))
+        );
+        assert!(defaults.skip_post_setup.is_empty());
+    }
 }

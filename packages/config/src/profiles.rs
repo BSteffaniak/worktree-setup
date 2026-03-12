@@ -690,4 +690,326 @@ remote = "origin"
         // "ci" profile_defaults should NOT be applied when resolving "dev"
         assert_eq!(resolved.defaults.post_setup, None);
     }
+
+    // ─── Phase 3: New field deserialization and merge ───────────────────────
+
+    #[test]
+    fn test_load_toml_profiles_all_creation_methods() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        writeln!(
+            file,
+            r#"
+[profiles.auto-profile]
+description = "Auto creation"
+configs = ["apps/"]
+creationMethod = "auto"
+autoCreate = true
+newBranch = true
+baseBranch = "main"
+
+[profiles.current-profile]
+description = "Current branch"
+configs = ["apps/"]
+creationMethod = "current"
+
+[profiles.remote-profile]
+description = "Remote branch"
+configs = ["apps/"]
+creationMethod = "remote"
+remote = "upstream"
+
+[profiles.detach-profile]
+description = "Detached HEAD"
+configs = ["apps/"]
+creationMethod = "detach"
+"#
+        )
+        .unwrap();
+
+        let profiles = load_profiles_file(file.path()).unwrap();
+        assert_eq!(profiles.profiles.len(), 4);
+
+        // Auto
+        let auto = &profiles.profiles["auto-profile"];
+        assert_eq!(
+            auto.defaults.creation_method,
+            Some(crate::types::CreationMethod::Auto)
+        );
+        assert_eq!(auto.defaults.auto_create, Some(true));
+        assert_eq!(auto.defaults.new_branch, Some(true));
+        assert_eq!(auto.defaults.base_branch.as_deref(), Some("main"));
+
+        // Current
+        let current = &profiles.profiles["current-profile"];
+        assert_eq!(
+            current.defaults.creation_method,
+            Some(crate::types::CreationMethod::Current)
+        );
+
+        // Remote
+        let remote = &profiles.profiles["remote-profile"];
+        assert_eq!(
+            remote.defaults.creation_method,
+            Some(crate::types::CreationMethod::Remote)
+        );
+        assert_eq!(remote.defaults.remote.as_deref(), Some("upstream"));
+
+        // Detach
+        let detach = &profiles.profiles["detach-profile"];
+        assert_eq!(
+            detach.defaults.creation_method,
+            Some(crate::types::CreationMethod::Detach)
+        );
+    }
+
+    #[test]
+    fn test_load_toml_profiles_post_setup_variants() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        writeln!(
+            file,
+            r#"
+[profiles.run-all]
+description = "Run all post-setup"
+configs = ["apps/"]
+postSetup = "all"
+
+[profiles.run-none]
+description = "Skip all post-setup"
+configs = ["apps/"]
+postSetup = "none"
+
+[profiles.run-specific]
+description = "Run specific commands"
+configs = ["apps/"]
+postSetup = ["bun install", "bun generate"]
+
+[profiles.run-all-skip]
+description = "Run all except some"
+configs = ["apps/"]
+postSetup = "all"
+skipPostSetup = ["bun generate"]
+"#
+        )
+        .unwrap();
+
+        let profiles = load_profiles_file(file.path()).unwrap();
+        assert_eq!(profiles.profiles.len(), 4);
+
+        // postSetup = "all"
+        let run_all = &profiles.profiles["run-all"];
+        assert_eq!(
+            run_all.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All
+            ))
+        );
+        assert!(run_all.defaults.skip_post_setup.is_empty());
+
+        // postSetup = "none"
+        let run_none = &profiles.profiles["run-none"];
+        assert_eq!(
+            run_none.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None
+            ))
+        );
+
+        // postSetup = ["bun install", "bun generate"]
+        let run_specific = &profiles.profiles["run-specific"];
+        assert_eq!(
+            run_specific.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Commands(vec![
+                "bun install".to_string(),
+                "bun generate".to_string(),
+            ]))
+        );
+
+        // postSetup = "all" + skipPostSetup = ["bun generate"]
+        let run_all_skip = &profiles.profiles["run-all-skip"];
+        assert_eq!(
+            run_all_skip.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All
+            ))
+        );
+        assert_eq!(
+            run_all_skip.defaults.skip_post_setup,
+            vec!["bun generate".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_skip_post_setup_vec() {
+        // Non-empty overlay wins over empty base
+        let mut base = ProfileDefaults::default();
+        let overlay = ProfileDefaults {
+            skip_post_setup: vec!["bun install".to_string()],
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(base.skip_post_setup, vec!["bun install".to_string()]);
+
+        // Non-empty base kept when overlay is empty
+        let mut base = ProfileDefaults {
+            skip_post_setup: vec!["bun install".to_string()],
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+        assert_eq!(base.skip_post_setup, vec!["bun install".to_string()]);
+
+        // Non-empty overlay replaces non-empty base
+        let mut base = ProfileDefaults {
+            skip_post_setup: vec!["bun install".to_string()],
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults {
+            skip_post_setup: vec!["bun generate".to_string(), "bun build".to_string()],
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(
+            base.skip_post_setup,
+            vec!["bun generate".to_string(), "bun build".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_auto_create() {
+        // auto_create overlay wins
+        let mut base = ProfileDefaults {
+            auto_create: Some(false),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults {
+            auto_create: Some(true),
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(base.auto_create, Some(true));
+
+        // auto_create base kept when overlay is None
+        let mut base = ProfileDefaults {
+            auto_create: Some(true),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+        assert_eq!(base.auto_create, Some(true));
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_overwrite_existing() {
+        // overwrite_existing overlay wins
+        let mut base = ProfileDefaults {
+            overwrite_existing: Some(false),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults {
+            overwrite_existing: Some(true),
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(base.overwrite_existing, Some(true));
+
+        // Base kept when overlay is None
+        let mut base = ProfileDefaults {
+            overwrite_existing: Some(true),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+        assert_eq!(base.overwrite_existing, Some(true));
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_new_branch() {
+        // new_branch overlay wins
+        let mut base = ProfileDefaults::default();
+        let overlay = ProfileDefaults {
+            new_branch: Some(true),
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(base.new_branch, Some(true));
+
+        // Base kept when overlay is None
+        let mut base = ProfileDefaults {
+            new_branch: Some(true),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+        assert_eq!(base.new_branch, Some(true));
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_creation_method_variants() {
+        // creation_method overlay replaces base
+        let mut base = ProfileDefaults {
+            creation_method: Some(crate::types::CreationMethod::Auto),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults {
+            creation_method: Some(crate::types::CreationMethod::Detach),
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert_eq!(
+            base.creation_method,
+            Some(crate::types::CreationMethod::Detach)
+        );
+
+        // Base kept when overlay is None
+        let mut base = ProfileDefaults {
+            creation_method: Some(crate::types::CreationMethod::Current),
+            ..Default::default()
+        };
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+        assert_eq!(
+            base.creation_method,
+            Some(crate::types::CreationMethod::Current)
+        );
+    }
+
+    #[test]
+    fn test_profile_defaults_merge_all_default_is_noop() {
+        // Merging with a fully-default overlay should not change anything
+        let mut base = ProfileDefaults {
+            copy_unstaged: Some(true),
+            overwrite_existing: Some(false),
+            auto_create: Some(true),
+            creation_method: Some(crate::types::CreationMethod::Remote),
+            base_branch: Some("main".to_string()),
+            new_branch: Some(true),
+            remote: Some("origin".to_string()),
+            post_setup: Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All,
+            )),
+            skip_post_setup: vec!["bun generate".to_string()],
+        };
+
+        let original_skip = base.skip_post_setup.clone();
+        let overlay = ProfileDefaults::default();
+        base.merge(&overlay);
+
+        assert_eq!(base.copy_unstaged, Some(true));
+        assert_eq!(base.overwrite_existing, Some(false));
+        assert_eq!(base.auto_create, Some(true));
+        assert_eq!(
+            base.creation_method,
+            Some(crate::types::CreationMethod::Remote)
+        );
+        assert_eq!(base.base_branch.as_deref(), Some("main"));
+        assert_eq!(base.new_branch, Some(true));
+        assert_eq!(base.remote.as_deref(), Some("origin"));
+        assert_eq!(
+            base.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All
+            ))
+        );
+        assert_eq!(base.skip_post_setup, original_skip);
+    }
 }

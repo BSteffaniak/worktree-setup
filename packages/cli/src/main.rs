@@ -1085,3 +1085,175 @@ fn format_result_string(
         (OperationResult::Skipped, _) => "skipped".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use worktree_setup_config::{
+        PostSetupKeyword, PostSetupMode, ProfileDefaults, ResolvedProfile,
+    };
+
+    /// Build a `ResolvedProfile` with the given defaults (helper).
+    fn make_profile(defaults: ProfileDefaults) -> ResolvedProfile {
+        ResolvedProfile {
+            names: vec!["test".to_string()],
+            defaults,
+            ..Default::default()
+        }
+    }
+
+    // ─── resolve_post_setup_commands ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_post_setup_no_install_flag_wins() {
+        // --no-install always returns empty, even if profile says "all"
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Keyword(PostSetupKeyword::All)),
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate"];
+
+        let result = resolve_post_setup_commands(true, Some(&profile), &cmds);
+        assert_eq!(result, Some(Vec::<&str>::new()));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_none_keyword() {
+        // post_setup = "none" → skip all, no prompt
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Keyword(PostSetupKeyword::None)),
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, Some(Vec::<&str>::new()));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_all_keyword() {
+        // post_setup = "all" → run all commands
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Keyword(PostSetupKeyword::All)),
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, Some(vec!["bun install", "bun generate"]));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_all_with_skip() {
+        // post_setup = "all" + skip_post_setup = ["bun generate"] → run all except skipped
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Keyword(PostSetupKeyword::All)),
+            skip_post_setup: vec!["bun generate".to_string()],
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate", "bun build"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, Some(vec!["bun install", "bun build"]));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_commands_list() {
+        // post_setup = ["bun install"] → run only matching commands
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Commands(vec!["bun install".to_string()])),
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate", "bun build"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, Some(vec!["bun install"]));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_commands_list_no_match() {
+        // post_setup = ["nonexistent"] → empty (no matching available commands)
+        let profile = make_profile(ProfileDefaults {
+            post_setup: Some(PostSetupMode::Commands(vec!["nonexistent".to_string()])),
+            ..Default::default()
+        });
+        let cmds = vec!["bun install", "bun generate"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, Some(Vec::<&str>::new()));
+    }
+
+    #[test]
+    fn test_resolve_post_setup_not_set_returns_none() {
+        // post_setup not set → None (prompt the user)
+        let profile = make_profile(ProfileDefaults::default());
+        let cmds = vec!["bun install"];
+
+        let result = resolve_post_setup_commands(false, Some(&profile), &cmds);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_post_setup_no_profile_returns_none() {
+        // No profile at all → None (prompt the user)
+        let cmds = vec!["bun install"];
+
+        let result = resolve_post_setup_commands(false, None, &cmds);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_post_setup_no_install_without_profile() {
+        // --no-install with no profile → empty
+        let cmds = vec!["bun install"];
+
+        let result = resolve_post_setup_commands(true, None, &cmds);
+        assert_eq!(result, Some(Vec::<&str>::new()));
+    }
+
+    // ─── resolve_overwrite ─────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_overwrite_flag_wins() {
+        // --overwrite flag → Some(true), regardless of profile
+        let profile = make_profile(ProfileDefaults {
+            overwrite_existing: Some(false),
+            ..Default::default()
+        });
+
+        let result = resolve_overwrite(true, Some(&profile));
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn test_resolve_overwrite_from_profile() {
+        // No flag, profile sets overwrite_existing → that value
+        let profile = make_profile(ProfileDefaults {
+            overwrite_existing: Some(true),
+            ..Default::default()
+        });
+
+        let result = resolve_overwrite(false, Some(&profile));
+        assert_eq!(result, Some(true));
+
+        // Profile says false
+        let profile_false = make_profile(ProfileDefaults {
+            overwrite_existing: Some(false),
+            ..Default::default()
+        });
+        let result = resolve_overwrite(false, Some(&profile_false));
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn test_resolve_overwrite_neither_set() {
+        // No flag, no profile → None (prompt)
+        let result = resolve_overwrite(false, None);
+        assert_eq!(result, None);
+
+        // No flag, profile doesn't set overwrite_existing → None
+        let profile = make_profile(ProfileDefaults::default());
+        let result = resolve_overwrite(false, Some(&profile));
+        assert_eq!(result, None);
+    }
+}

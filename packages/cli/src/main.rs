@@ -22,9 +22,10 @@ use args::{Args, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
 use worktree_setup_git::{
-    WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote, get_current_branch,
-    get_default_branch, get_local_branches, get_main_worktree, get_recent_branches, get_remotes,
-    get_repo_root, get_unstaged_and_untracked_files,
+    GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
+    get_current_branch, get_default_branch, get_local_branches, get_main_worktree,
+    get_recent_branches, get_remotes, get_repo_root, get_unstaged_and_untracked_files,
+    prune_worktrees,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
@@ -436,36 +437,31 @@ fn handle_worktree_creation(
     repo: &worktree_setup_git::Repository,
     target_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.non_interactive {
+    let options = if args.non_interactive {
         // Handle --remote-branch: fetch first, then set branch to the remote ref
         let branch = if let Some(ref remote_branch) = args.remote_branch {
             let remote = resolve_remote_non_interactive(repo, args.remote.as_deref())?;
             println!("Fetching from {remote}...");
             fetch_remote(repo, &remote)?;
-            // Pass just the branch name (not "<remote>/<name>"); git will
-            // auto-create a local tracking branch when a matching remote
-            // tracking branch exists.
             Some(remote_branch.clone())
         } else {
             args.branch.clone()
         };
 
-        // Create with provided options
-        // Default behavior: let git create an auto-named branch (don't set detach: true)
         println!("Creating worktree at {}...", target_path.display());
-        let options = WorktreeCreateOptions {
+        WorktreeCreateOptions {
             branch,
             new_branch: args.new_branch.clone(),
-            detach: false,
-        };
-        create_worktree(repo, target_path, &options)?;
+            force: args.force,
+            ..Default::default()
+        }
     } else {
         // Interactive creation
         let current_branch = get_current_branch(repo)?;
         let branches = get_local_branches(repo)?;
         let default_branch = get_default_branch(repo);
         let recent_branches = get_recent_branches(repo, 5);
-        if let Some(options) = interactive::prompt_worktree_create(
+        match interactive::prompt_worktree_create(
             repo,
             target_path,
             current_branch.as_deref(),
@@ -474,11 +470,74 @@ fn handle_worktree_creation(
             &recent_branches,
             args.remote.as_deref(),
         )? {
-            println!("\nCreating worktree at {}...", target_path.display());
-            create_worktree(repo, target_path, &options)?;
+            Some(options) => {
+                println!("\nCreating worktree at {}...", target_path.display());
+                options
+            }
+            None => return Ok(()),
         }
+    };
+
+    create_worktree_with_recovery(repo, target_path, &options, args.non_interactive)
+}
+
+/// Attempt to create a worktree, recovering from stale registrations.
+///
+/// If `git worktree add` fails because the path is already registered
+/// but missing from disk:
+/// * Interactive: prompts the user to prune, force, or cancel
+/// * Non-interactive: returns the error (use `--force` to override)
+fn create_worktree_with_recovery(
+    repo: &worktree_setup_git::Repository,
+    path: &Path,
+    options: &WorktreeCreateOptions,
+    non_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match create_worktree(repo, path, options) {
+        Ok(()) => Ok(()),
+        Err(ref e) if is_stale_worktree_error(e) => {
+            if non_interactive {
+                return Err(format!(
+                    "Path '{}' is registered as a stale worktree. \
+                     Use --force to override, or run 'git worktree prune' first.",
+                    path.display()
+                )
+                .into());
+            }
+
+            // Interactive recovery
+            match interactive::prompt_stale_worktree_recovery()? {
+                interactive::StaleWorktreeAction::Prune => {
+                    println!("Pruning stale worktrees...");
+                    prune_worktrees(repo)?;
+                    println!("Retrying worktree creation...");
+                    create_worktree(repo, path, options)?;
+                    Ok(())
+                }
+                interactive::StaleWorktreeAction::Force => {
+                    println!("Force creating worktree...");
+                    let mut forced = options.clone();
+                    forced.force = true;
+                    create_worktree(repo, path, &forced)?;
+                    Ok(())
+                }
+                interactive::StaleWorktreeAction::Cancel => {
+                    Err("Worktree creation cancelled.".into())
+                }
+            }
+        }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
+}
+
+/// Check if a `GitError` is a stale worktree registration error.
+fn is_stale_worktree_error(err: &GitError) -> bool {
+    match err {
+        GitError::WorktreeCreateError { source, .. } => source
+            .message()
+            .contains("is a missing but already registered worktree"),
+        _ => false,
+    }
 }
 
 /// Resolve the remote name in non-interactive mode.

@@ -365,6 +365,46 @@ pub fn prompt_run_install(default: bool) -> io::Result<bool> {
         .interact()?)
 }
 
+/// Recovery action for a stale worktree registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleWorktreeAction {
+    /// Run `git worktree prune` and retry.
+    Prune,
+    /// Retry with `--force`.
+    Force,
+    /// Cancel and return the original error.
+    Cancel,
+}
+
+/// Prompt the user for how to handle a stale worktree registration.
+///
+/// Shown when `git worktree add` fails because the path is already
+/// registered but missing from disk.
+///
+/// # Errors
+///
+/// * If the user cancels the prompt
+#[must_use = "caller must act on the chosen recovery action"]
+pub fn prompt_stale_worktree_recovery() -> io::Result<StaleWorktreeAction> {
+    let options = [
+        "Prune stale worktrees and retry",
+        "Force create (overwrite registration)",
+        "Cancel",
+    ];
+
+    let choice = Select::new()
+        .with_prompt("This path is registered as a stale worktree. How would you like to proceed?")
+        .items(options)
+        .default(0)
+        .interact()?;
+
+    Ok(match choice {
+        0 => StaleWorktreeAction::Prune,
+        1 => StaleWorktreeAction::Force,
+        _ => StaleWorktreeAction::Cancel,
+    })
+}
+
 /// Result of the setup operations prompt.
 #[derive(Debug, Clone)]
 pub struct SetupOperationChoices {

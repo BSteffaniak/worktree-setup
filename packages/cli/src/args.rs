@@ -41,6 +41,10 @@ pub struct Args {
     #[arg(long)]
     pub remote: Option<String>,
 
+    /// Force worktree creation even if the path is already registered.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
     /// Specific config file to use (can be specified multiple times).
     #[arg(long = "config", short = 'c')]
     pub configs: Vec<String>,

@@ -49,6 +49,10 @@ pub enum GitError {
         source: git2::Error,
     },
 
+    /// Failed to prune stale worktrees.
+    #[error("Failed to prune worktrees: {0}")]
+    WorktreePruneError(#[source] git2::Error),
+
     /// Failed to get repository status.
     #[error("Failed to get repository status: {0}")]
     StatusError(#[source] git2::Error),

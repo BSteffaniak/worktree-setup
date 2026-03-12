@@ -34,4 +34,5 @@ pub use repo::{
 pub use status::get_unstaged_and_untracked_files;
 pub use worktree::{
     WorktreeCreateOptions, WorktreeInfo, create_worktree, get_main_worktree, get_worktrees,
+    prune_worktrees,
 };

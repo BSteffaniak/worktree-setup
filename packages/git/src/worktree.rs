@@ -34,6 +34,8 @@ pub struct WorktreeCreateOptions {
     pub new_branch: Option<String>,
     /// Create worktree with detached HEAD.
     pub detach: bool,
+    /// Force creation even if the path is already registered as a worktree.
+    pub force: bool,
 }
 
 /// Get a list of all worktrees for a repository.
@@ -146,6 +148,10 @@ pub fn create_worktree(
     // Build git worktree add command
     let mut args: Vec<&str> = vec!["worktree", "add"];
 
+    if options.force {
+        args.push("-f");
+    }
+
     if options.detach {
         args.push("--detach");
     }
@@ -190,6 +196,37 @@ pub fn create_worktree(
     }
 
     log::info!("Created worktree at {}", path.display());
+    Ok(())
+}
+
+/// Prune stale worktree registrations using the git CLI.
+///
+/// Removes worktree entries whose directories no longer exist on disk.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+///
+/// # Errors
+///
+/// * If the prune command fails
+pub fn prune_worktrees(repo: &Repository) -> Result<(), GitError> {
+    let repo_root = get_repo_root(repo)?;
+
+    log::info!("Pruning stale worktrees");
+
+    let output = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| GitError::WorktreePruneError(git2::Error::from_str(&e.to_string())))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitError::WorktreePruneError(git2::Error::from_str(&stderr)));
+    }
+
+    log::info!("Pruned stale worktrees");
     Ok(())
 }
 

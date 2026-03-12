@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use worktree_setup_config::LoadedConfig;
-use worktree_setup_git::{Repository, WorktreeCreateOptions, fetch_remote, get_remote_branches};
+use worktree_setup_git::{
+    Repository, WorktreeCreateOptions, fetch_remote, get_remote_branches, get_remotes,
+};
 
 /// Select which configs to apply from a list.
 ///
@@ -109,32 +111,73 @@ fn prompt_base_branch(
     }
 }
 
+/// Resolve which remote to use.
+///
+/// If `override_name` is provided, uses that directly. Otherwise auto-detects:
+/// * Single remote: uses it automatically
+/// * Multiple remotes: prompts the user to pick one
+/// * No remotes: returns an error
+///
+/// # Errors
+///
+/// * If listing remotes fails
+/// * If the user cancels the prompt
+/// * If the repository has no remotes configured
+fn resolve_remote(repo: &Repository, override_name: Option<&str>) -> io::Result<String> {
+    if let Some(name) = override_name {
+        return Ok(name.to_string());
+    }
+
+    let remotes =
+        get_remotes(repo).map_err(|e| io::Error::other(format!("Failed to list remotes: {e}")))?;
+
+    match remotes.len() {
+        0 => Err(io::Error::other("No remotes configured in this repository")),
+        1 => Ok(remotes.into_iter().next().unwrap_or_default()),
+        _ => {
+            let idx = Select::new()
+                .with_prompt("Select remote")
+                .items(&remotes)
+                .default(0)
+                .interact()?;
+            Ok(remotes[idx].clone())
+        }
+    }
+}
+
 /// Prompt for tracking a remote branch.
 ///
-/// Optionally fetches from origin, then presents a picker of remote branches.
-/// Falls back to default options if no remote branches are found.
+/// Resolves the remote (auto-detect or prompt), optionally fetches, then
+/// presents a picker of remote branches. Falls back to default options
+/// if no remote branches are found.
 ///
 /// # Arguments
 ///
 /// * `repo` - The repository (needed for fetching and listing remote branches)
+/// * `remote_override` - If set, use this remote name instead of auto-detecting
 ///
 /// # Errors
 ///
 /// * If the user cancels the prompts
 /// * If fetching or listing remote branches fails
-fn prompt_remote_branch(repo: &Repository) -> io::Result<WorktreeCreateOptions> {
+fn prompt_remote_branch(
+    repo: &Repository,
+    remote_override: Option<&str>,
+) -> io::Result<WorktreeCreateOptions> {
+    let remote = resolve_remote(repo, remote_override)?;
+
     let should_fetch = Confirm::new()
-        .with_prompt("Fetch latest from remote?")
+        .with_prompt(format!("Fetch latest from {remote}?"))
         .default(true)
         .interact()?;
 
     if should_fetch {
-        println!("Fetching from origin...");
-        fetch_remote(repo, "origin")
+        println!("Fetching from {remote}...");
+        fetch_remote(repo, &remote)
             .map_err(|e| io::Error::other(format!("Failed to fetch: {e}")))?;
     }
 
-    let remote_branches = get_remote_branches(repo)
+    let remote_branches = get_remote_branches(repo, &remote)
         .map_err(|e| io::Error::other(format!("Failed to list remote branches: {e}")))?;
 
     if remote_branches.is_empty() {
@@ -151,9 +194,9 @@ fn prompt_remote_branch(repo: &Repository) -> io::Result<WorktreeCreateOptions> 
     // We use strip_prefix with the exact remote name rather than splitting on '/'
     // to correctly handle branch names that contain slashes.
     let selected = &remote_branches[branch_idx];
-    let remote_prefix = "origin/";
+    let remote_prefix = format!("{remote}/");
     let local_name = selected
-        .strip_prefix(remote_prefix)
+        .strip_prefix(&remote_prefix)
         .unwrap_or(selected.as_str());
 
     Ok(WorktreeCreateOptions {
@@ -174,6 +217,7 @@ fn prompt_remote_branch(repo: &Repository) -> io::Result<WorktreeCreateOptions> 
 /// * `branches` - List of available local branches
 /// * `default_branch` - The detected default branch (e.g., "main" or "master")
 /// * `recent_branches` - Recently checked-out branches from reflog
+/// * `remote_override` - If set, use this remote name instead of auto-detecting
 ///
 /// # Errors
 ///
@@ -186,6 +230,7 @@ pub fn prompt_worktree_create(
     branches: &[String],
     default_branch: Option<&str>,
     recent_branches: &[String],
+    remote_override: Option<&str>,
 ) -> io::Result<Option<WorktreeCreateOptions>> {
     let should_create = Confirm::new()
         .with_prompt(format!(
@@ -297,7 +342,7 @@ pub fn prompt_worktree_create(
                 }
             }
         }
-        "remote" => prompt_remote_branch(repo)?,
+        "remote" => prompt_remote_branch(repo, remote_override)?,
         "detach" => WorktreeCreateOptions {
             detach: true,
             ..Default::default()

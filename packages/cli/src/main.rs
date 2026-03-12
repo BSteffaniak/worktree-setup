@@ -23,8 +23,8 @@ use progress::ProgressManager;
 use worktree_setup_config::{LoadedConfig, discover_configs, load_config};
 use worktree_setup_git::{
     WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote, get_current_branch,
-    get_default_branch, get_local_branches, get_main_worktree, get_recent_branches, get_repo_root,
-    get_unstaged_and_untracked_files,
+    get_default_branch, get_local_branches, get_main_worktree, get_recent_branches, get_remotes,
+    get_repo_root, get_unstaged_and_untracked_files,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
@@ -439,9 +439,10 @@ fn handle_worktree_creation(
     if args.non_interactive {
         // Handle --remote-branch: fetch first, then set branch to the remote ref
         let branch = if let Some(ref remote_branch) = args.remote_branch {
-            println!("Fetching from origin...");
-            fetch_remote(repo, "origin")?;
-            // Pass just the branch name (not "origin/<name>"); git will
+            let remote = resolve_remote_non_interactive(repo, args.remote.as_deref())?;
+            println!("Fetching from {remote}...");
+            fetch_remote(repo, &remote)?;
+            // Pass just the branch name (not "<remote>/<name>"); git will
             // auto-create a local tracking branch when a matching remote
             // tracking branch exists.
             Some(remote_branch.clone())
@@ -471,12 +472,38 @@ fn handle_worktree_creation(
             &branches,
             default_branch.as_deref(),
             &recent_branches,
+            args.remote.as_deref(),
         )? {
             println!("\nCreating worktree at {}...", target_path.display());
             create_worktree(repo, target_path, &options)?;
         }
     }
     Ok(())
+}
+
+/// Resolve the remote name in non-interactive mode.
+///
+/// If `override_name` is provided, uses that. Otherwise auto-detects:
+/// * Single remote: uses it
+/// * Multiple or zero remotes: returns an error
+fn resolve_remote_non_interactive(
+    repo: &worktree_setup_git::Repository,
+    override_name: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(name) = override_name {
+        return Ok(name.to_string());
+    }
+
+    let remotes = get_remotes(repo)?;
+    match remotes.len() {
+        0 => Err("No remotes configured in this repository".into()),
+        1 => Ok(remotes.into_iter().next().unwrap_or_default()),
+        _ => Err(format!(
+            "Multiple remotes found ({}). Use --remote to specify which one.",
+            remotes.join(", ")
+        )
+        .into()),
+    }
 }
 
 /// Main application logic for the default (no subcommand) flow.

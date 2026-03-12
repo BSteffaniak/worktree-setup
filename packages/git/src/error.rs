@@ -61,6 +61,10 @@ pub enum GitError {
     #[error("Failed to list branches: {0}")]
     BranchListError(#[source] git2::Error),
 
+    /// Failed to list remotes.
+    #[error("Failed to list remotes: {0}")]
+    RemoteListError(#[source] git2::Error),
+
     /// Failed to fetch from remote.
     #[error("Failed to fetch from remote '{remote}': {source}")]
     FetchError {

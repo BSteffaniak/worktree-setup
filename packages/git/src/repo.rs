@@ -177,10 +177,7 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
     None
 }
 
-/// Get a list of remote branch names.
-///
-/// Returns branch names in the format `origin/branch-name`.
-/// Filters out `HEAD` pointer refs like `origin/HEAD`.
+/// Get a list of remote names configured for the repository.
 ///
 /// # Arguments
 ///
@@ -188,12 +185,38 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
 ///
 /// # Errors
 ///
+/// * If the remote list cannot be retrieved
+pub fn get_remotes(repo: &Repository) -> Result<Vec<String>, GitError> {
+    let remotes = repo.remotes().map_err(GitError::RemoteListError)?;
+
+    let mut names = Vec::new();
+    for name in remotes.iter().flatten() {
+        names.push(name.to_string());
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+/// Get a list of remote branch names for a specific remote.
+///
+/// Returns branch names in the format `remote/branch-name`
+/// (e.g., `origin/main`). Filters out `HEAD` pointer refs.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+/// * `remote` - The remote name to filter branches for (e.g., `"origin"`)
+///
+/// # Errors
+///
 /// * If the branch list cannot be retrieved
-pub fn get_remote_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
+pub fn get_remote_branches(repo: &Repository, remote: &str) -> Result<Vec<String>, GitError> {
     let branches = repo
         .branches(Some(git2::BranchType::Remote))
         .map_err(GitError::BranchListError)?;
 
+    let prefix = format!("{remote}/");
     let mut names = Vec::new();
     for branch in branches {
         let (branch, _) = branch.map_err(GitError::BranchListError)?;
@@ -202,7 +225,10 @@ pub fn get_remote_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
             if name.ends_with("/HEAD") {
                 continue;
             }
-            names.push(name.to_string());
+            // Only include branches from the specified remote
+            if name.starts_with(&prefix) {
+                names.push(name.to_string());
+            }
         }
     }
 

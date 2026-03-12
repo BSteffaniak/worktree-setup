@@ -37,6 +37,10 @@ pub struct Args {
     #[arg(long)]
     pub remote_branch: Option<String>,
 
+    /// Remote name to use (auto-detected if omitted).
+    #[arg(long)]
+    pub remote: Option<String>,
+
     /// Specific config file to use (can be specified multiple times).
     #[arg(long = "config", short = 'c')]
     pub configs: Vec<String>,

@@ -441,8 +441,10 @@ fn handle_worktree_creation(
         let branch = if let Some(ref remote_branch) = args.remote_branch {
             println!("Fetching from origin...");
             fetch_remote(repo, "origin")?;
-            // Pass the remote ref directly; git will create a local tracking branch
-            Some(format!("origin/{remote_branch}"))
+            // Pass just the branch name (not "origin/<name>"); git will
+            // auto-create a local tracking branch when a matching remote
+            // tracking branch exists.
+            Some(remote_branch.clone())
         } else {
             args.branch.clone()
         };

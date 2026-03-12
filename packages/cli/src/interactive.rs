@@ -147,8 +147,17 @@ fn prompt_remote_branch(repo: &Repository) -> io::Result<WorktreeCreateOptions> 
         .items(&remote_branches)
         .interact()?;
 
+    // Strip the known remote prefix (e.g., "origin/feature/auth/login" -> "feature/auth/login").
+    // We use strip_prefix with the exact remote name rather than splitting on '/'
+    // to correctly handle branch names that contain slashes.
+    let selected = &remote_branches[branch_idx];
+    let remote_prefix = "origin/";
+    let local_name = selected
+        .strip_prefix(remote_prefix)
+        .unwrap_or(selected.as_str());
+
     Ok(WorktreeCreateOptions {
-        branch: Some(remote_branches[branch_idx].clone()),
+        branch: Some(local_name.to_string()),
         ..Default::default()
     })
 }

@@ -53,6 +53,20 @@ pub struct Config {
     /// Commands to run after setup completes.
     #[serde(default)]
     pub post_setup: Vec<String>,
+
+    /// Profile names this config belongs to.
+    ///
+    /// When a user runs `--profile foo`, any config that lists `"foo"` here
+    /// will be auto-selected (in addition to central profiles file matches).
+    #[serde(default)]
+    pub profiles: Vec<String>,
+
+    /// Per-profile default overrides declared by this config.
+    ///
+    /// Keys are profile names, values are `ProfileDefaults`. These override
+    /// the central profiles file defaults for the same profile name.
+    #[serde(default)]
+    pub profile_defaults: BTreeMap<String, ProfileDefaults>,
 }
 
 /// A loaded configuration with metadata.

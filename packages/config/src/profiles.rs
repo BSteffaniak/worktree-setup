@@ -39,20 +39,32 @@ pub fn load_profiles_file(path: &Path) -> Result<ProfilesFile, ConfigError> {
 
 /// Resolve one or more profile names into a single `ResolvedProfile`.
 ///
-/// For Phase 1, this only checks the central profiles file. Individual
-/// config `profiles` / `profile_defaults` fields will be added in Phase 2.
+/// Resolution checks both the central profiles file and individual config
+/// `profiles` / `profile_defaults` fields.
 ///
 /// # Resolution Logic
 ///
-/// 1. For each profile name, look it up in the profiles file
-/// 2. Match the profile's config patterns against `all_configs` by substring
-/// 3. When multiple profiles are given, union the config lists and merge
-///    defaults (later profile's defaults win on conflicts)
-/// 4. Dedup config indices
+/// For each profile name:
+///
+/// 1. Look it up in the central profiles file (if present) to get config
+///    patterns and central defaults
+/// 2. Match config patterns against `all_configs` by substring
+/// 3. Also include any config that declares the profile name in its
+///    `profiles` field
+/// 4. Merge defaults: central profile defaults first, then per-config
+///    `profile_defaults` for matching configs (per-config wins over central)
+///
+/// When multiple profiles are given, they are processed in order. Config
+/// lists are unioned (deduped). For defaults, later profiles win over
+/// earlier profiles.
+///
+/// A profile name does **not** need to exist in the central profiles file
+/// if at least one config declares it in its `profiles` field.
 ///
 /// # Errors
 ///
-/// * `ProfileNotFound` if any requested profile name is not defined
+/// * `ProfileNotFound` if a requested profile name is not defined in
+///   the central file AND no config declares it in `profiles`
 pub fn resolve_profiles(
     profile_names: &[String],
     profiles_file: Option<&ProfilesFile>,
@@ -66,34 +78,65 @@ pub fn resolve_profiles(
     let mut seen_indices = BTreeSet::new();
 
     for name in profile_names {
-        // Look up the profile definition
-        let definition = profiles_file
-            .and_then(|pf| pf.profiles.get(name.as_str()))
-            .ok_or_else(|| ConfigError::ProfileNotFound(name.clone()))?;
+        // Look up central profile definition (may not exist)
+        let central_def = profiles_file.and_then(|pf| pf.profiles.get(name.as_str()));
 
-        // Use the last profile's description
-        if !definition.description.is_empty() {
-            resolved.description.clone_from(&definition.description);
+        // Check if any config declares this profile
+        let any_config_declares = all_configs
+            .iter()
+            .any(|c| c.config.profiles.iter().any(|p| p == name));
+
+        // If neither central nor any config declares this profile, error
+        if central_def.is_none() && !any_config_declares {
+            return Err(ConfigError::ProfileNotFound(name.clone()));
         }
 
-        // Match config patterns against all_configs
-        for pattern in &definition.configs {
-            for (idx, config) in all_configs.iter().enumerate() {
-                if !seen_indices.contains(&idx)
-                    && (config.relative_path.contains(pattern.as_str())
-                        || config
-                            .config_path
-                            .to_string_lossy()
-                            .contains(pattern.as_str()))
-                {
-                    seen_indices.insert(idx);
-                    resolved.config_indices.push(idx);
+        // Use the last profile's description (from central definition)
+        if let Some(def) = central_def
+            && !def.description.is_empty()
+        {
+            resolved.description.clone_from(&def.description);
+        }
+
+        // Step 1: Merge central defaults first (lowest priority for this profile)
+        if let Some(def) = central_def {
+            resolved.defaults.merge(&def.defaults);
+        }
+
+        // Step 2: Match config patterns from central definition
+        if let Some(def) = central_def {
+            for pattern in &def.configs {
+                for (idx, config) in all_configs.iter().enumerate() {
+                    if !seen_indices.contains(&idx)
+                        && (config.relative_path.contains(pattern.as_str())
+                            || config
+                                .config_path
+                                .to_string_lossy()
+                                .contains(pattern.as_str()))
+                    {
+                        seen_indices.insert(idx);
+                        resolved.config_indices.push(idx);
+                    }
                 }
             }
         }
 
-        // Merge defaults (later profile wins)
-        resolved.defaults.merge(&definition.defaults);
+        // Step 3: Include configs that declare this profile name
+        for (idx, config) in all_configs.iter().enumerate() {
+            if !seen_indices.contains(&idx) && config.config.profiles.iter().any(|p| p == name) {
+                seen_indices.insert(idx);
+                resolved.config_indices.push(idx);
+            }
+        }
+
+        // Step 4: Merge per-config profile_defaults (higher priority than central)
+        // Iterate over all selected configs (including newly added ones)
+        // and merge any profile_defaults they declare for this profile name.
+        for &idx in &resolved.config_indices {
+            if let Some(config_defaults) = all_configs[idx].config.profile_defaults.get(name) {
+                resolved.defaults.merge(config_defaults);
+            }
+        }
     }
 
     Ok(resolved)
@@ -200,7 +243,8 @@ fn try_load_ts_with_deno(path: &Path) -> Result<ProfilesFile, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Config, ProfileDefaults};
+    use crate::types::{Config, ProfileDefaults, ProfileDefinition};
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
@@ -209,6 +253,25 @@ mod tests {
         LoadedConfig {
             config: Config {
                 description: description.to_string(),
+                ..Default::default()
+            },
+            config_path: PathBuf::from(format!("/repo/{relative_path}")),
+            config_dir: PathBuf::from("/repo"),
+            relative_path: relative_path.to_string(),
+        }
+    }
+
+    fn make_loaded_config_with_profiles(
+        relative_path: &str,
+        description: &str,
+        profiles: Vec<&str>,
+        profile_defaults: BTreeMap<String, ProfileDefaults>,
+    ) -> LoadedConfig {
+        LoadedConfig {
+            config: Config {
+                description: description.to_string(),
+                profiles: profiles.into_iter().map(String::from).collect(),
+                profile_defaults,
                 ..Default::default()
             },
             config_path: PathBuf::from(format!("/repo/{relative_path}")),
@@ -356,5 +419,228 @@ baseBranch = "main"
         assert_eq!(base.base_branch.as_deref(), Some("main")); // kept
         assert_eq!(base.remote.as_deref(), Some("upstream")); // new
         assert_eq!(base.new_branch, None); // still None
+    }
+
+    // ─── Phase 2: Per-config profile declarations ──────────────────────────
+
+    #[test]
+    fn test_config_declares_profile_membership() {
+        // A config declares itself as belonging to profile "dev",
+        // with no central profiles file at all.
+        let configs = vec![
+            make_loaded_config_with_profiles(
+                "apps/my-app/worktree.config.ts",
+                "my-app config",
+                vec!["dev"],
+                BTreeMap::new(),
+            ),
+            make_loaded_config("apps/other/worktree.config.ts", "other config"),
+        ];
+
+        let resolved = resolve_profiles(&["dev".to_string()], None, &configs).unwrap();
+
+        assert_eq!(resolved.config_indices, vec![0]);
+        // No central file, so no description
+        assert_eq!(resolved.description, "");
+    }
+
+    #[test]
+    fn test_config_profile_membership_no_central_file() {
+        // Profile exists purely from per-config declarations, no central file
+        let configs = vec![
+            make_loaded_config_with_profiles(
+                "apps/a/worktree.config.ts",
+                "app a",
+                vec!["full"],
+                BTreeMap::new(),
+            ),
+            make_loaded_config_with_profiles(
+                "apps/b/worktree.config.ts",
+                "app b",
+                vec!["full", "minimal"],
+                BTreeMap::new(),
+            ),
+            make_loaded_config("apps/c/worktree.config.ts", "app c"),
+        ];
+
+        // "full" profile: picks up both a and b
+        let resolved = resolve_profiles(&["full".to_string()], None, &configs).unwrap();
+        assert_eq!(resolved.config_indices, vec![0, 1]);
+
+        // "minimal" profile: picks up only b
+        let resolved = resolve_profiles(&["minimal".to_string()], None, &configs).unwrap();
+        assert_eq!(resolved.config_indices, vec![1]);
+    }
+
+    #[test]
+    fn test_profile_not_found_when_no_source() {
+        // Profile not in central file AND no config declares it -> error
+        let configs = vec![make_loaded_config_with_profiles(
+            "apps/a/worktree.config.ts",
+            "app a",
+            vec!["dev"],
+            BTreeMap::new(),
+        )];
+
+        let profiles_file = ProfilesFile::default();
+        let result = resolve_profiles(&["ci".to_string()], Some(&profiles_file), &configs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_central_and_config_declarations_combined() {
+        // Central file matches config 0 via pattern.
+        // Config 1 declares itself in the profile.
+        // Both should be selected.
+        let configs = vec![
+            make_loaded_config("apps/my-app/worktree.config.ts", "matched by pattern"),
+            make_loaded_config_with_profiles(
+                "libs/shared/worktree.config.ts",
+                "declares membership",
+                vec!["dev"],
+                BTreeMap::new(),
+            ),
+            make_loaded_config("apps/other/worktree.config.ts", "not matched"),
+        ];
+
+        let mut profiles_file = ProfilesFile::default();
+        profiles_file.profiles.insert(
+            "dev".to_string(),
+            ProfileDefinition {
+                description: "Dev".to_string(),
+                configs: vec!["apps/my-app/".to_string()],
+                defaults: ProfileDefaults::default(),
+            },
+        );
+
+        let resolved =
+            resolve_profiles(&["dev".to_string()], Some(&profiles_file), &configs).unwrap();
+
+        assert_eq!(resolved.config_indices, vec![0, 1]);
+        assert_eq!(resolved.description, "Dev");
+    }
+
+    #[test]
+    fn test_per_config_defaults_override_central() {
+        // Central file sets copy_unstaged = false.
+        // A config overrides it to true for the same profile.
+        // Per-config should win.
+        let mut profile_defaults = BTreeMap::new();
+        profile_defaults.insert(
+            "dev".to_string(),
+            ProfileDefaults {
+                copy_unstaged: Some(true),
+                base_branch: Some("develop".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let configs = vec![make_loaded_config_with_profiles(
+            "apps/my-app/worktree.config.ts",
+            "my-app",
+            vec!["dev"],
+            profile_defaults,
+        )];
+
+        let mut profiles_file = ProfilesFile::default();
+        profiles_file.profiles.insert(
+            "dev".to_string(),
+            ProfileDefinition {
+                description: "Dev".to_string(),
+                configs: vec!["apps/my-app/".to_string()],
+                defaults: ProfileDefaults {
+                    copy_unstaged: Some(false),
+                    skip_post_setup: Some(true),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let resolved =
+            resolve_profiles(&["dev".to_string()], Some(&profiles_file), &configs).unwrap();
+
+        // Per-config overrides central for copy_unstaged
+        assert_eq!(resolved.defaults.copy_unstaged, Some(true));
+        // Per-config sets base_branch (central didn't)
+        assert_eq!(resolved.defaults.base_branch.as_deref(), Some("develop"));
+        // Central's skip_post_setup is kept (per-config didn't override it)
+        assert_eq!(resolved.defaults.skip_post_setup, Some(true));
+    }
+
+    #[test]
+    fn test_multiple_configs_with_profile_defaults() {
+        // Two configs both declare profile_defaults for "dev".
+        // Both are merged in order (later config index wins on conflict).
+        let mut defaults_a = BTreeMap::new();
+        defaults_a.insert(
+            "dev".to_string(),
+            ProfileDefaults {
+                copy_unstaged: Some(true),
+                base_branch: Some("develop".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut defaults_b = BTreeMap::new();
+        defaults_b.insert(
+            "dev".to_string(),
+            ProfileDefaults {
+                copy_unstaged: Some(false),
+                remote: Some("upstream".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let configs = vec![
+            make_loaded_config_with_profiles(
+                "apps/a/worktree.config.ts",
+                "app a",
+                vec!["dev"],
+                defaults_a,
+            ),
+            make_loaded_config_with_profiles(
+                "apps/b/worktree.config.ts",
+                "app b",
+                vec!["dev"],
+                defaults_b,
+            ),
+        ];
+
+        let resolved = resolve_profiles(&["dev".to_string()], None, &configs).unwrap();
+
+        assert_eq!(resolved.config_indices, vec![0, 1]);
+        // Config b (later index) wins on copy_unstaged
+        assert_eq!(resolved.defaults.copy_unstaged, Some(false));
+        // Config a set base_branch, b didn't override it
+        assert_eq!(resolved.defaults.base_branch.as_deref(), Some("develop"));
+        // Config b added remote
+        assert_eq!(resolved.defaults.remote.as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn test_per_config_defaults_only_for_matching_profile() {
+        // Config declares profile_defaults for "ci", but we resolve "dev".
+        // The "ci" defaults should NOT be applied.
+        let mut profile_defaults = BTreeMap::new();
+        profile_defaults.insert(
+            "ci".to_string(),
+            ProfileDefaults {
+                skip_post_setup: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let configs = vec![make_loaded_config_with_profiles(
+            "apps/my-app/worktree.config.ts",
+            "my-app",
+            vec!["dev", "ci"],
+            profile_defaults,
+        )];
+
+        let resolved = resolve_profiles(&["dev".to_string()], None, &configs).unwrap();
+
+        assert_eq!(resolved.config_indices, vec![0]);
+        // "ci" profile_defaults should NOT be applied when resolving "dev"
+        assert_eq!(resolved.defaults.skip_post_setup, None);
     }
 }

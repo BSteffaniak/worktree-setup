@@ -83,5 +83,43 @@ postSetup = ["npm install"]
         assert!(config.symlinks.is_empty());
         assert!(config.copy.is_empty());
         assert!(!config.copy_unstaged);
+        assert!(config.profiles.is_empty());
+        assert!(config.profile_defaults.is_empty());
+    }
+
+    #[test]
+    fn test_load_toml_config_with_profiles() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+description = "Config with profiles"
+symlinks = [".env"]
+profiles = ["dev", "ci"]
+
+[profileDefaults.dev]
+copyUnstaged = true
+baseBranch = "develop"
+
+[profileDefaults.ci]
+skipPostSetup = true
+"#
+        )
+        .unwrap();
+
+        let config = load_toml_config(file.path()).unwrap();
+
+        assert_eq!(config.description, "Config with profiles");
+        assert_eq!(config.profiles, vec!["dev", "ci"]);
+        assert_eq!(config.profile_defaults.len(), 2);
+
+        let dev_defaults = &config.profile_defaults["dev"];
+        assert_eq!(dev_defaults.copy_unstaged, Some(true));
+        assert_eq!(dev_defaults.base_branch.as_deref(), Some("develop"));
+        assert_eq!(dev_defaults.skip_post_setup, None);
+
+        let ci_defaults = &config.profile_defaults["ci"];
+        assert_eq!(ci_defaults.skip_post_setup, Some(true));
+        assert_eq!(ci_defaults.copy_unstaged, None);
     }
 }

@@ -55,7 +55,7 @@ pub fn prompt_worktree_path() -> io::Result<PathBuf> {
 ///
 /// # Arguments
 ///
-/// * `default_branch` - The detected default branch (e.g., "main" or "master")
+/// * `default_branch` - The detected default branch (e.g., "master" or "main")
 /// * `recent_branches` - Recently checked-out branches from reflog
 /// * `profile_base` - If set by a profile, this branch is preselected as the default
 ///

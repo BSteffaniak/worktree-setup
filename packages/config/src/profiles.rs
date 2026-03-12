@@ -290,7 +290,7 @@ mod tests {
 description = "My app development"
 configs = ["apps/my-app/worktree.config.ts"]
 copyUnstaged = true
-baseBranch = "main"
+baseBranch = "master"
 
 [profiles.remote]
 description = "Remote branch tracking"
@@ -308,7 +308,7 @@ remote = "origin"
         assert_eq!(profile.description, "My app development");
         assert_eq!(profile.configs, vec!["apps/my-app/worktree.config.ts"]);
         assert_eq!(profile.defaults.copy_unstaged, Some(true));
-        assert_eq!(profile.defaults.base_branch.as_deref(), Some("main"));
+        assert_eq!(profile.defaults.base_branch.as_deref(), Some("master"));
         assert_eq!(profile.defaults.creation_method, None);
 
         let remote_profile = &profiles.profiles["remote"];
@@ -428,7 +428,7 @@ remote = "origin"
                 crate::types::PostSetupKeyword::All,
             )),
             copy_unstaged: Some(true),
-            base_branch: Some("main".to_string()),
+            base_branch: Some("master".to_string()),
             ..Default::default()
         };
 
@@ -450,7 +450,7 @@ remote = "origin"
             ))
         ); // overridden
         assert_eq!(base.copy_unstaged, Some(true)); // kept
-        assert_eq!(base.base_branch.as_deref(), Some("main")); // kept
+        assert_eq!(base.base_branch.as_deref(), Some("master")); // kept
         assert_eq!(base.remote.as_deref(), Some("upstream")); // new
         assert_eq!(base.new_branch, None); // still None
         assert_eq!(
@@ -705,7 +705,7 @@ configs = ["apps/"]
 creationMethod = "auto"
 autoCreate = true
 newBranch = true
-baseBranch = "main"
+baseBranch = "master"
 
 [profiles.current-profile]
 description = "Current branch"
@@ -737,7 +737,7 @@ creationMethod = "detach"
         );
         assert_eq!(auto.defaults.auto_create, Some(true));
         assert_eq!(auto.defaults.new_branch, Some(true));
-        assert_eq!(auto.defaults.base_branch.as_deref(), Some("main"));
+        assert_eq!(auto.defaults.base_branch.as_deref(), Some("master"));
 
         // Current
         let current = &profiles.profiles["current-profile"];
@@ -981,7 +981,7 @@ skipPostSetup = ["bun generate"]
             overwrite_existing: Some(false),
             auto_create: Some(true),
             creation_method: Some(crate::types::CreationMethod::Remote),
-            base_branch: Some("main".to_string()),
+            base_branch: Some("master".to_string()),
             new_branch: Some(true),
             remote: Some("origin".to_string()),
             post_setup: Some(crate::types::PostSetupMode::Keyword(
@@ -1001,7 +1001,7 @@ skipPostSetup = ["bun generate"]
             base.creation_method,
             Some(crate::types::CreationMethod::Remote)
         );
-        assert_eq!(base.base_branch.as_deref(), Some("main"));
+        assert_eq!(base.base_branch.as_deref(), Some("master"));
         assert_eq!(base.new_branch, Some(true));
         assert_eq!(base.remote.as_deref(), Some("origin"));
         assert_eq!(

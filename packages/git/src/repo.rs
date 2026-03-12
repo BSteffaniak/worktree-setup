@@ -143,7 +143,7 @@ pub fn get_local_branches(repo: &Repository) -> Result<Vec<String>, GitError> {
 /// Detection order:
 /// 1. `refs/remotes/origin/HEAD` - the remote's default branch
 /// 2. `init.defaultBranch` git config - user's configured default
-/// 3. Check if `main` or `master` exist locally
+/// 3. Check if `master` or `main` exist locally
 ///
 /// Returns `None` if no default can be determined.
 #[must_use]
@@ -152,7 +152,7 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
     if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD")
         && let Some(target) = reference.symbolic_target()
     {
-        // target is "refs/remotes/origin/main" -> extract "main"
+        // target is "refs/remotes/origin/master" -> extract "master"
         if let Some(branch) = target.strip_prefix("refs/remotes/origin/") {
             return Some(branch.to_string());
         }
@@ -167,7 +167,7 @@ pub fn get_default_branch(repo: &Repository) -> Option<String> {
 
     // Fall back to checking for common branches locally
     if let Ok(branches) = get_local_branches(repo) {
-        for candidate in ["main", "master"] {
+        for candidate in ["master", "main"] {
             if branches.contains(&candidate.to_string()) {
                 return Some(candidate.to_string());
             }

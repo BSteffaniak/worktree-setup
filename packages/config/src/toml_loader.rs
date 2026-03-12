@@ -140,7 +140,7 @@ profiles = ["full"]
 [profileDefaults.full]
 autoCreate = true
 creationMethod = "remote"
-baseBranch = "main"
+baseBranch = "master"
 newBranch = false
 remote = "upstream"
 overwriteExisting = true
@@ -159,7 +159,7 @@ skipPostSetup = ["bun generate", "bun build"]
             defaults.creation_method,
             Some(crate::types::CreationMethod::Remote)
         );
-        assert_eq!(defaults.base_branch.as_deref(), Some("main"));
+        assert_eq!(defaults.base_branch.as_deref(), Some("master"));
         assert_eq!(defaults.new_branch, Some(false));
         assert_eq!(defaults.remote.as_deref(), Some("upstream"));
         assert_eq!(defaults.overwrite_existing, Some(true));

@@ -82,6 +82,46 @@ pub struct LoadedConfig {
     pub relative_path: String,
 }
 
+/// How the worktree should be created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CreationMethod {
+    /// New branch, auto-named after the worktree directory.
+    Auto,
+    /// Use the current branch.
+    Current,
+    /// Track a remote branch (infers name from worktree directory).
+    Remote,
+    /// Detached HEAD at the current commit.
+    Detach,
+}
+
+/// Keyword for post-setup command behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PostSetupKeyword {
+    /// Run all post-setup commands without prompting.
+    All,
+    /// Skip all post-setup commands without prompting.
+    None,
+}
+
+/// Controls which post-setup commands to run.
+///
+/// * `"all"` — run all commands (optionally filtered by `skipPostSetup`)
+/// * `"none"` — skip all commands
+/// * `["cmd1", "cmd2"]` — run only these specific commands (exact match)
+///
+/// When not set, the user is prompted interactively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PostSetupMode {
+    /// `"all"` or `"none"` keyword.
+    Keyword(PostSetupKeyword),
+    /// Specific commands to run (exact match against available commands).
+    Commands(Vec<String>),
+}
+
 /// Defaults that a profile can provide, overriding interactive prompts.
 ///
 /// All fields are `Option` — only set values are applied. Unset values
@@ -89,39 +129,53 @@ pub struct LoadedConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileDefaults {
-    /// Skip post-setup commands when `true`.
-    pub skip_post_setup: Option<bool>,
     /// Copy unstaged/untracked files from main worktree.
     pub copy_unstaged: Option<bool>,
     /// Overwrite existing files during file operations.
     pub overwrite_existing: Option<bool>,
+
+    /// Skip the "Create worktree?" confirmation and create automatically.
+    pub auto_create: Option<bool>,
+    /// How to create the worktree (skips the creation method picker).
+    pub creation_method: Option<CreationMethod>,
     /// Base branch for new worktree branches.
     pub base_branch: Option<String>,
     /// Always create a new branch (auto-named after worktree directory).
     pub new_branch: Option<bool>,
     /// Remote name to use for remote branch operations.
     pub remote: Option<String>,
-    /// Default to tracking a remote branch when creating a worktree.
+
+    /// Which post-setup commands to run.
     ///
-    /// When `true`, the interactive creation picker defaults to
-    /// "Track remote branch..." and the branch name is inferred from
-    /// the worktree directory name.
-    pub track_remote_branch: Option<bool>,
+    /// * `"all"` — run all without prompting
+    /// * `"none"` — skip all without prompting
+    /// * `["cmd1", "cmd2"]` — run only these (exact match), no prompt
+    /// * Not set — prompt the user
+    pub post_setup: Option<PostSetupMode>,
+    /// Specific post-setup commands to skip (exact match).
+    ///
+    /// Only meaningful when `post_setup = "all"`. Commands listed here
+    /// are excluded from the set of commands that would otherwise run.
+    #[serde(default)]
+    pub skip_post_setup: Vec<String>,
 }
 
 impl ProfileDefaults {
     /// Merge another `ProfileDefaults` on top of self.
     ///
-    /// Values from `other` win when they are `Some`.
+    /// Values from `other` win when they are `Some` (or non-empty for `Vec`).
     pub fn merge(&mut self, other: &Self) {
-        if other.skip_post_setup.is_some() {
-            self.skip_post_setup = other.skip_post_setup;
-        }
         if other.copy_unstaged.is_some() {
             self.copy_unstaged = other.copy_unstaged;
         }
         if other.overwrite_existing.is_some() {
             self.overwrite_existing = other.overwrite_existing;
+        }
+        if other.auto_create.is_some() {
+            self.auto_create = other.auto_create;
+        }
+        if other.creation_method.is_some() {
+            self.creation_method.clone_from(&other.creation_method);
         }
         if other.base_branch.is_some() {
             self.base_branch.clone_from(&other.base_branch);
@@ -132,8 +186,11 @@ impl ProfileDefaults {
         if other.remote.is_some() {
             self.remote.clone_from(&other.remote);
         }
-        if other.track_remote_branch.is_some() {
-            self.track_remote_branch = other.track_remote_branch;
+        if other.post_setup.is_some() {
+            self.post_setup.clone_from(&other.post_setup);
+        }
+        if !other.skip_post_setup.is_empty() {
+            self.skip_post_setup.clone_from(&other.skip_post_setup);
         }
     }
 }

@@ -21,8 +21,8 @@ use path_clean::PathClean;
 use args::{Args, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
-    LoadedConfig, ProfileDefaults, ProfilesFile, ResolvedProfile, discover_configs,
-    discover_profiles_file, load_config, load_profiles_file, resolve_profiles,
+    CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ProfilesFile, ResolvedProfile,
+    discover_configs, discover_profiles_file, load_config, load_profiles_file, resolve_profiles,
 };
 use worktree_setup_git::{
     GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
@@ -345,27 +345,69 @@ fn collect_post_setup_commands<'a>(configs: &[&'a LoadedConfig]) -> Vec<&'a str>
 
 // ─── Subcommand: setup ──────────────────────────────────────────────────────
 
-/// Resolve whether post-setup should run based on CLI flag and profile default.
+/// Resolve which post-setup commands to run based on CLI flags and profile defaults.
 ///
-/// Priority: CLI `--no-install` flag > profile `skip_post_setup` > default (true).
-const fn should_run_post_setup(no_install: bool, profile: Option<&ResolvedProfile>) -> bool {
+/// Returns:
+/// * `Some(cmds)` — run exactly these commands, no prompt needed
+/// * `None` — prompt the user to decide
+///
+/// Priority: `--no-install` CLI flag > profile `post_setup` > prompt.
+///
+/// When `post_setup = "all"`, `skip_post_setup` filters the command list.
+/// When `post_setup = ["cmd1", "cmd2"]`, only those commands run (exact match).
+/// When `post_setup = "none"`, returns an empty list.
+/// When `post_setup` is not set, returns `None` to trigger a prompt.
+fn resolve_post_setup_commands<'a>(
+    no_install: bool,
+    profile: Option<&ResolvedProfile>,
+    available_commands: &[&'a str],
+) -> Option<Vec<&'a str>> {
+    // CLI --no-install always wins
     if no_install {
-        return false;
+        return Some(Vec::new());
     }
-    if let Some(p) = profile
-        && let Some(skip) = p.defaults.skip_post_setup
-    {
-        return !skip;
+
+    let defaults = profile.map(|p| &p.defaults)?;
+    let post_setup = defaults.post_setup.as_ref()?;
+
+    match post_setup {
+        PostSetupMode::Keyword(PostSetupKeyword::None) => Some(Vec::new()),
+        PostSetupMode::Keyword(PostSetupKeyword::All) => {
+            // Run all, minus any in skip_post_setup
+            let skip = &defaults.skip_post_setup;
+            if skip.is_empty() {
+                Some(available_commands.to_vec())
+            } else {
+                Some(
+                    available_commands
+                        .iter()
+                        .filter(|cmd| !skip.iter().any(|s| s == **cmd))
+                        .copied()
+                        .collect(),
+                )
+            }
+        }
+        PostSetupMode::Commands(cmds) => {
+            // Run only commands that exist in the available list (exact match)
+            Some(
+                available_commands
+                    .iter()
+                    .filter(|cmd| cmds.iter().any(|c| c == **cmd))
+                    .copied()
+                    .collect(),
+            )
+        }
     }
-    true
 }
 
 /// Resolve whether overwrite should be enabled based on CLI flag and profile default.
-fn should_overwrite(overwrite_flag: bool, profile: Option<&ResolvedProfile>) -> bool {
-    overwrite_flag
-        || profile
-            .and_then(|p| p.defaults.overwrite_existing)
-            .unwrap_or(false)
+///
+/// Returns `Some(value)` when determined by CLI or profile, `None` to prompt.
+fn resolve_overwrite(overwrite_flag: bool, profile: Option<&ResolvedProfile>) -> Option<bool> {
+    if overwrite_flag {
+        return Some(true);
+    }
+    profile.and_then(|p| p.defaults.overwrite_existing)
 }
 
 /// Determine what operations to run in `setup` mode.
@@ -377,24 +419,30 @@ fn determine_setup_operations(
     is_secondary_worktree: bool,
     unique_commands: &[&str],
 ) -> Result<(bool, bool, bool), Box<dyn std::error::Error>> {
+    // Resolve pre-determined values from CLI flags + profile
+    let files_determined: Option<bool> = if args.no_files { Some(false) } else { None };
+
+    let overwrite_determined = resolve_overwrite(args.overwrite, resolved_profile);
+
+    let post_setup_resolved =
+        resolve_post_setup_commands(args.no_install, resolved_profile, unique_commands);
+    let post_setup_determined: Option<bool> =
+        post_setup_resolved.as_ref().map(|cmds| !cmds.is_empty());
+
     if args.non_interactive {
-        let run_files = is_secondary_worktree && !args.no_files;
-        let run_post_setup = should_run_post_setup(args.no_install, resolved_profile);
-        let overwrite = should_overwrite(args.overwrite, resolved_profile);
+        let run_files = files_determined.unwrap_or(is_secondary_worktree);
+        let overwrite = overwrite_determined.unwrap_or(false);
+        let run_post_setup = post_setup_determined.unwrap_or(true);
         return Ok((run_files, overwrite, run_post_setup));
     }
 
-    // Interactive: show checklist (profile defaults affect initial checkbox states)
-    let default_files = is_secondary_worktree && !args.no_files;
-    let default_overwrite = should_overwrite(args.overwrite, resolved_profile);
-    let default_post_setup = should_run_post_setup(args.no_install, resolved_profile);
-
+    // Interactive: show checklist (only undetermined items)
     let choices = interactive::prompt_setup_operations(
-        &interactive::SetupOperationDefaults {
+        &interactive::SetupOperationInputs {
             is_secondary_worktree,
-            files: default_files,
-            overwrite: default_overwrite,
-            post_setup: default_post_setup,
+            files: files_determined,
+            overwrite: overwrite_determined,
+            post_setup: post_setup_determined,
         },
         unique_commands,
     )?;
@@ -509,7 +557,14 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Run post-setup commands
     if run_post_setup {
-        run_post_setup_commands(&unique_commands, &target_path)?;
+        // Apply per-command filtering from profile if present
+        let resolved_cmds = resolve_post_setup_commands(
+            args.no_install,
+            resolved_profile.as_ref(),
+            &unique_commands,
+        );
+        let cmds_to_run = resolved_cmds.as_deref().unwrap_or(&unique_commands);
+        run_post_setup_commands(cmds_to_run, &target_path)?;
     }
 
     output::print_success();
@@ -589,11 +644,11 @@ fn select_configs_or_profile(
 /// * CLI flag > profile default > interactive prompt / builtin default
 ///
 /// Profile defaults used:
-/// * `remote` — remote name for `--remote-branch` fetch
+/// * `remote` — remote name for remote branch fetch
 /// * `base_branch` — base branch for new branch creation
 /// * `new_branch` — when `true`, auto-create a branch named after the worktree
-/// * `track_remote_branch` — when `true`, default to remote branch tracking and
-///   infer branch name from worktree directory
+/// * `auto_create` — skip the "Create worktree?" confirmation
+/// * `creation_method` — skip the creation method picker
 fn handle_worktree_creation(
     args: &Args,
     repo: &worktree_setup_git::Repository,
@@ -601,32 +656,45 @@ fn handle_worktree_creation(
     profile: Option<&ResolvedProfile>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let profile_defaults = profile.map(|p| &p.defaults);
-    let track_remote = profile_defaults
-        .and_then(|d| d.track_remote_branch)
-        .unwrap_or(false);
     let worktree_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
 
-    let options = if args.non_interactive {
-        handle_creation_non_interactive(
-            args,
-            repo,
-            target_path,
-            profile_defaults,
-            track_remote,
-            worktree_name,
-        )?
+    // Build creation hints from profile defaults + CLI flags
+    let effective_remote = args
+        .remote
+        .as_deref()
+        .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+    let creation_method = profile_defaults.and_then(|d| d.creation_method.as_ref());
+    let auto_create = profile_defaults
+        .and_then(|d| d.auto_create)
+        .unwrap_or(false);
+    let profile_base_branch = profile_defaults.and_then(|d| d.base_branch.as_deref());
+    let profile_new_branch = profile_defaults.and_then(|d| d.new_branch).unwrap_or(false);
+
+    // Infer branch name for remote tracking (unless --no-infer-branch)
+    let is_remote =
+        creation_method == Some(&CreationMethod::Remote) || args.remote_branch.is_some();
+    let inferred_branch = if is_remote && !args.no_infer_branch {
+        Some(worktree_name)
     } else {
-        let result = handle_creation_interactive(
-            args,
-            repo,
-            target_path,
-            profile_defaults,
-            track_remote,
-            worktree_name,
-        )?;
+        None
+    };
+
+    let hints = interactive::CreationProfileHints {
+        auto_create,
+        creation_method,
+        base_branch: profile_base_branch,
+        new_branch: profile_new_branch,
+        remote_override: effective_remote,
+        inferred_branch,
+    };
+
+    let options = if args.non_interactive {
+        handle_creation_non_interactive(args, repo, target_path, &hints, worktree_name)?
+    } else {
+        let result = handle_creation_interactive(args, repo, target_path, &hints)?;
         let Some(options) = result else {
             return Ok(());
         };
@@ -642,50 +710,55 @@ fn handle_creation_non_interactive(
     args: &Args,
     repo: &worktree_setup_git::Repository,
     target_path: &Path,
-    profile_defaults: Option<&ProfileDefaults>,
-    track_remote: bool,
+    hints: &interactive::CreationProfileHints<'_>,
     worktree_name: &str,
 ) -> Result<WorktreeCreateOptions, Box<dyn std::error::Error>> {
-    // Resolve remote: CLI --remote > profile remote > auto-detect
-    let effective_remote = args
-        .remote
-        .as_deref()
-        .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
+    let is_remote =
+        hints.creation_method == Some(&CreationMethod::Remote) || args.remote_branch.is_some();
 
-    // Handle --remote-branch or track_remote_branch profile default
+    // Handle --remote-branch or creation_method = "remote"
     let branch = if let Some(ref remote_branch) = args.remote_branch {
         // Explicit --remote-branch: always use it
-        let remote = resolve_remote_non_interactive(repo, effective_remote)?;
+        let remote = resolve_remote_non_interactive(repo, hints.remote_override)?;
         println!("Fetching from {remote}...");
         fetch_remote(repo, &remote)?;
         Some(remote_branch.clone())
-    } else if track_remote && !args.no_infer_branch {
-        // Profile says track remote — infer branch from directory name
-        let remote = resolve_remote_non_interactive(repo, effective_remote)?;
+    } else if hints.creation_method == Some(&CreationMethod::Remote) && !args.no_infer_branch {
+        // Profile says remote — infer branch from directory name
+        let remote = resolve_remote_non_interactive(repo, hints.remote_override)?;
         println!("Fetching from {remote}...");
         fetch_remote(repo, &remote)?;
         println!("Inferred remote branch: {remote}/{worktree_name}");
         Some(worktree_name.to_string())
-    } else if track_remote && args.no_infer_branch {
+    } else if hints.creation_method == Some(&CreationMethod::Remote) && args.no_infer_branch {
         return Err(
-            "Profile sets trackRemoteBranch but --no-infer-branch is set. \
+            "Profile sets creationMethod = \"remote\" but --no-infer-branch is set. \
              Use --remote-branch <name> to specify the branch explicitly."
                 .into(),
         );
+    } else if hints.creation_method == Some(&CreationMethod::Current) {
+        // Use current branch
+        get_current_branch(repo)?
+    } else if hints.creation_method == Some(&CreationMethod::Detach) {
+        // Detached HEAD handled below via the detach flag
+        None
     } else {
-        // CLI --branch > profile base_branch > None
+        // Auto or no creation_method: CLI --branch > profile base_branch > None
         args.branch
             .clone()
-            .or_else(|| profile_defaults.and_then(|d| d.base_branch.clone()))
+            .or_else(|| hints.base_branch.map(String::from))
     };
 
     // CLI --new-branch > profile new_branch (auto-name from worktree dir) > None
-    // (not used when tracking a remote branch)
-    let new_branch = if track_remote || args.remote_branch.is_some() {
+    // (not used when tracking a remote branch or detaching)
+    let new_branch = if is_remote
+        || hints.creation_method == Some(&CreationMethod::Detach)
+        || hints.creation_method == Some(&CreationMethod::Current)
+    {
         None
     } else {
         args.new_branch.clone().or_else(|| {
-            if profile_defaults.and_then(|d| d.new_branch) == Some(true) {
+            if hints.new_branch {
                 Some(worktree_name.to_string())
             } else {
                 None
@@ -693,12 +766,14 @@ fn handle_creation_non_interactive(
         })
     };
 
+    let detach = hints.creation_method == Some(&CreationMethod::Detach);
+
     println!("Creating worktree at {}...", target_path.display());
     Ok(WorktreeCreateOptions {
         branch,
         new_branch,
         force: args.force,
-        ..Default::default()
+        detach,
     })
 }
 
@@ -706,27 +781,11 @@ fn handle_creation_non_interactive(
 ///
 /// Returns `None` if the user declines to create the worktree.
 fn handle_creation_interactive(
-    args: &Args,
+    _args: &Args,
     repo: &worktree_setup_git::Repository,
     target_path: &Path,
-    profile_defaults: Option<&ProfileDefaults>,
-    track_remote: bool,
-    worktree_name: &str,
+    hints: &interactive::CreationProfileHints<'_>,
 ) -> Result<Option<WorktreeCreateOptions>, Box<dyn std::error::Error>> {
-    let effective_remote = args
-        .remote
-        .as_deref()
-        .or_else(|| profile_defaults.and_then(|d| d.remote.as_deref()));
-    let profile_base_branch = profile_defaults.and_then(|d| d.base_branch.as_deref());
-    let profile_new_branch = profile_defaults.and_then(|d| d.new_branch).unwrap_or(false);
-
-    // Infer branch name for remote tracking (unless --no-infer-branch)
-    let inferred_branch = if track_remote && !args.no_infer_branch {
-        Some(worktree_name)
-    } else {
-        None
-    };
-
     let current_branch = get_current_branch(repo)?;
     let branches = get_local_branches(repo)?;
     let default_branch = get_default_branch(repo);
@@ -739,11 +798,7 @@ fn handle_creation_interactive(
         &branches,
         default_branch.as_deref(),
         &recent_branches,
-        effective_remote,
-        profile_base_branch,
-        profile_new_branch,
-        track_remote,
-        inferred_branch,
+        hints,
     )?)
 }
 
@@ -977,19 +1032,31 @@ fn apply_create_operations(
     // Collect all post-setup commands
     let unique_commands = collect_post_setup_commands(selected_configs);
 
-    // Determine if post-setup should run: CLI flag > profile default > prompt
-    let should_run_install = should_run_post_setup(args.no_install, resolved_profile);
+    if unique_commands.is_empty() {
+        return Ok(());
+    }
 
-    // Run post-setup commands
-    if !unique_commands.is_empty() && should_run_install {
-        let should_run = if args.non_interactive {
-            true
-        } else {
-            interactive::prompt_run_install(true)?
-        };
+    // Resolve post-setup: CLI flag > profile > prompt
+    let resolved_cmds =
+        resolve_post_setup_commands(args.no_install, resolved_profile, &unique_commands);
 
-        if should_run {
-            run_post_setup_commands(&unique_commands, target_path)?;
+    match resolved_cmds {
+        Some(cmds) => {
+            // Fully determined — run without prompting
+            if !cmds.is_empty() {
+                run_post_setup_commands(&cmds, target_path)?;
+            }
+        }
+        None => {
+            // Not determined — prompt the user (or run all in non-interactive)
+            if args.non_interactive {
+                run_post_setup_commands(&unique_commands, target_path)?;
+            } else {
+                let should_run = interactive::prompt_run_install(true)?;
+                if should_run {
+                    run_post_setup_commands(&unique_commands, target_path)?;
+                }
+            }
         }
     }
 

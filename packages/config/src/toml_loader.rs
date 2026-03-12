@@ -102,7 +102,7 @@ copyUnstaged = true
 baseBranch = "develop"
 
 [profileDefaults.ci]
-skipPostSetup = true
+postSetup = "none"
 "#
         )
         .unwrap();
@@ -116,10 +116,15 @@ skipPostSetup = true
         let dev_defaults = &config.profile_defaults["dev"];
         assert_eq!(dev_defaults.copy_unstaged, Some(true));
         assert_eq!(dev_defaults.base_branch.as_deref(), Some("develop"));
-        assert_eq!(dev_defaults.skip_post_setup, None);
+        assert_eq!(dev_defaults.post_setup, None);
 
         let ci_defaults = &config.profile_defaults["ci"];
-        assert_eq!(ci_defaults.skip_post_setup, Some(true));
+        assert_eq!(
+            ci_defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None
+            ))
+        );
         assert_eq!(ci_defaults.copy_unstaged, None);
     }
 }

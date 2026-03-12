@@ -295,7 +295,7 @@ baseBranch = "main"
 [profiles.remote]
 description = "Remote branch tracking"
 configs = ["apps/my-app/"]
-trackRemoteBranch = true
+creationMethod = "remote"
 remote = "origin"
 "#
         )
@@ -309,11 +309,14 @@ remote = "origin"
         assert_eq!(profile.configs, vec!["apps/my-app/worktree.config.ts"]);
         assert_eq!(profile.defaults.copy_unstaged, Some(true));
         assert_eq!(profile.defaults.base_branch.as_deref(), Some("main"));
-        assert_eq!(profile.defaults.track_remote_branch, None);
+        assert_eq!(profile.defaults.creation_method, None);
 
         let remote_profile = &profiles.profiles["remote"];
         assert_eq!(remote_profile.description, "Remote branch tracking");
-        assert_eq!(remote_profile.defaults.track_remote_branch, Some(true));
+        assert_eq!(
+            remote_profile.defaults.creation_method,
+            Some(crate::types::CreationMethod::Remote)
+        );
         assert_eq!(remote_profile.defaults.remote.as_deref(), Some("origin"));
     }
 
@@ -374,7 +377,9 @@ remote = "origin"
                     "worktree.local.config.ts".to_string(),
                 ],
                 defaults: ProfileDefaults {
-                    skip_post_setup: Some(false),
+                    post_setup: Some(crate::types::PostSetupMode::Keyword(
+                        crate::types::PostSetupKeyword::All,
+                    )),
                     ..Default::default()
                 },
             },
@@ -388,7 +393,9 @@ remote = "origin"
                     "worktree.nix.config.ts".to_string(),
                 ],
                 defaults: ProfileDefaults {
-                    skip_post_setup: Some(true),
+                    post_setup: Some(crate::types::PostSetupMode::Keyword(
+                        crate::types::PostSetupKeyword::None,
+                    )),
                     ..Default::default()
                 },
             },
@@ -406,33 +413,50 @@ remote = "origin"
         // Later profile's description wins
         assert_eq!(resolved.description, "Nix");
         // Later profile's defaults win
-        assert_eq!(resolved.defaults.skip_post_setup, Some(true));
+        assert_eq!(
+            resolved.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None
+            ))
+        );
     }
 
     #[test]
     fn test_profile_defaults_merge() {
         let mut base = ProfileDefaults {
-            skip_post_setup: Some(false),
+            post_setup: Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::All,
+            )),
             copy_unstaged: Some(true),
             base_branch: Some("main".to_string()),
             ..Default::default()
         };
 
         let overlay = ProfileDefaults {
-            skip_post_setup: Some(true),
+            post_setup: Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None,
+            )),
             remote: Some("upstream".to_string()),
-            track_remote_branch: Some(true),
+            creation_method: Some(crate::types::CreationMethod::Remote),
             ..Default::default()
         };
 
         base.merge(&overlay);
 
-        assert_eq!(base.skip_post_setup, Some(true)); // overridden
+        assert_eq!(
+            base.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None
+            ))
+        ); // overridden
         assert_eq!(base.copy_unstaged, Some(true)); // kept
         assert_eq!(base.base_branch.as_deref(), Some("main")); // kept
         assert_eq!(base.remote.as_deref(), Some("upstream")); // new
         assert_eq!(base.new_branch, None); // still None
-        assert_eq!(base.track_remote_branch, Some(true)); // new
+        assert_eq!(
+            base.creation_method,
+            Some(crate::types::CreationMethod::Remote)
+        ); // new
     }
 
     // ─── Phase 2: Per-config profile declarations ──────────────────────────
@@ -564,7 +588,9 @@ remote = "origin"
                 configs: vec!["apps/my-app/".to_string()],
                 defaults: ProfileDefaults {
                     copy_unstaged: Some(false),
-                    skip_post_setup: Some(true),
+                    post_setup: Some(crate::types::PostSetupMode::Keyword(
+                        crate::types::PostSetupKeyword::None,
+                    )),
                     ..Default::default()
                 },
             },
@@ -577,8 +603,13 @@ remote = "origin"
         assert_eq!(resolved.defaults.copy_unstaged, Some(true));
         // Per-config sets base_branch (central didn't)
         assert_eq!(resolved.defaults.base_branch.as_deref(), Some("develop"));
-        // Central's skip_post_setup is kept (per-config didn't override it)
-        assert_eq!(resolved.defaults.skip_post_setup, Some(true));
+        // Central's post_setup is kept (per-config didn't override it)
+        assert_eq!(
+            resolved.defaults.post_setup,
+            Some(crate::types::PostSetupMode::Keyword(
+                crate::types::PostSetupKeyword::None
+            ))
+        );
     }
 
     #[test]
@@ -639,7 +670,9 @@ remote = "origin"
         profile_defaults.insert(
             "ci".to_string(),
             ProfileDefaults {
-                skip_post_setup: Some(true),
+                post_setup: Some(crate::types::PostSetupMode::Keyword(
+                    crate::types::PostSetupKeyword::None,
+                )),
                 ..Default::default()
             },
         );
@@ -655,6 +688,6 @@ remote = "origin"
 
         assert_eq!(resolved.config_indices, vec![0]);
         // "ci" profile_defaults should NOT be applied when resolving "dev"
-        assert_eq!(resolved.defaults.skip_post_setup, None);
+        assert_eq!(resolved.defaults.post_setup, None);
     }
 }

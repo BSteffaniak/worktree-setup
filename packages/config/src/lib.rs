@@ -37,8 +37,8 @@ pub use profiles::{load_profiles_file, resolve_profiles};
 pub use toml_loader::load_toml_config;
 pub use ts_loader::load_ts_config;
 pub use types::{
-    Config, LoadedConfig, ProfileDefaults, ProfileDefinition, ProfilesFile, ResolvedProfile,
-    TemplateMapping,
+    Config, CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ProfileDefaults,
+    ProfileDefinition, ProfilesFile, ResolvedProfile, TemplateMapping,
 };
 
 use std::path::Path;

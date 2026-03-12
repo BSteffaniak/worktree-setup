@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use dialoguer::{Confirm, Input, MultiSelect, Select};
-use worktree_setup_config::LoadedConfig;
+use worktree_setup_config::{CreationMethod, LoadedConfig};
 use worktree_setup_git::{
     Repository, WorktreeCreateOptions, fetch_remote, get_remote_branches, get_remotes,
 };
@@ -248,13 +248,30 @@ fn prompt_remote_branch(
     })
 }
 
+/// Profile-derived hints that control worktree creation prompts.
+#[derive(Debug, Clone, Default)]
+pub struct CreationProfileHints<'a> {
+    /// Skip the "Create worktree?" confirmation.
+    pub auto_create: bool,
+    /// Skip the creation method picker and use this method directly.
+    pub creation_method: Option<&'a CreationMethod>,
+    /// Preselect this base branch for new branch creation.
+    pub base_branch: Option<&'a str>,
+    /// When `true` with `creation_method = Auto`, use `base_branch` without prompting.
+    pub new_branch: bool,
+    /// Override the remote name for remote branch operations.
+    pub remote_override: Option<&'a str>,
+    /// Branch name inferred from worktree directory (for remote tracking).
+    pub inferred_branch: Option<&'a str>,
+}
+
 /// Build the creation method options list and determine the default choice.
 ///
 /// Returns `(display_labels, value_keys, default_index)`.
 fn build_creation_options(
     worktree_name: &str,
     current_branch: Option<&str>,
-    profile_track_remote: bool,
+    creation_method: Option<&CreationMethod>,
 ) -> (Vec<String>, Vec<&'static str>, usize) {
     let mut options: Vec<String> = Vec::new();
     let mut option_values: Vec<&str> = Vec::new();
@@ -279,41 +296,72 @@ fn build_creation_options(
     options.push("Detached HEAD (current commit)".to_string());
     option_values.push("detach");
 
-    let default_choice = if profile_track_remote {
-        option_values
-            .iter()
-            .position(|v| *v == "remote")
-            .unwrap_or(0)
-    } else {
-        0
+    let default_key = match creation_method {
+        Some(CreationMethod::Remote) => "remote",
+        Some(CreationMethod::Current) => "current",
+        Some(CreationMethod::Detach) => "detach",
+        _ => "auto",
     };
 
+    let default_choice = option_values
+        .iter()
+        .position(|v| *v == default_key)
+        .unwrap_or(0);
+
     (options, option_values, default_choice)
+}
+
+/// Dispatch a creation method directly, without showing the picker.
+fn dispatch_creation_method(
+    method: &CreationMethod,
+    repo: &Repository,
+    worktree_name: &str,
+    current_branch: Option<&str>,
+    hints: &CreationProfileHints<'_>,
+) -> io::Result<WorktreeCreateOptions> {
+    match method {
+        CreationMethod::Auto => {
+            let base_branch = hints.base_branch.map(String::from);
+            if base_branch.is_some() {
+                Ok(WorktreeCreateOptions {
+                    new_branch: Some(worktree_name.to_string()),
+                    branch: base_branch,
+                    ..Default::default()
+                })
+            } else {
+                // Current HEAD — let git handle auto-naming
+                Ok(WorktreeCreateOptions::default())
+            }
+        }
+        CreationMethod::Current => Ok(WorktreeCreateOptions {
+            branch: current_branch.map(String::from),
+            ..Default::default()
+        }),
+        CreationMethod::Remote => {
+            prompt_remote_branch(repo, hints.remote_override, hints.inferred_branch)
+        }
+        CreationMethod::Detach => Ok(WorktreeCreateOptions {
+            detach: true,
+            ..Default::default()
+        }),
+    }
 }
 
 /// Prompt for worktree creation options.
 ///
 /// Returns `None` if the user doesn't want to create a worktree.
 ///
-/// # Arguments
-///
-/// * `repo` - The repository (needed for fetching remote branches)
-/// * `target_path` - The path where the worktree will be created
-/// * `current_branch` - The current branch name, if on a branch (None if detached HEAD)
-/// * `branches` - List of available local branches
-/// * `default_branch` - The detected default branch (e.g., "main" or "master")
-/// * `recent_branches` - Recently checked-out branches from reflog
-/// * `remote_override` - If set, use this remote name instead of auto-detecting
-/// * `profile_base_branch` - If set by a profile, preselect this as the base branch
-/// * `profile_new_branch` - If `true` (from profile), default to auto-named branch creation
-/// * `profile_track_remote` - If `true` (from profile), default to "Track remote branch..."
-/// * `inferred_branch` - Branch name inferred from worktree dir (for remote tracking)
+/// Profile hints control which prompts are skipped:
+/// * `auto_create` — skip the "Create it?" confirmation
+/// * `creation_method` — skip the creation method picker
+/// * `base_branch` / `new_branch` — skip the base branch prompt
+/// * `inferred_branch` — auto-select a remote branch by name
 ///
 /// # Errors
 ///
 /// * If the user cancels the prompts
 /// * If fetching remote branches fails
-#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn prompt_worktree_create(
     repo: &Repository,
     target_path: &Path,
@@ -321,22 +369,21 @@ pub fn prompt_worktree_create(
     branches: &[String],
     default_branch: Option<&str>,
     recent_branches: &[String],
-    remote_override: Option<&str>,
-    profile_base_branch: Option<&str>,
-    profile_new_branch: bool,
-    profile_track_remote: bool,
-    inferred_branch: Option<&str>,
+    hints: &CreationProfileHints<'_>,
 ) -> io::Result<Option<WorktreeCreateOptions>> {
-    let should_create = Confirm::new()
-        .with_prompt(format!(
-            "Worktree does not exist at {}. Create it?",
-            target_path.display()
-        ))
-        .default(true)
-        .interact()?;
+    // Step 1: Confirm creation (skip if auto_create)
+    if !hints.auto_create {
+        let should_create = Confirm::new()
+            .with_prompt(format!(
+                "Worktree does not exist at {}. Create it?",
+                target_path.display()
+            ))
+            .default(true)
+            .interact()?;
 
-    if !should_create {
-        return Ok(None);
+        if !should_create {
+            return Ok(None);
+        }
     }
 
     let worktree_name = target_path
@@ -344,8 +391,15 @@ pub fn prompt_worktree_create(
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
 
+    // Step 2: If creation_method is fully determined, dispatch directly
+    if let Some(method) = hints.creation_method {
+        let options = dispatch_creation_method(method, repo, worktree_name, current_branch, hints)?;
+        return Ok(Some(options));
+    }
+
+    // Step 3: Show creation method picker
     let (options, option_values, default_choice) =
-        build_creation_options(worktree_name, current_branch, profile_track_remote);
+        build_creation_options(worktree_name, current_branch, hints.creation_method);
 
     let choice = Select::new()
         .with_prompt("How should the worktree be created?")
@@ -357,16 +411,12 @@ pub fn prompt_worktree_create(
 
     let result = match selected_value {
         "auto" => {
-            // If profile sets both new_branch and base_branch, use the base
-            // branch directly without prompting
-            let base_branch = if profile_new_branch && profile_base_branch.is_some() {
-                profile_base_branch.map(String::from)
+            let base_branch = if hints.new_branch && hints.base_branch.is_some() {
+                hints.base_branch.map(String::from)
             } else {
-                prompt_base_branch(default_branch, recent_branches, profile_base_branch)?
+                prompt_base_branch(default_branch, recent_branches, hints.base_branch)?
             };
 
-            // For auto-named branch with a custom base, we need to explicitly
-            // create the branch with -b, otherwise git just checks out the base branch
             if base_branch.is_some() {
                 WorktreeCreateOptions {
                     new_branch: Some(worktree_name.to_string()),
@@ -374,7 +424,6 @@ pub fn prompt_worktree_create(
                     ..Default::default()
                 }
             } else {
-                // Current HEAD - let git handle auto-naming
                 WorktreeCreateOptions::default()
             }
         }
@@ -384,7 +433,7 @@ pub fn prompt_worktree_create(
                 .interact_text()?;
 
             let base_branch =
-                prompt_base_branch(default_branch, recent_branches, profile_base_branch)?;
+                prompt_base_branch(default_branch, recent_branches, hints.base_branch)?;
 
             WorktreeCreateOptions {
                 new_branch: Some(branch_name),
@@ -392,13 +441,10 @@ pub fn prompt_worktree_create(
                 ..Default::default()
             }
         }
-        "current" => {
-            // Use the current branch
-            WorktreeCreateOptions {
-                branch: current_branch.map(String::from),
-                ..Default::default()
-            }
-        }
+        "current" => WorktreeCreateOptions {
+            branch: current_branch.map(String::from),
+            ..Default::default()
+        },
         "existing" => {
             if branches.is_empty() {
                 println!("No local branches found. Using auto-named branch instead.");
@@ -415,7 +461,7 @@ pub fn prompt_worktree_create(
                 }
             }
         }
-        "remote" => prompt_remote_branch(repo, remote_override, inferred_branch)?,
+        "remote" => prompt_remote_branch(repo, hints.remote_override, hints.inferred_branch)?,
         "detach" => WorktreeCreateOptions {
             detach: true,
             ..Default::default()
@@ -489,70 +535,74 @@ pub struct SetupOperationChoices {
     pub run_post_setup: bool,
 }
 
-/// Default values for setup operation checkboxes.
+/// Input for each setup operation: pre-determined by profile or needs prompting.
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct SetupOperationDefaults {
-    /// Whether the target is a secondary worktree (shows file ops when `true`).
+pub struct SetupOperationInputs {
+    /// Whether the target is a secondary worktree (controls file ops visibility).
     pub is_secondary_worktree: bool,
-    /// Default checked state for file operations.
-    pub files: bool,
-    /// Default checked state for overwrite existing files.
-    pub overwrite: bool,
-    /// Default checked state for post-setup commands.
-    pub post_setup: bool,
+    /// File operations: `Some(value)` = determined, `None` = prompt.
+    pub files: Option<bool>,
+    /// Overwrite existing: `Some(value)` = determined, `None` = prompt.
+    pub overwrite: Option<bool>,
+    /// Post-setup commands: `Some(value)` = determined, `None` = prompt.
+    pub post_setup: Option<bool>,
 }
 
-/// Prompt the user to select which setup operations to run.
+/// Determine setup operations, prompting only for undetermined values.
 ///
-/// Shows an interactive checklist with file operations, overwrite toggle,
-/// and post-setup commands. Items are pre-checked based on defaults
-/// (which can be influenced by CLI flags).
+/// If all values are pre-determined (by profile + CLI flags), no prompt
+/// is shown. Otherwise, only undetermined items appear in the checklist.
 ///
 /// # Arguments
 ///
-/// * `defaults` - Default checked states for each operation
-/// * `post_setup_commands` - List of post-setup commands (shown inline for context)
+/// * `inputs` - Which operations are determined vs need prompting
+/// * `post_setup_commands` - Post-setup commands (shown inline for context)
 ///
 /// # Errors
 ///
 /// * If the user cancels the prompt
 pub fn prompt_setup_operations(
-    defaults: &SetupOperationDefaults,
+    inputs: &SetupOperationInputs,
     post_setup_commands: &[&str],
 ) -> io::Result<SetupOperationChoices> {
+    // Start with pre-determined values
+    let mut result = SetupOperationChoices {
+        run_files: inputs.files.unwrap_or(inputs.is_secondary_worktree),
+        overwrite_existing: inputs.overwrite.unwrap_or(false),
+        run_post_setup: inputs.post_setup.unwrap_or(!post_setup_commands.is_empty()),
+    };
+
+    // Build checklist of only undetermined items
     let mut items: Vec<String> = Vec::new();
     let mut checked: Vec<bool> = Vec::new();
 
-    // Track which index maps to which operation
+    // Track which checklist index maps to which operation
     let mut file_ops_index: Option<usize> = None;
     let mut overwrite_index: Option<usize> = None;
     let mut post_setup_index: Option<usize> = None;
 
-    if defaults.is_secondary_worktree {
+    if inputs.is_secondary_worktree && inputs.files.is_none() {
         file_ops_index = Some(items.len());
         items.push("Apply file operations (symlinks, copies, templates)".to_string());
-        checked.push(defaults.files);
-
-        overwrite_index = Some(items.len());
-        items.push("Overwrite existing files".to_string());
-        checked.push(defaults.overwrite);
+        checked.push(result.run_files);
     }
 
-    if !post_setup_commands.is_empty() {
+    if inputs.is_secondary_worktree && inputs.overwrite.is_none() {
+        overwrite_index = Some(items.len());
+        items.push("Overwrite existing files".to_string());
+        checked.push(result.overwrite_existing);
+    }
+
+    if !post_setup_commands.is_empty() && inputs.post_setup.is_none() {
         post_setup_index = Some(items.len());
         let cmds_display = post_setup_commands.join(", ");
         items.push(format!("Run post-setup commands ({cmds_display})"));
-        checked.push(defaults.post_setup);
+        checked.push(result.run_post_setup);
     }
 
+    // If nothing needs prompting, return the pre-determined values
     if items.is_empty() {
-        // Nothing to prompt for
-        return Ok(SetupOperationChoices {
-            run_files: false,
-            overwrite_existing: false,
-            run_post_setup: false,
-        });
+        return Ok(result);
     }
 
     let selections = MultiSelect::new()
@@ -561,12 +611,16 @@ pub fn prompt_setup_operations(
         .defaults(&checked)
         .interact()?;
 
-    let run_files = file_ops_index.is_some_and(|i| selections.contains(&i));
+    // Update only the prompted items
+    if let Some(i) = file_ops_index {
+        result.run_files = selections.contains(&i);
+    }
+    if let Some(i) = overwrite_index {
+        result.overwrite_existing = result.run_files && selections.contains(&i);
+    }
+    if let Some(i) = post_setup_index {
+        result.run_post_setup = selections.contains(&i);
+    }
 
-    Ok(SetupOperationChoices {
-        run_files,
-        // Overwrite only matters if file operations are selected
-        overwrite_existing: run_files && overwrite_index.is_some_and(|i| selections.contains(&i)),
-        run_post_setup: post_setup_index.is_some_and(|i| selections.contains(&i)),
-    })
+    Ok(result)
 }

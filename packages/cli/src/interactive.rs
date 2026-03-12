@@ -32,6 +32,7 @@ pub fn select_configs(configs: &[LoadedConfig]) -> io::Result<Vec<usize>> {
     let selections = MultiSelect::new()
         .with_prompt("Select configurations to apply")
         .items(&items)
+        .defaults(&vec![true; items.len()])
         .interact()?;
 
     Ok(selections)

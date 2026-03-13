@@ -87,6 +87,28 @@ pub enum GitError {
     #[error("Worktree not found: {0}")]
     WorktreeNotFound(String),
 
+    /// Failed to remove worktree.
+    #[error("Failed to remove worktree at {path}: {message}")]
+    WorktreeRemoveError {
+        /// Path of the worktree that could not be removed.
+        path: String,
+        /// Error message from the git CLI.
+        message: String,
+    },
+
+    /// Cannot remove the main worktree.
+    #[error("Cannot remove the main worktree at {0}")]
+    CannotRemoveMainWorktree(String),
+
+    /// Failed to delete a branch.
+    #[error("Failed to delete branch '{branch}': {message}")]
+    BranchDeleteError {
+        /// The branch name that could not be deleted.
+        branch: String,
+        /// Error message from the git CLI.
+        message: String,
+    },
+
     /// Path error.
     #[error("Invalid path: {}", .0.display())]
     InvalidPath(PathBuf),

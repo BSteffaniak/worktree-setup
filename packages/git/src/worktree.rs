@@ -229,6 +229,115 @@ pub fn prune_worktrees(repo: &Repository) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Remove a linked worktree using the git CLI.
+///
+/// This removes the worktree directory and its git tracking. The main
+/// worktree cannot be removed — attempting to do so returns an error.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+/// * `worktree_path` - Path to the worktree to remove
+/// * `force` - If true, pass `--force` to allow removal even with
+///   uncommitted changes or if the working tree is dirty
+///
+/// # Errors
+///
+/// * If `worktree_path` is the main worktree
+/// * If the git CLI command fails
+pub fn remove_worktree(
+    repo: &Repository,
+    worktree_path: &Path,
+    force: bool,
+) -> Result<(), GitError> {
+    // Guard: never remove the main worktree
+    let repo_root = get_repo_root(repo)?;
+    let main_canonical = repo_root
+        .canonicalize()
+        .map_err(|_| GitError::CannotRemoveMainWorktree(repo_root.to_string_lossy().to_string()))?;
+    if let Ok(target_canonical) = worktree_path.canonicalize()
+        && target_canonical == main_canonical
+    {
+        return Err(GitError::CannotRemoveMainWorktree(
+            worktree_path.to_string_lossy().to_string(),
+        ));
+    }
+
+    log::info!("Removing worktree at {}", worktree_path.display());
+
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+
+    if force {
+        args.push("--force");
+    }
+
+    let path_str = worktree_path.to_string_lossy();
+    args.push(&path_str);
+
+    log::debug!("Running: git {}", args.join(" "));
+
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| GitError::WorktreeRemoveError {
+            path: worktree_path.to_string_lossy().to_string(),
+            message: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitError::WorktreeRemoveError {
+            path: worktree_path.to_string_lossy().to_string(),
+            message: stderr.trim().to_string(),
+        });
+    }
+
+    log::info!("Removed worktree at {}", worktree_path.display());
+    Ok(())
+}
+
+/// Delete a local branch using the git CLI.
+///
+/// # Arguments
+///
+/// * `repo` - The repository
+/// * `branch` - Name of the branch to delete
+/// * `force` - If true, uses `-D` (force delete) instead of `-d`
+///   (safe delete). Safe delete refuses to delete branches that have
+///   not been fully merged into their upstream or HEAD.
+///
+/// # Errors
+///
+/// * If the git CLI command fails (e.g., branch not found or not merged)
+pub fn delete_branch(repo: &Repository, branch: &str, force: bool) -> Result<(), GitError> {
+    let repo_root = get_repo_root(repo)?;
+    let flag = if force { "-D" } else { "-d" };
+
+    log::info!("Deleting branch '{branch}' (force={force})");
+    log::debug!("Running: git branch {flag} {branch}");
+
+    let output = Command::new("git")
+        .args(["branch", flag, branch])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|e| GitError::BranchDeleteError {
+            branch: branch.to_string(),
+            message: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitError::BranchDeleteError {
+            branch: branch.to_string(),
+            message: stderr.trim().to_string(),
+        });
+    }
+
+    log::info!("Deleted branch '{branch}'");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +437,192 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn test_remove_worktree() {
+        let (dir, repo) = create_test_repo();
+
+        // Create a linked worktree
+        let wt_path = dir.path().join("to-remove");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "remove-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert!(wt_path.exists(), "worktree dir should exist before removal");
+        assert_eq!(get_worktrees(&repo).unwrap().len(), 2);
+
+        // Remove it
+        remove_worktree(&repo, &wt_path, false).unwrap();
+
+        assert!(
+            !wt_path.exists(),
+            "worktree dir should be gone after removal"
+        );
+
+        // Re-open repo to get fresh worktree list (git2 caches)
+        let repo = Repository::open(dir.path()).unwrap();
+        let worktrees = get_worktrees(&repo).unwrap();
+        assert_eq!(worktrees.len(), 1, "only main worktree should remain");
+        assert!(worktrees[0].is_main);
+    }
+
+    #[test]
+    fn test_remove_worktree_force() {
+        let (dir, repo) = create_test_repo();
+
+        // Create a linked worktree
+        let wt_path = dir.path().join("dirty-wt");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "dirty-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Make it dirty (uncommitted changes)
+        std::fs::write(wt_path.join("dirty-file.txt"), "uncommitted").unwrap();
+        Command::new("git")
+            .args(["add", "dirty-file.txt"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+
+        // Non-force removal should fail on dirty worktree
+        let result = remove_worktree(&repo, &wt_path, false);
+        assert!(
+            result.is_err(),
+            "non-force removal of dirty worktree should fail"
+        );
+
+        // Force removal should succeed
+        remove_worktree(&repo, &wt_path, true).unwrap();
+        assert!(
+            !wt_path.exists(),
+            "worktree should be gone after force removal"
+        );
+    }
+
+    #[test]
+    fn test_remove_main_worktree_rejected() {
+        let (dir, repo) = create_test_repo();
+
+        let result = remove_worktree(&repo, dir.path(), false);
+        assert!(result.is_err(), "removing main worktree should fail");
+
+        match result.unwrap_err() {
+            GitError::CannotRemoveMainWorktree(_) => {}
+            other => panic!("expected CannotRemoveMainWorktree, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_delete_branch() {
+        let (dir, repo) = create_test_repo();
+
+        // Create a branch (merged into current HEAD, so -d will work)
+        Command::new("git")
+            .args(["branch", "to-delete"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Verify branch exists
+        let output = Command::new("git")
+            .args(["branch", "--list", "to-delete"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("to-delete"),
+            "branch should exist before delete"
+        );
+
+        // Delete it (safe mode)
+        delete_branch(&repo, "to-delete", false).unwrap();
+
+        // Verify branch is gone
+        let output = Command::new("git")
+            .args(["branch", "--list", "to-delete"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("to-delete"),
+            "branch should be gone after delete"
+        );
+    }
+
+    #[test]
+    fn test_delete_branch_force() {
+        let (dir, repo) = create_test_repo();
+
+        // Create a worktree with a new branch, add a commit, then remove the worktree.
+        // The branch will be "unmerged" relative to the main branch.
+        let wt_path = dir.path().join("unmerged-wt");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "unmerged-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Add a commit on the unmerged branch
+        std::fs::write(wt_path.join("new-file.txt"), "content").unwrap();
+        Command::new("git")
+            .args(["add", "new-file.txt"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "unmerged commit"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+
+        // Remove the worktree (force because it has extra commit)
+        remove_worktree(&repo, &wt_path, true).unwrap();
+
+        // Safe delete should fail (branch is not merged)
+        let result = delete_branch(&repo, "unmerged-branch", false);
+        assert!(
+            result.is_err(),
+            "safe delete of unmerged branch should fail"
+        );
+
+        // Force delete should succeed
+        delete_branch(&repo, "unmerged-branch", true).unwrap();
+
+        // Verify branch is gone
+        let output = Command::new("git")
+            .args(["branch", "--list", "unmerged-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("unmerged-branch"),
+            "branch should be gone after force delete"
+        );
+    }
+
+    #[test]
+    fn test_delete_nonexistent_branch_fails() {
+        let (_dir, repo) = create_test_repo();
+
+        let result = delete_branch(&repo, "does-not-exist", false);
+        assert!(result.is_err(), "deleting nonexistent branch should fail");
+
+        match result.unwrap_err() {
+            GitError::BranchDeleteError { branch, .. } => {
+                assert_eq!(branch, "does-not-exist");
+            }
+            other => panic!("expected BranchDeleteError, got: {other}"),
+        }
     }
 }

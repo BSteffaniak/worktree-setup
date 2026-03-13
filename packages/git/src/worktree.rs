@@ -62,9 +62,8 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>, GitError> {
     let worktree_names = repo.worktrees().map_err(GitError::WorktreeListError)?;
 
     for name in worktree_names.iter().flatten() {
-        if let Ok(wt) = repo.find_worktree(name)
-            && let Some(wt_path) = wt.path().parent()
-        {
+        if let Ok(wt) = repo.find_worktree(name) {
+            let wt_path = wt.path();
             // Open the worktree as a repo to get branch info
             if let Ok(wt_repo) = Repository::open(wt_path) {
                 worktrees.push(get_worktree_info_from_repo(&wt_repo, wt_path, false));
@@ -289,5 +288,45 @@ mod tests {
         let expected = dir.path().canonicalize().unwrap();
         let actual = main.path.canonicalize().unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_get_worktrees_finds_linked() {
+        let (dir, repo) = create_test_repo();
+
+        // Create a linked worktree
+        let wt_path = dir.path().join("linked-wt");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "linked-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let worktrees = get_worktrees(&repo).unwrap();
+
+        assert_eq!(worktrees.len(), 2, "should find main + linked worktree");
+
+        let main = worktrees.iter().find(|w| w.is_main).unwrap();
+        let linked = worktrees.iter().find(|w| !w.is_main).unwrap();
+
+        // Main worktree
+        let expected_main = dir.path().canonicalize().unwrap();
+        let actual_main = main.path.canonicalize().unwrap();
+        assert_eq!(actual_main, expected_main);
+
+        // Linked worktree
+        let expected_linked = wt_path.canonicalize().unwrap();
+        let actual_linked = linked.path.canonicalize().unwrap();
+        assert_eq!(actual_linked, expected_linked);
+        assert_eq!(linked.branch.as_deref(), Some("linked-branch"));
+
+        // Clean up
+        Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
     }
 }

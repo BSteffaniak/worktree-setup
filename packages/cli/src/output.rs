@@ -108,6 +108,7 @@ pub fn print_info(message: &str) {
 }
 
 /// An item resolved for cleaning (deletion).
+#[derive(Clone)]
 pub struct CleanItem {
     /// Display path relative to the target directory.
     pub relative_path: String,
@@ -180,6 +181,76 @@ pub fn print_clean_summary(deleted_count: usize, total_size: u64) {
         "Deleted {} item{}, freed {}",
         deleted_count,
         if deleted_count == 1 { "" } else { "s" },
+        format_size(total_size)
+    );
+}
+
+/// Print a detailed preview of items grouped by worktree.
+///
+/// Shows a header for each worktree, items underneath, and a grand total.
+pub fn print_multi_worktree_clean_preview(groups: &[(String, Vec<CleanItem>)]) {
+    let total_items: usize = groups.iter().map(|(_, items)| items.len()).sum();
+
+    if total_items == 0 {
+        println!("Nothing to clean across selected worktrees.");
+        return;
+    }
+
+    for (label, items) in groups {
+        if items.is_empty() {
+            continue;
+        }
+
+        println!(
+            "  {} ({} item{}):",
+            label.cyan().bold(),
+            items.len(),
+            if items.len() == 1 { "" } else { "s" }
+        );
+
+        for item in items {
+            let type_label = if item.is_dir { "dir " } else { "file" };
+            let size_str = format_size(item.size);
+            println!(
+                "    {} {} {} {}",
+                "•".dimmed(),
+                format!("[{type_label}]").dimmed(),
+                item.relative_path.yellow(),
+                format!("({size_str})").dimmed(),
+            );
+        }
+        println!();
+    }
+
+    let total_size: u64 = groups
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|i| i.size))
+        .sum();
+    let worktree_count = groups.iter().filter(|(_, items)| !items.is_empty()).count();
+    println!(
+        "  {} {}",
+        "Total:".bold(),
+        format!(
+            "{total_items} items across {worktree_count} worktree{}, {}",
+            if worktree_count == 1 { "" } else { "s" },
+            format_size(total_size)
+        )
+        .bold()
+    );
+}
+
+/// Print a summary after multi-worktree cleaning completes.
+pub fn print_multi_worktree_clean_summary(
+    deleted_count: usize,
+    total_size: u64,
+    worktree_count: usize,
+) {
+    println!(
+        "Deleted {} item{} across {} worktree{}, freed {}",
+        deleted_count,
+        if deleted_count == 1 { "" } else { "s" },
+        worktree_count,
+        if worktree_count == 1 { "" } else { "s" },
         format_size(total_size)
     );
 }

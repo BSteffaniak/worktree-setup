@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use worktree_setup_config::{CreationMethod, LoadedConfig};
 use worktree_setup_git::{
-    Repository, WorktreeCreateOptions, fetch_remote, get_remote_branches, get_remotes,
+    Repository, WorktreeCreateOptions, WorktreeInfo, fetch_remote, get_remote_branches, get_remotes,
 };
 
 /// Select which configs to apply from a list.
@@ -33,6 +33,49 @@ pub fn select_configs(configs: &[LoadedConfig]) -> io::Result<Vec<usize>> {
         .with_prompt("Select configurations to apply")
         .items(&items)
         .defaults(&vec![true; items.len()])
+        .interact()?;
+
+    Ok(selections)
+}
+
+/// Format a worktree as a display label for selection prompts.
+///
+/// Shows: `branch (path)` with `[main]` suffix for the main worktree,
+/// or `detached@commit (path)` for detached HEAD.
+#[must_use]
+fn format_worktree_label(wt: &WorktreeInfo) -> String {
+    let suffix = if wt.is_main { " [main]" } else { "" };
+
+    wt.branch.as_ref().map_or_else(
+        || {
+            wt.commit.as_ref().map_or_else(
+                || format!("({}){suffix}", wt.path.display()),
+                |commit| format!("detached@{commit} ({}){suffix}", wt.path.display()),
+            )
+        },
+        |branch| format!("{branch} ({}){suffix}", wt.path.display()),
+    )
+}
+
+/// Select which worktrees to clean from a list.
+///
+/// Displays each worktree with its branch name and path.
+/// All worktrees are unchecked by default.
+///
+/// # Errors
+///
+/// * If the user cancels the selection
+pub fn select_worktrees(worktrees: &[WorktreeInfo]) -> io::Result<Vec<usize>> {
+    if worktrees.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let items: Vec<String> = worktrees.iter().map(format_worktree_label).collect();
+
+    let selections = MultiSelect::new()
+        .with_prompt("Select worktrees to clean")
+        .items(&items)
+        .defaults(&vec![false; items.len()])
         .interact()?;
 
     Ok(selections)

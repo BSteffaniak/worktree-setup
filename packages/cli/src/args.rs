@@ -223,6 +223,13 @@ pub struct CleanArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
 
+    /// Interactively select worktrees to clean.
+    ///
+    /// Opens a multi-select prompt listing all worktrees in the repository.
+    /// Cannot be combined with a positional target path.
+    #[arg(long, short = 'w')]
+    pub worktrees: bool,
+
     /// Preview what would be deleted without actually deleting.
     #[arg(long)]
     pub dry_run: bool,

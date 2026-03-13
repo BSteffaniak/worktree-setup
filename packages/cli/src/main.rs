@@ -29,7 +29,7 @@ use worktree_setup_git::{
     GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
     get_current_branch, get_default_branch, get_local_branches, get_main_worktree,
     get_recent_branches, get_remotes, get_repo_root, get_unstaged_and_untracked_files,
-    prune_worktrees,
+    get_worktrees, prune_worktrees,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
@@ -847,7 +847,295 @@ fn resolve_clean_glob(
 ///
 /// Discovers clean paths from selected configs, shows a preview with sizes,
 /// prompts for confirmation (unless `--force` or `--dry-run`), and deletes.
+///
+/// When `--worktrees` is set, presents an interactive multi-select of all
+/// worktrees in the repository and cleans each selected one.
 fn run_clean(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate conflicting args
+    if args.worktrees && args.target_path.is_some() {
+        return Err(
+            "--worktrees and a positional target path are mutually exclusive. \
+             Use --worktrees to select worktrees interactively, or provide a target path."
+                .into(),
+        );
+    }
+
+    if args.worktrees {
+        run_clean_multi_worktree(args)
+    } else {
+        run_clean_single(args)
+    }
+}
+
+/// A group of resolved clean items for a single worktree.
+struct WorktreeCleanGroup {
+    /// Display label for the worktree (e.g. branch name).
+    label: String,
+    /// Resolved absolute paths paired with their display strings.
+    resolved: Vec<(PathBuf, String)>,
+    /// Preview items with type and size info.
+    items: Vec<output::CleanItem>,
+}
+
+/// Run multi-worktree clean: prompt for worktree selection, resolve clean
+/// paths for each, show grouped preview, single confirmation, then delete all.
+fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+
+    // Discover repository from cwd
+    let repo = discover_repo(&cwd)?;
+    let repo_root = get_repo_root(&repo)?;
+
+    output::print_header("Worktree Clean (multi)");
+    output::print_repo_info(&repo_root.to_string_lossy());
+    println!();
+
+    // Get all worktrees
+    let worktrees = get_worktrees(&repo)?;
+
+    if worktrees.len() < 2 {
+        output::print_info("Only one worktree found. Use clean without --worktrees instead.");
+        return Ok(());
+    }
+
+    // Prompt for worktree selection (always, even with --force)
+    if args.non_interactive {
+        return Err(
+            "--worktrees requires interactive mode for worktree selection. \
+             Remove --non-interactive to use this feature."
+                .into(),
+        );
+    }
+
+    let selected_indices = interactive::select_worktrees(&worktrees)?;
+    if selected_indices.is_empty() {
+        println!("No worktrees selected. Exiting.");
+        return Ok(());
+    }
+
+    let selected_worktrees: Vec<_> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
+
+    // Discover configs and select which to use
+    let selected_configs = discover_and_select_clean_configs(args, &repo_root)?;
+    let selected_configs: Vec<&LoadedConfig> = selected_configs.iter().collect();
+
+    // Check if any selected config has clean paths
+    let has_clean_paths = selected_configs.iter().any(|c| !c.config.clean.is_empty());
+    if !has_clean_paths {
+        output::print_info("No clean paths defined in selected configs.");
+        return Ok(());
+    }
+
+    // Resolve clean paths for each selected worktree
+    let groups = resolve_multi_worktree_clean(&selected_worktrees, &selected_configs, &repo_root);
+
+    // Check if there's anything to clean
+    let total_items: usize = groups.iter().map(|g| g.items.len()).sum();
+    if total_items == 0 {
+        output::print_info(
+            "All clean paths are already clean across selected worktrees (nothing to delete).",
+        );
+        return Ok(());
+    }
+
+    // Build display groups for preview
+    let display_groups: Vec<(String, Vec<output::CleanItem>)> = groups
+        .iter()
+        .map(|g| (g.label.clone(), g.items.clone()))
+        .collect();
+
+    println!();
+    output::print_multi_worktree_clean_preview(&display_groups);
+
+    // Dry run: stop here
+    if args.dry_run {
+        println!("\n{}", "Dry run — nothing was deleted.".dimmed());
+        return Ok(());
+    }
+
+    // Confirm and delete
+    confirm_and_delete_multi(args.force, args.non_interactive, &groups)
+}
+
+/// Discover configs, resolve profiles, and select which configs to use for cleaning.
+///
+/// Shared logic between single and multi-worktree clean modes.
+fn discover_and_select_clean_configs(
+    args: &CleanArgs,
+    repo_root: &Path,
+) -> Result<Vec<LoadedConfig>, Box<dyn std::error::Error>> {
+    let all_configs = discover_and_load_configs(repo_root)?;
+
+    if all_configs.is_empty() {
+        output::print_warning("No configs found. Nothing to clean.");
+        return Ok(Vec::new());
+    }
+
+    // Resolve profiles if --profile was provided
+    let resolved_profile = if args.profile.is_empty() {
+        None
+    } else {
+        Some(resolve_and_print_profile(
+            &args.profile,
+            &all_configs,
+            repo_root,
+        )?)
+    };
+
+    // Select configs
+    let selected_indices = select_configs_or_profile(
+        &all_configs,
+        args.non_interactive,
+        &args.configs,
+        resolved_profile.as_ref(),
+    )?;
+
+    let Some(selected_indices) = selected_indices else {
+        return Ok(Vec::new());
+    };
+
+    Ok(selected_indices
+        .iter()
+        .map(|&i| all_configs[i].clone())
+        .collect())
+}
+
+/// Resolve clean paths for each worktree, building grouped results.
+fn resolve_multi_worktree_clean(
+    worktrees: &[&worktree_setup_git::WorktreeInfo],
+    selected_configs: &[&LoadedConfig],
+    repo_root: &Path,
+) -> Vec<WorktreeCleanGroup> {
+    let mut groups = Vec::new();
+
+    for wt in worktrees {
+        let target_path = &wt.path;
+        let target_canonical = match target_path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                output::print_warning(&format!(
+                    "Could not access worktree '{}': {}",
+                    target_path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+
+        let resolved =
+            resolve_clean_paths(selected_configs, target_path, &target_canonical, repo_root);
+
+        let items: Vec<output::CleanItem> = resolved
+            .iter()
+            .map(|(abs_path, rel_path)| {
+                let is_dir = abs_path.is_dir();
+                let size = path_size(abs_path);
+                output::CleanItem {
+                    relative_path: rel_path.clone(),
+                    is_dir,
+                    size,
+                }
+            })
+            .collect();
+
+        let label = worktree_clean_label(wt);
+        groups.push(WorktreeCleanGroup {
+            label,
+            resolved,
+            items,
+        });
+    }
+
+    groups
+}
+
+/// Build a display label for a worktree in clean output.
+fn worktree_clean_label(wt: &worktree_setup_git::WorktreeInfo) -> String {
+    let suffix = if wt.is_main { " [main]" } else { "" };
+    wt.branch.as_ref().map_or_else(
+        || {
+            wt.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+                + suffix
+        },
+        |branch| format!("{branch}{suffix}"),
+    )
+}
+
+/// Confirm and delete items across multiple worktrees.
+fn confirm_and_delete_multi(
+    force: bool,
+    non_interactive: bool,
+    groups: &[WorktreeCleanGroup],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !force {
+        if non_interactive {
+            return Err(
+                "Clean requires confirmation. Use --force to skip, or --dry-run to preview.".into(),
+            );
+        }
+
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt("Proceed with deletion across all selected worktrees?")
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted_count = 0usize;
+    let mut total_size = 0u64;
+    let mut worktrees_cleaned = 0usize;
+
+    for group in groups {
+        if group.items.is_empty() {
+            continue;
+        }
+
+        let mut worktree_had_deletion = false;
+
+        for (idx, (abs_path, _)) in group.resolved.iter().enumerate() {
+            let item = &group.items[idx];
+            let result = if abs_path.is_dir() {
+                std::fs::remove_dir_all(abs_path)
+            } else {
+                std::fs::remove_file(abs_path)
+            };
+
+            match result {
+                Ok(()) => {
+                    deleted_count += 1;
+                    total_size += item.size;
+                    worktree_had_deletion = true;
+                }
+                Err(e) => {
+                    output::print_warning(&format!(
+                        "Failed to delete '{}': {}",
+                        item.relative_path, e
+                    ));
+                }
+            }
+        }
+
+        if worktree_had_deletion {
+            worktrees_cleaned += 1;
+        }
+    }
+
+    println!();
+    output::print_multi_worktree_clean_summary(deleted_count, total_size, worktrees_cleaned);
+
+    Ok(())
+}
+
+/// Run single-worktree clean (original behavior).
+fn run_clean_single(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let target_path = resolve_setup_target(&cwd, args.target_path.as_ref());
 
@@ -2162,5 +2450,141 @@ mod tests {
         let single_size = path_size(&original);
         // Both hardlinks should be counted (disk usage for each entry)
         assert_eq!(size, single_size * 2);
+    }
+
+    // ─── worktree_clean_label ───────────────────────────────────────────
+
+    #[test]
+    fn test_worktree_clean_label_with_branch() {
+        let wt = worktree_setup_git::WorktreeInfo {
+            path: PathBuf::from("/repo/feature"),
+            is_main: false,
+            branch: Some("feature-auth".to_string()),
+            commit: Some("abc12345".to_string()),
+        };
+        assert_eq!(worktree_clean_label(&wt), "feature-auth");
+    }
+
+    #[test]
+    fn test_worktree_clean_label_main_worktree() {
+        let wt = worktree_setup_git::WorktreeInfo {
+            path: PathBuf::from("/repo"),
+            is_main: true,
+            branch: Some("master".to_string()),
+            commit: Some("abc12345".to_string()),
+        };
+        assert_eq!(worktree_clean_label(&wt), "master [main]");
+    }
+
+    #[test]
+    fn test_worktree_clean_label_no_branch() {
+        let wt = worktree_setup_git::WorktreeInfo {
+            path: PathBuf::from("/repo/detached-wt"),
+            is_main: false,
+            branch: None,
+            commit: Some("abc12345".to_string()),
+        };
+        // Falls back to directory name
+        assert_eq!(worktree_clean_label(&wt), "detached-wt");
+    }
+
+    #[test]
+    fn test_worktree_clean_label_no_branch_main() {
+        let wt = worktree_setup_git::WorktreeInfo {
+            path: PathBuf::from("/repo"),
+            is_main: true,
+            branch: None,
+            commit: Some("abc12345".to_string()),
+        };
+        assert_eq!(worktree_clean_label(&wt), "repo [main]");
+    }
+
+    // ─── resolve_multi_worktree_clean ───────────────────────────────────
+
+    #[test]
+    fn test_resolve_multi_worktree_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        // Config at repo root level
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Two "worktrees" (just directories for testing)
+        let wt1_path = repo_root.join("wt1");
+        let wt2_path = repo_root.join("wt2");
+
+        // Create clean targets in both worktrees
+        std::fs::create_dir_all(wt1_path.join("apps/my-app/node_modules")).unwrap();
+        std::fs::write(wt1_path.join("apps/my-app/node_modules/pkg.js"), "data1").unwrap();
+
+        std::fs::create_dir_all(wt2_path.join("apps/my-app/node_modules")).unwrap();
+        std::fs::write(wt2_path.join("apps/my-app/node_modules/pkg.js"), "data2").unwrap();
+        std::fs::create_dir_all(wt2_path.join("apps/my-app/.turbo")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string(), ".turbo".to_string()],
+        );
+
+        let wt1 = worktree_setup_git::WorktreeInfo {
+            path: wt1_path,
+            is_main: false,
+            branch: Some("feature-a".to_string()),
+            commit: None,
+        };
+        let wt2 = worktree_setup_git::WorktreeInfo {
+            path: wt2_path,
+            is_main: false,
+            branch: Some("feature-b".to_string()),
+            commit: None,
+        };
+
+        let worktrees = vec![&wt1, &wt2];
+        let configs = vec![&config];
+
+        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "feature-a");
+        assert_eq!(groups[0].items.len(), 1); // only node_modules exists in wt1
+        assert_eq!(groups[1].label, "feature-b");
+        assert_eq!(groups[1].items.len(), 2); // node_modules + .turbo exist in wt2
+    }
+
+    #[test]
+    fn test_resolve_multi_worktree_clean_empty_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Worktree exists but has no clean targets
+        let wt_path = repo_root.join("wt-empty");
+        std::fs::create_dir_all(wt_path.join("apps/my-app")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string()],
+        );
+
+        let wt = worktree_setup_git::WorktreeInfo {
+            path: wt_path,
+            is_main: false,
+            branch: Some("empty-branch".to_string()),
+            commit: None,
+        };
+
+        let worktrees = vec![&wt];
+        let configs = vec![&config];
+
+        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "empty-branch");
+        assert!(groups[0].items.is_empty());
     }
 }

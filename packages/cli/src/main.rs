@@ -859,6 +859,15 @@ fn resolve_clean_glob(
 /// * No path, CWD is inside a linked worktree → remove that worktree
 /// * No path, CWD is main worktree / repo root → interactive multi-select
 fn run_remove(args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate conflicting args
+    if args.worktrees && args.target_path.is_some() {
+        return Err(
+            "--worktrees and a positional target path are mutually exclusive. \
+             Use --worktrees to select worktrees interactively, or provide a target path."
+                .into(),
+        );
+    }
+
     let cwd = env::current_dir()?;
     let repo = discover_repo(&cwd)?;
     let repo_root = get_repo_root(&repo)?;
@@ -869,8 +878,13 @@ fn run_remove(args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
     output::print_repo_info(&repo_root.to_string_lossy());
     println!();
 
+    // Mode 1: --worktrees flag — always interactive, regardless of CWD
+    if args.worktrees {
+        return run_remove_interactive(args, &repo, &worktrees, &global_config);
+    }
+
+    // Mode 2: explicit positional path
     if let Some(ref target) = args.target_path {
-        // Mode 1: explicit positional path
         let target_path = if target.is_absolute() {
             target.clone()
         } else {
@@ -886,16 +900,16 @@ fn run_remove(args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Detect whether CWD is inside a linked (non-main) worktree
+    // Mode 3: no args — detect CWD context
     let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
 
     find_containing_linked_worktree(&cwd_canonical, &worktrees).map_or_else(
         || {
-            // Mode 3: CWD is main worktree or repo root — interactive
+            // CWD is main worktree or repo root — interactive
             run_remove_interactive(args, &repo, &worktrees, &global_config)
         },
         |wt| {
-            // Mode 2: CWD is inside a linked worktree — remove it
+            // CWD is inside a linked worktree — remove it
             run_remove_single(
                 args,
                 &repo,

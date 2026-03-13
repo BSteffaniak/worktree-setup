@@ -271,6 +271,13 @@ pub struct RemoveArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
 
+    /// Interactively select worktrees to remove.
+    ///
+    /// Opens a multi-select prompt listing all worktrees in the repository.
+    /// Cannot be combined with a positional target path.
+    #[arg(long, short = 'w')]
+    pub worktrees: bool,
+
     /// Preview what would be removed without actually removing.
     #[arg(long)]
     pub dry_run: bool,

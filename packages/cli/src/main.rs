@@ -3155,4 +3155,374 @@ mod tests {
         assert_eq!(groups[0].label, "empty-branch");
         assert!(groups[0].items.is_empty());
     }
+
+    // ─── find_containing_linked_worktree ────────────────────────────────
+
+    fn make_worktree_info(path: &Path, is_main: bool, branch: Option<&str>) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.to_path_buf(),
+            is_main,
+            branch: branch.map(String::from),
+            commit: None,
+        }
+    }
+
+    #[test]
+    fn test_find_containing_linked_worktree_finds_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main");
+        let linked_path = dir.path().join("linked");
+        std::fs::create_dir_all(&main_path).unwrap();
+        std::fs::create_dir_all(linked_path.join("subdir")).unwrap();
+
+        let worktrees = vec![
+            make_worktree_info(&main_path, true, Some("master")),
+            make_worktree_info(&linked_path, false, Some("feature")),
+        ];
+
+        // CWD inside linked worktree
+        let cwd = linked_path.canonicalize().unwrap().join("subdir");
+        let result = find_containing_linked_worktree(&cwd, &worktrees);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn test_find_containing_linked_worktree_ignores_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main");
+        std::fs::create_dir_all(&main_path).unwrap();
+
+        let worktrees = vec![make_worktree_info(&main_path, true, Some("master"))];
+
+        // CWD inside main worktree — should return None
+        let cwd = main_path.canonicalize().unwrap();
+        let result = find_containing_linked_worktree(&cwd, &worktrees);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_containing_linked_worktree_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main");
+        let linked_path = dir.path().join("linked");
+        let other_path = dir.path().join("other");
+        std::fs::create_dir_all(&main_path).unwrap();
+        std::fs::create_dir_all(&linked_path).unwrap();
+        std::fs::create_dir_all(&other_path).unwrap();
+
+        let worktrees = vec![
+            make_worktree_info(&main_path, true, Some("master")),
+            make_worktree_info(&linked_path, false, Some("feature")),
+        ];
+
+        // CWD in a directory that isn't any worktree
+        let cwd = other_path.canonicalize().unwrap();
+        let result = find_containing_linked_worktree(&cwd, &worktrees);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_containing_linked_worktree_exact_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let linked_path = dir.path().join("linked");
+        std::fs::create_dir_all(&linked_path).unwrap();
+
+        let worktrees = vec![make_worktree_info(&linked_path, false, Some("feature"))];
+
+        // CWD is the worktree root itself (not a subdirectory)
+        let cwd = linked_path.canonicalize().unwrap();
+        let result = find_containing_linked_worktree(&cwd, &worktrees);
+        assert!(result.is_some());
+    }
+
+    // ─── worktree_has_changes ───────────────────────────────────────────
+
+    fn create_test_repo(dir: &Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "# Test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_worktree_has_changes_clean_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        assert!(
+            !worktree_has_changes(dir.path()),
+            "clean repo should have no changes"
+        );
+    }
+
+    #[test]
+    fn test_worktree_has_changes_dirty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        // Create an untracked file
+        std::fs::write(dir.path().join("new-file.txt"), "content").unwrap();
+
+        assert!(
+            worktree_has_changes(dir.path()),
+            "repo with untracked file should have changes"
+        );
+    }
+
+    #[test]
+    fn test_worktree_has_changes_unstaged_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        // Modify a tracked file without staging
+        std::fs::write(dir.path().join("README.md"), "# Modified").unwrap();
+
+        assert!(
+            worktree_has_changes(dir.path()),
+            "repo with unstaged modification should have changes"
+        );
+    }
+
+    #[test]
+    fn test_worktree_has_changes_nonexistent_path() {
+        assert!(
+            !worktree_has_changes(Path::new("/nonexistent/path")),
+            "nonexistent path should return false"
+        );
+    }
+
+    // ─── handle_branch_deletion policy ──────────────────────────────────
+
+    #[test]
+    fn test_handle_branch_deletion_never_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        // Create a branch to test with
+        Command::new("git")
+            .args(["branch", "test-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Never policy should skip deletion entirely
+        let result = handle_branch_deletion(
+            &repo,
+            "test-branch",
+            BranchDeletePolicy::Never,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(result.is_none(), "Never policy should return None");
+
+        // Verify branch still exists
+        let output = Command::new("git")
+            .args(["branch", "--list", "test-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("test-branch"),
+            "branch should still exist after Never policy"
+        );
+    }
+
+    #[test]
+    fn test_handle_branch_deletion_always_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        // Create a branch (merged, so -d works)
+        Command::new("git")
+            .args(["branch", "auto-delete-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Always policy should delete without asking
+        let result = handle_branch_deletion(
+            &repo,
+            "auto-delete-branch",
+            BranchDeletePolicy::Always,
+            true, // non_interactive — shouldn't matter for Always
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, Some("auto-delete-branch".to_string()));
+
+        // Verify branch is gone
+        let output = Command::new("git")
+            .args(["branch", "--list", "auto-delete-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("auto-delete-branch"),
+            "branch should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_handle_branch_deletion_ask_non_interactive_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        Command::new("git")
+            .args(["branch", "ask-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Ask policy in non-interactive mode should skip
+        let result = handle_branch_deletion(
+            &repo,
+            "ask-branch",
+            BranchDeletePolicy::Ask,
+            true, // non_interactive
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "Ask policy in non-interactive mode should skip"
+        );
+
+        // Branch should still exist
+        let output = Command::new("git")
+            .args(["branch", "--list", "ask-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("ask-branch"), "branch should still exist");
+    }
+
+    #[test]
+    fn test_handle_branch_deletion_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        Command::new("git")
+            .args(["branch", "dry-run-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Always policy with dry_run should report but not delete
+        let result = handle_branch_deletion(
+            &repo,
+            "dry-run-branch",
+            BranchDeletePolicy::Always,
+            false,
+            false,
+            true, // dry_run
+        )
+        .unwrap();
+        assert_eq!(result, Some("dry-run-branch".to_string()));
+
+        // Branch should still exist
+        let output = Command::new("git")
+            .args(["branch", "--list", "dry-run-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("dry-run-branch"),
+            "branch should still exist after dry run"
+        );
+    }
+
+    #[test]
+    fn test_handle_branch_deletion_force_deletes_unmerged() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        // Create a worktree with an unmerged branch, add a commit, remove worktree
+        let wt_path = dir.path().join("unmerged-wt");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "unmerged-force-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(wt_path.join("extra.txt"), "extra").unwrap();
+        Command::new("git")
+            .args(["add", "extra.txt"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "unmerged work"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        // Always + force should force-delete the unmerged branch
+        let result = handle_branch_deletion(
+            &repo,
+            "unmerged-force-branch",
+            BranchDeletePolicy::Always,
+            false,
+            true, // force
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, Some("unmerged-force-branch".to_string()));
+
+        // Branch should be gone
+        let output = Command::new("git")
+            .args(["branch", "--list", "unmerged-force-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("unmerged-force-branch"),
+            "unmerged branch should be force-deleted"
+        );
+    }
 }

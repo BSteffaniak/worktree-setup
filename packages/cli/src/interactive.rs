@@ -341,6 +341,13 @@ fn render_items(
 ///
 /// All items start **unchecked**.
 ///
+/// # Arguments
+///
+/// * `worktrees` - The worktrees to display
+/// * `warnings` - Per-worktree warning text (e.g., "has uncommitted changes").
+///   `None` entries mean no warning for that worktree. Must be the same length
+///   as `worktrees`.
+///
 /// # Returns
 ///
 /// `Ok(Some(indices))` on confirm, `Ok(None)` on cancel.
@@ -349,7 +356,10 @@ fn render_items(
 /// # Errors
 ///
 /// * If terminal I/O fails
-pub fn select_worktrees_for_removal(worktrees: &[WorktreeInfo]) -> io::Result<Option<Vec<usize>>> {
+pub fn select_worktrees_for_removal(
+    worktrees: &[WorktreeInfo],
+    warnings: &[Option<String>],
+) -> io::Result<Option<Vec<usize>>> {
     let count = worktrees.len();
     if count == 0 {
         return Ok(Some(Vec::new()));
@@ -391,13 +401,14 @@ pub fn select_worktrees_for_removal(worktrees: &[WorktreeInfo]) -> io::Result<Op
         "Select worktrees to remove (space to toggle, enter to confirm):".bold()
     );
     term.write_line(&prompt_line)?;
-    render_removal_items(&term, &labels, &checked, &disabled, cursor)?;
+    render_removal_items(&term, &labels, &checked, &disabled, warnings, cursor)?;
 
     let result = run_removal_select_loop(
         &term,
         &labels,
         &mut checked,
         &disabled,
+        warnings,
         &mut cursor,
         &key_rx,
     );
@@ -417,6 +428,7 @@ fn run_removal_select_loop(
     labels: &[String],
     checked: &mut [bool],
     disabled: &[bool],
+    warnings: &[Option<String>],
     cursor: &mut usize,
     key_rx: &mpsc::Receiver<Key>,
 ) -> io::Result<Option<Vec<usize>>> {
@@ -475,7 +487,7 @@ fn run_removal_select_loop(
 
         // Redraw
         term.clear_last_lines(count)?;
-        render_removal_items(term, labels, checked, disabled, *cursor)?;
+        render_removal_items(term, labels, checked, disabled, warnings, *cursor)?;
     }
 }
 
@@ -485,23 +497,30 @@ fn run_removal_select_loop(
 /// - `>` arrow for active item, 2-space indent for inactive
 /// - `[x]` / `[ ]` ASCII checkboxes
 /// - Disabled items (main worktree) shown with dim text and `[-]` checkbox
+/// - Warning text (e.g., "has uncommitted changes") shown in yellow after the label
 fn render_removal_items(
     term: &Term,
     labels: &[String],
     checked: &[bool],
     disabled: &[bool],
+    warnings: &[Option<String>],
     cursor: usize,
 ) -> io::Result<()> {
     for (i, label) in labels.iter().enumerate() {
         let is_active = i == cursor;
         let prefix = if is_active { ">" } else { " " };
 
+        let warning_suffix = warnings
+            .get(i)
+            .and_then(Option::as_ref)
+            .map_or_else(String::new, |w| format!(" {}", format!("({w})").yellow()));
+
         if disabled[i] {
             let line = format!("{prefix} [-] {label}").dimmed();
             term.write_line(&line.to_string())?;
         } else {
             let checkbox = if checked[i] { "[x]" } else { "[ ]" };
-            term.write_line(&format!("{prefix} {checkbox} {label}"))?;
+            term.write_line(&format!("{prefix} {checkbox} {label}{warning_suffix}"))?;
         }
     }
 

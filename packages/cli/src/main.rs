@@ -1141,8 +1141,22 @@ fn run_remove_interactive(
             .into());
     }
 
+    // Compute per-worktree warnings for the picker
+    let warnings: Vec<Option<String>> = worktrees
+        .iter()
+        .map(|wt| {
+            if wt.is_main {
+                None
+            } else if worktree_has_changes(&wt.path) {
+                Some("has uncommitted changes".to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Show the picker
-    let selection = interactive::select_worktrees_for_removal(worktrees)?;
+    let selection = interactive::select_worktrees_for_removal(worktrees, &warnings)?;
 
     let Some(selected_indices) = selection else {
         println!("Cancelled.");

@@ -76,6 +76,29 @@ pub struct WorktreeResolution {
     pub summary: String,
 }
 
+/// Resolved warning for a single worktree, produced by a background thread.
+pub struct WarningResolution {
+    /// Index of the worktree in the original list.
+    pub index: usize,
+    /// Warning text, or `None` if the worktree is clean.
+    pub warning: Option<String>,
+}
+
+/// Tri-state status for a worktree warning check.
+#[derive(Clone)]
+enum WarningStatus {
+    /// Background thread has not yet reported for this worktree.
+    Pending,
+    /// Check completed — worktree is clean (no warning).
+    Clean,
+    /// Check completed — worktree has a warning to display.
+    Warning(String),
+}
+
+/// Result type for [`select_worktrees_for_removal`]:
+/// `(selected_indices_or_none, per_worktree_warnings)`.
+pub type RemovalPickerResult = (Option<Vec<usize>>, Vec<Option<String>>);
+
 /// Spinner frames (braille dots).
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -327,9 +350,12 @@ fn render_items(
 
 /// Custom multi-select widget for choosing worktrees to remove.
 ///
-/// Simpler than [`select_worktrees_with_sizes`] — no background threads,
-/// no spinners, no size computation. The main worktree is shown but
-/// **disabled**: it cannot be toggled and is skipped by "toggle all".
+/// Displays all worktrees immediately with animated spinners while background
+/// threads check each worktree for uncommitted changes. As checks complete,
+/// spinners are replaced with warning text or disappear.
+///
+/// The main worktree is shown but **disabled**: it cannot be toggled and is
+/// skipped by "toggle all".
 ///
 /// Key bindings match `dialoguer::MultiSelect`:
 /// * `↑`/`k` — move cursor up
@@ -344,32 +370,47 @@ fn render_items(
 /// # Arguments
 ///
 /// * `worktrees` - The worktrees to display
-/// * `warnings` - Per-worktree warning text (e.g., "has uncommitted changes").
-///   `None` entries mean no warning for that worktree. Must be the same length
-///   as `worktrees`.
+/// * `warning_rx` - Channel receiving [`WarningResolution`]s from background threads
+/// * `done` - Atomic flag signaling all background checks are complete
 ///
 /// # Returns
 ///
-/// `Ok(Some(indices))` on confirm, `Ok(None)` on cancel.
-/// Indices refer to positions in the original `worktrees` slice.
+/// `Ok((Some(indices), warnings))` on confirm, `Ok((None, warnings))` on cancel.
+/// The `warnings` vector has the same length as `worktrees`, with resolved
+/// warning text for each entry (`None` = clean or main worktree).
 ///
 /// # Errors
 ///
 /// * If terminal I/O fails
 pub fn select_worktrees_for_removal(
     worktrees: &[WorktreeInfo],
-    warnings: &[Option<String>],
-) -> io::Result<Option<Vec<usize>>> {
+    warning_rx: &mpsc::Receiver<WarningResolution>,
+    done: &AtomicBool,
+) -> io::Result<RemovalPickerResult> {
     let count = worktrees.len();
     if count == 0 {
-        return Ok(Some(Vec::new()));
+        return Ok((Some(Vec::new()), Vec::new()));
     }
 
     let labels: Vec<String> = worktrees.iter().map(format_worktree_label).collect();
     let disabled: Vec<bool> = worktrees.iter().map(|wt| wt.is_main).collect();
 
-    let mut checked = vec![false; count];
-    let mut cursor: usize = 0;
+    let mut state = RemovalSelectState {
+        checked: vec![false; count],
+        // Main worktrees start resolved (clean); linked start as pending.
+        warnings: worktrees
+            .iter()
+            .map(|wt| {
+                if wt.is_main {
+                    WarningStatus::Clean
+                } else {
+                    WarningStatus::Pending
+                }
+            })
+            .collect(),
+        cursor: 0,
+        spinner_frame: 0,
+    };
 
     let term = Term::stderr();
 
@@ -401,16 +442,18 @@ pub fn select_worktrees_for_removal(
         "Select worktrees to remove (space to toggle, enter to confirm):".bold()
     );
     term.write_line(&prompt_line)?;
-    render_removal_items(&term, &labels, &checked, &disabled, warnings, cursor)?;
-
-    let result = run_removal_select_loop(
+    render_removal_items(
         &term,
         &labels,
-        &mut checked,
+        &state.checked,
         &disabled,
-        warnings,
-        &mut cursor,
-        &key_rx,
+        &state.warnings,
+        state.cursor,
+        state.spinner_frame,
+    )?;
+
+    let result = run_removal_select_loop(
+        &term, &labels, &mut state, &disabled, &key_rx, warning_rx, done,
     );
 
     // Cleanup
@@ -419,75 +462,135 @@ pub fn select_worktrees_for_removal(
     input_done.store(true, Ordering::Relaxed);
     drop(input_handle);
 
-    result
+    // Flatten the tri-state warnings into final resolved warnings
+    let final_warnings: Vec<Option<String>> = state
+        .warnings
+        .into_iter()
+        .map(|w| match w {
+            WarningStatus::Warning(text) => Some(text),
+            WarningStatus::Pending | WarningStatus::Clean => None,
+        })
+        .collect();
+
+    result.map(|sel| (sel, final_warnings))
+}
+
+/// Mutable state for the removal multi-select widget.
+struct RemovalSelectState {
+    checked: Vec<bool>,
+    /// Per-worktree warning check status.
+    warnings: Vec<WarningStatus>,
+    cursor: usize,
+    spinner_frame: usize,
 }
 
 /// Main loop for the removal multi-select widget.
+///
+/// Polls for key events and background warning results, re-renders on changes.
+#[allow(clippy::too_many_arguments)]
 fn run_removal_select_loop(
     term: &Term,
     labels: &[String],
-    checked: &mut [bool],
+    state: &mut RemovalSelectState,
     disabled: &[bool],
-    warnings: &[Option<String>],
-    cursor: &mut usize,
     key_rx: &mpsc::Receiver<Key>,
+    warning_rx: &mpsc::Receiver<WarningResolution>,
+    done: &AtomicBool,
 ) -> io::Result<Option<Vec<usize>>> {
     let count = labels.len();
 
     loop {
-        // Block until a key is available (no spinner to animate)
-        let Ok(key) = key_rx.recv() else {
-            return Ok(None);
-        };
-
-        match key {
-            // Move down
-            Key::ArrowDown | Key::Tab | Key::Char('j') => {
-                *cursor = (*cursor + 1) % count;
+        // Drain all available background results
+        let mut needs_redraw = false;
+        while let Ok(res) = warning_rx.try_recv() {
+            if res.index < count {
+                state.warnings[res.index] = res
+                    .warning
+                    .map_or(WarningStatus::Clean, WarningStatus::Warning);
+                needs_redraw = true;
             }
-            // Move up
-            Key::ArrowUp | Key::BackTab | Key::Char('k') => {
-                *cursor = (*cursor + count - 1) % count;
-            }
-            // Toggle current (only if not disabled)
-            Key::Char(' ') => {
-                if !disabled[*cursor] {
-                    checked[*cursor] = !checked[*cursor];
-                }
-            }
-            // Toggle all (excludes disabled items)
-            Key::Char('a') => {
-                let all_enabled_checked = checked
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !disabled[*i])
-                    .all(|(_, &c)| c);
-                for (i, c) in checked.iter_mut().enumerate() {
-                    if !disabled[i] {
-                        *c = !all_enabled_checked;
-                    }
-                }
-            }
-            // Confirm
-            Key::Enter => {
-                let selected: Vec<usize> = checked
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| **c)
-                    .map(|(i, _)| i)
-                    .collect();
-                return Ok(Some(selected));
-            }
-            // Cancel
-            Key::Escape | Key::Char('q') => {
-                return Ok(None);
-            }
-            _ => continue, // no redraw needed
         }
 
-        // Redraw
-        term.clear_last_lines(count)?;
-        render_removal_items(term, labels, checked, disabled, warnings, *cursor)?;
+        // Process all available key events
+        while let Ok(key) = key_rx.try_recv() {
+            needs_redraw = true;
+            match key {
+                // Move down
+                Key::ArrowDown | Key::Tab | Key::Char('j') => {
+                    state.cursor = (state.cursor + 1) % count;
+                }
+                // Move up
+                Key::ArrowUp | Key::BackTab | Key::Char('k') => {
+                    state.cursor = (state.cursor + count - 1) % count;
+                }
+                // Toggle current (only if not disabled)
+                Key::Char(' ') => {
+                    if !disabled[state.cursor] {
+                        state.checked[state.cursor] = !state.checked[state.cursor];
+                    }
+                }
+                // Toggle all (excludes disabled items)
+                Key::Char('a') => {
+                    let all_enabled_checked = state
+                        .checked
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !disabled[*i])
+                        .all(|(_, &c)| c);
+                    for (i, c) in state.checked.iter_mut().enumerate() {
+                        if !disabled[i] {
+                            *c = !all_enabled_checked;
+                        }
+                    }
+                }
+                // Confirm
+                Key::Enter => {
+                    let selected: Vec<usize> = state
+                        .checked
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| **c)
+                        .map(|(i, _)| i)
+                        .collect();
+                    return Ok(Some(selected));
+                }
+                // Cancel
+                Key::Escape | Key::Char('q') => {
+                    return Ok(None);
+                }
+                _ => {
+                    needs_redraw = false;
+                }
+            }
+        }
+
+        // Advance spinner if there are still unresolved items
+        let has_pending = state
+            .warnings
+            .iter()
+            .any(|w| matches!(w, WarningStatus::Pending))
+            && !done.load(Ordering::Relaxed);
+        if has_pending {
+            state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            // Clear previous render and redraw
+            term.clear_last_lines(count)?;
+            render_removal_items(
+                term,
+                labels,
+                &state.checked,
+                disabled,
+                &state.warnings,
+                state.cursor,
+                state.spinner_frame,
+            )?;
+        }
+
+        // Sleep to avoid busy-waiting (also controls spinner speed)
+        std::thread::sleep(Duration::from_millis(SPINNER_TICK_MS));
     }
 }
 
@@ -497,30 +600,40 @@ fn run_removal_select_loop(
 /// - `>` arrow for active item, 2-space indent for inactive
 /// - `[x]` / `[ ]` ASCII checkboxes
 /// - Disabled items (main worktree) shown with dim text and `[-]` checkbox
+/// - Pending checks shown with animated spinner
 /// - Warning text (e.g., "has uncommitted changes") shown in yellow after the label
 fn render_removal_items(
     term: &Term,
     labels: &[String],
     checked: &[bool],
     disabled: &[bool],
-    warnings: &[Option<String>],
+    warnings: &[WarningStatus],
     cursor: usize,
+    spinner_frame: usize,
 ) -> io::Result<()> {
     for (i, label) in labels.iter().enumerate() {
         let is_active = i == cursor;
         let prefix = if is_active { ">" } else { " " };
-
-        let warning_suffix = warnings
-            .get(i)
-            .and_then(Option::as_ref)
-            .map_or_else(String::new, |w| format!(" {}", format!("({w})").yellow()));
 
         if disabled[i] {
             let line = format!("{prefix} [-] {label}").dimmed();
             term.write_line(&line.to_string())?;
         } else {
             let checkbox = if checked[i] { "[x]" } else { "[ ]" };
-            term.write_line(&format!("{prefix} {checkbox} {label}{warning_suffix}"))?;
+            let suffix = match warnings.get(i) {
+                // Still checking — show spinner
+                Some(WarningStatus::Pending) | None => {
+                    let frame = SPINNER_FRAMES[spinner_frame];
+                    format!("  {frame} checking...").yellow().to_string()
+                }
+                // Resolved with warning
+                Some(WarningStatus::Warning(w)) => {
+                    format!(" {}", format!("({w})").yellow())
+                }
+                // Resolved clean — no suffix
+                Some(WarningStatus::Clean) => String::new(),
+            };
+            term.write_line(&format!("{prefix} {checkbox} {label}{suffix}"))?;
         }
     }
 

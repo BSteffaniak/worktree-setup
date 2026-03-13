@@ -1141,22 +1141,43 @@ fn run_remove_interactive(
             .into());
     }
 
-    // Compute per-worktree warnings for the picker
-    let warnings: Vec<Option<String>> = worktrees
+    // Spawn background threads to check each linked worktree for uncommitted changes.
+    let (warning_tx, warning_rx) = mpsc::channel::<interactive::WarningResolution>();
+    let checks_done = Arc::new(AtomicBool::new(false));
+    let checks_done_clone = checks_done.clone();
+
+    let worktree_paths: Vec<(usize, std::path::PathBuf, bool)> = worktrees
         .iter()
-        .map(|wt| {
-            if wt.is_main {
-                None
-            } else if worktree_has_changes(&wt.path) {
-                Some("has uncommitted changes".to_string())
-            } else {
-                None
-            }
-        })
+        .enumerate()
+        .map(|(i, wt)| (i, wt.path.clone(), wt.is_main))
         .collect();
 
-    // Show the picker
-    let selection = interactive::select_worktrees_for_removal(worktrees, &warnings)?;
+    std::thread::spawn(move || {
+        let handles: Vec<_> = worktree_paths
+            .into_iter()
+            .filter(|(_, _, is_main)| !is_main)
+            .map(|(index, path, _)| {
+                let tx = warning_tx.clone();
+                std::thread::spawn(move || {
+                    let warning = if worktree_has_changes(&path) {
+                        Some("has uncommitted changes".to_string())
+                    } else {
+                        None
+                    };
+                    let _ = tx.send(interactive::WarningResolution { index, warning });
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+        checks_done_clone.store(true, Ordering::Relaxed);
+    });
+
+    // Show the picker (returns immediately, spinners animate while checks resolve)
+    let (selection, resolved_warnings) =
+        interactive::select_worktrees_for_removal(worktrees, &warning_rx, &checks_done)?;
 
     let Some(selected_indices) = selection else {
         println!("Cancelled.");
@@ -1170,15 +1191,15 @@ fn run_remove_interactive(
 
     let selected: Vec<&WorktreeInfo> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
 
-    // Check for uncommitted changes and build preview
-    let display_infos: Vec<output::RemoveDisplayInfo> = selected
+    // Build preview from resolved warnings (no re-checking needed)
+    let display_infos: Vec<output::RemoveDisplayInfo> = selected_indices
         .iter()
-        .map(|wt| {
-            let has_changes = worktree_has_changes(&wt.path);
+        .map(|&i| {
+            let wt = &worktrees[i];
             output::RemoveDisplayInfo {
                 branch: wt.branch.clone(),
                 path: wt.path.to_string_lossy().to_string(),
-                has_changes,
+                has_changes: resolved_warnings.get(i).and_then(Option::as_ref).is_some(),
             }
         })
         .collect();

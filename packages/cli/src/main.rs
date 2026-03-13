@@ -591,39 +591,69 @@ fn is_glob_pattern(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }
 
-/// Calculate the total size of a path (file or directory, recursive).
+/// Calculate the disk usage of a path (file or directory, recursive).
+///
+/// Uses `walkdir` with `follow_links(false)` to avoid traversing symlinks.
+/// On Unix, reports actual disk usage via `st_blocks * 512` (matching `du`
+/// and `ncdu` behavior). On other platforms, falls back to apparent size.
 fn path_size(path: &Path) -> u64 {
-    if path.is_file() || path.is_symlink() {
-        path.metadata().map_or(0, |m| m.len())
-    } else if path.is_dir() {
-        walkdir(path)
-    } else {
-        0
+    if path.is_symlink() {
+        return path.symlink_metadata().map_or(0, |m| file_disk_usage(&m));
     }
-}
+    if path.is_file() {
+        return path.metadata().map_or(0, |m| file_disk_usage(&m));
+    }
+    if !path.is_dir() {
+        return 0;
+    }
 
-/// Recursively sum file sizes in a directory.
-fn walkdir(dir: &Path) -> u64 {
     let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                total += walkdir(&path);
-            } else {
-                total += path.metadata().map_or(0, |m| m.len());
-            }
+
+    for entry in walkdir::WalkDir::new(path).follow_links(false).min_depth(1) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+
+        // Skip directories and symlinks — we only count regular file sizes
+        let ft = entry.file_type();
+        if ft.is_dir() || ft.is_symlink() {
+            continue;
         }
+
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+
+        total += file_disk_usage(&meta);
     }
     total
+}
+
+/// Return the disk usage of a single file from its metadata.
+///
+/// On Unix, uses `st_blocks * 512` for actual disk usage.
+/// On other platforms, falls back to the file's apparent size.
+fn file_disk_usage(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 /// Resolve clean paths from selected configs into concrete items to delete.
 ///
 /// For each config's `clean` entries:
-/// * Exact paths are resolved relative to the config's directory as mapped
+/// * Paths starting with `/` are repo-root-relative (resolved against
+///   `target_path`)
+/// * Other paths are resolved relative to the config's directory as mapped
 ///   into the target worktree
-/// * Glob patterns are expanded the same way
+/// * Glob patterns (containing `*`, `?`, or `[`) are expanded via a
+///   `walkdir` + `globset` walk that skips symlinks and prunes matched dirs
 ///
 /// All resolved paths must be inside `target_canonical` (containment check).
 /// Paths that don't exist on disk are silently skipped.
@@ -648,18 +678,25 @@ fn resolve_clean_paths(
         let target_config_dir = target_path.join(config_rel);
 
         for pattern in &config.config.clean {
-            if is_glob_pattern(pattern) {
+            // Leading `/` means repo-root-relative (resolved against
+            // `target_path`). Otherwise, resolve against the config's
+            // directory mapped into the target worktree.
+            let (effective_pattern, base_dir) = pattern.strip_prefix('/').map_or_else(
+                || (pattern.as_str(), target_config_dir.clone()),
+                |stripped| (stripped, target_path.to_path_buf()),
+            );
+            if is_glob_pattern(effective_pattern) {
                 resolve_clean_glob(
-                    pattern,
-                    &target_config_dir,
+                    effective_pattern,
+                    &base_dir,
                     target_canonical,
                     &mut seen,
                     &mut results,
                 );
             } else {
                 resolve_clean_exact(
-                    pattern,
-                    &target_config_dir,
+                    effective_pattern,
+                    &base_dir,
                     target_canonical,
                     &mut seen,
                     &mut results,
@@ -668,18 +705,29 @@ fn resolve_clean_paths(
         }
     }
 
+    // Filter out paths that are descendants of other resolved paths.
+    // E.g., "**/dist" may match "node_modules/.bun/foo/dist" which is
+    // already inside "node_modules" — keep only the ancestor.
     results
+        .iter()
+        .filter(|(path, _)| {
+            !results
+                .iter()
+                .any(|(other, _)| other != path && path.starts_with(other))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Resolve a single exact clean path.
 fn resolve_clean_exact(
     pattern: &str,
-    target_config_dir: &Path,
+    base_dir: &Path,
     target_canonical: &Path,
     seen: &mut std::collections::BTreeSet<PathBuf>,
     results: &mut Vec<(PathBuf, String)>,
 ) {
-    let candidate = target_config_dir.join(pattern);
+    let candidate = base_dir.join(pattern);
 
     if !candidate.exists() {
         log::debug!(
@@ -708,30 +756,59 @@ fn resolve_clean_exact(
     }
 }
 
-/// Resolve a glob clean pattern.
+/// Resolve a glob clean pattern using `walkdir` + `globset`.
+///
+/// Walks the directory tree under `base_dir` with `follow_links(false)` to
+/// avoid traversing symlinks. Each entry's relative path is matched against
+/// the compiled glob pattern. When a directory matches, it is added to results
+/// and pruned (not recursed into) — this avoids walking into matched
+/// directories like `node_modules/` which may contain thousands of entries.
 fn resolve_clean_glob(
     pattern: &str,
-    target_config_dir: &Path,
+    base_dir: &Path,
     target_canonical: &Path,
     seen: &mut std::collections::BTreeSet<PathBuf>,
     results: &mut Vec<(PathBuf, String)>,
 ) {
-    let full_pattern = target_config_dir.join(pattern);
-    let full_pattern_str = full_pattern.to_string_lossy();
-
-    let entries = match glob::glob(&full_pattern_str) {
-        Ok(entries) => entries,
+    let glob = match globset::Glob::new(pattern) {
+        Ok(g) => g.compile_matcher(),
         Err(e) => {
             log::warn!("Invalid glob pattern '{pattern}': {e}");
             return;
         }
     };
 
-    for entry in entries {
-        let Ok(path) = entry else {
+    let mut it = walkdir::WalkDir::new(base_dir)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter();
+
+    loop {
+        let entry = match it.next() {
+            None => break,
+            Some(Err(e)) => {
+                log::debug!("Error during directory walk: {e}");
+                continue;
+            }
+            Some(Ok(entry)) => entry,
+        };
+
+        // Skip symlinks entirely — don't match or descend into them
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        let Ok(relative) = path.strip_prefix(base_dir) else {
             continue;
         };
 
+        if !glob.is_match(relative) {
+            continue;
+        }
+
+        // We have a match — canonicalize and apply containment/dedup checks
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
@@ -741,12 +818,27 @@ fn resolve_clean_glob(
             continue;
         }
 
+        // Skip if this path is inside an already-resolved path
+        if seen
+            .iter()
+            .any(|existing| canonical.starts_with(existing) && *existing != canonical)
+        {
+            continue;
+        }
+
         if seen.insert(canonical.clone()) {
-            let relative = canonical.strip_prefix(target_canonical).map_or_else(
+            let display = canonical.strip_prefix(target_canonical).map_or_else(
                 |_| path.to_string_lossy().to_string(),
                 |r| r.to_string_lossy().to_string(),
             );
-            results.push((canonical, relative));
+            results.push((canonical, display));
+        }
+
+        // If the match is a directory, prune it — don't recurse into it.
+        // This is the key performance optimization: e.g., after matching
+        // `node_modules/`, we skip the thousands of entries inside it.
+        if entry.file_type().is_dir() {
+            it.skip_current_dir();
         }
     }
 }
@@ -1606,11 +1698,11 @@ mod tests {
         assert_eq!(output::format_size(0), "0 B");
         assert_eq!(output::format_size(512), "512 B");
         assert_eq!(output::format_size(1023), "1023 B");
-        assert_eq!(output::format_size(1024), "1.0 KB");
-        assert_eq!(output::format_size(1536), "1.5 KB");
-        assert_eq!(output::format_size(1_048_576), "1.0 MB");
-        assert_eq!(output::format_size(1_572_864), "1.5 MB");
-        assert_eq!(output::format_size(1_073_741_824), "1.0 GB");
+        assert_eq!(output::format_size(1024), "1.0 KiB");
+        assert_eq!(output::format_size(1536), "1.5 KiB");
+        assert_eq!(output::format_size(1_048_576), "1.0 MiB");
+        assert_eq!(output::format_size(1_572_864), "1.5 MiB");
+        assert_eq!(output::format_size(1_073_741_824), "1.0 GiB");
     }
 
     // ─── resolve_clean_paths ────────────────────────────────────────────
@@ -1783,5 +1875,292 @@ mod tests {
 
         // Should only appear once despite two configs referencing it
         assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_clean_filters_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Create node_modules with a nested dist directory
+        std::fs::create_dir_all(target_app_dir.join("node_modules/pkg/dist")).unwrap();
+        std::fs::write(
+            target_app_dir.join("node_modules/pkg/dist/index.js"),
+            "code",
+        )
+        .unwrap();
+
+        // Create a dist directory outside node_modules (should remain)
+        std::fs::create_dir_all(target_app_dir.join("packages/utils/dist")).unwrap();
+        std::fs::write(target_app_dir.join("packages/utils/dist/index.js"), "code").unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string(), "**/dist".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // Should have 2 items: node_modules and packages/utils/dist
+        // The node_modules/pkg/dist should be filtered out as a descendant
+        assert_eq!(resolved.len(), 2);
+        let rel_paths: Vec<&str> = resolved.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rel_paths.iter().any(|p| p.ends_with("node_modules")));
+        assert!(rel_paths.iter().any(|p| p.ends_with("packages/utils/dist")));
+        // Ensure the nested dist is NOT present
+        assert!(!rel_paths.iter().any(|p| p.contains("node_modules/pkg")));
+    }
+
+    #[test]
+    fn test_resolve_clean_glob_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Create a real dist directory (should be found)
+        std::fs::create_dir_all(target_app_dir.join("src/dist")).unwrap();
+        std::fs::write(target_app_dir.join("src/dist/bundle.js"), "code").unwrap();
+
+        // Create a directory that will be the symlink target (outside normal hierarchy)
+        let cache_dir = target.join("cache/pkg");
+        std::fs::create_dir_all(cache_dir.join("dist")).unwrap();
+        std::fs::write(cache_dir.join("dist/cached.js"), "cached").unwrap();
+
+        // Create node_modules/pkg as a symlink -> ../../cache/pkg
+        std::fs::create_dir_all(target_app_dir.join("node_modules")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cache_dir, target_app_dir.join("node_modules/pkg")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["**/dist".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // On unix: only src/dist should appear; node_modules/pkg/dist should be skipped
+        // because node_modules/pkg is a symlink
+        #[cfg(unix)]
+        {
+            assert_eq!(resolved.len(), 1);
+            assert!(resolved[0].1.contains("src/dist"));
+        }
+
+        // On non-unix: symlink wasn't created, so only src/dist will match anyway
+        #[cfg(not(unix))]
+        {
+            assert_eq!(resolved.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_resolve_clean_root_relative_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        // Config lives in apps/my-app but the clean path is root-relative
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        // Create node_modules at the worktree root (NOT inside apps/my-app)
+        std::fs::create_dir_all(target.join("node_modules/pkg")).unwrap();
+        std::fs::write(target.join("node_modules/pkg/index.js"), "code").unwrap();
+        // Also create the target config dir so it exists
+        std::fs::create_dir_all(target.join("apps/my-app")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["/node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].1, "node_modules");
+    }
+
+    #[test]
+    fn test_resolve_clean_root_relative_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+
+        // Create dist dirs at various levels (all relative to worktree root)
+        std::fs::create_dir_all(target.join("apps/my-app/dist")).unwrap();
+        std::fs::write(target.join("apps/my-app/dist/bundle.js"), "code").unwrap();
+        std::fs::create_dir_all(target.join("packages/utils/dist")).unwrap();
+        std::fs::write(target.join("packages/utils/dist/lib.js"), "code").unwrap();
+        // Non-matching directory
+        std::fs::create_dir_all(target.join("packages/utils/src")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["/**/dist".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // Should find both dist dirs from the worktree root
+        assert_eq!(resolved.len(), 2);
+        let rel_paths: Vec<&str> = resolved.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rel_paths.iter().all(|p| p.contains("dist")));
+        assert!(rel_paths.iter().any(|p| p.contains("apps/my-app/dist")));
+        assert!(rel_paths.iter().any(|p| p.contains("packages/utils/dist")));
+    }
+
+    #[test]
+    fn test_resolve_clean_mixed_relative_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Config-relative: node_modules inside apps/my-app
+        std::fs::create_dir_all(target_app_dir.join("node_modules")).unwrap();
+        // Root-relative: .turbo at the worktree root
+        std::fs::create_dir_all(target.join(".turbo")).unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec![
+                "node_modules".to_string(), // config-relative
+                "/.turbo".to_string(),      // root-relative
+            ],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert_eq!(resolved.len(), 2);
+        let rel_paths: Vec<&str> = resolved.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rel_paths.iter().any(|p| p.contains("node_modules")));
+        assert!(rel_paths.iter().any(|p| p == &".turbo"));
+    }
+
+    #[test]
+    fn test_resolve_clean_glob_prunes_matched_dirs() {
+        // When **/node_modules matches a node_modules dir, it should NOT
+        // recurse into it. Verify that nested matches inside a matched dir
+        // don't appear in results (the parent match subsumes them).
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Create a node_modules with deeply nested sub-node_modules
+        // (simulating a non-hoisted dependency)
+        std::fs::create_dir_all(target_app_dir.join("node_modules/pkg/node_modules/nested-pkg"))
+            .unwrap();
+        std::fs::write(
+            target_app_dir.join("node_modules/pkg/node_modules/nested-pkg/index.js"),
+            "code",
+        )
+        .unwrap();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["**/node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // Should only have 1 result: the top-level node_modules.
+        // The nested node_modules/pkg/node_modules should NOT appear because
+        // walkdir prunes the parent node_modules/ on match.
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].1.ends_with("node_modules"));
+        assert!(!resolved[0].1.contains("pkg"));
+    }
+
+    #[test]
+    fn test_path_size_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create a real directory with a file
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("file.txt"), "hello world").unwrap(); // 11 bytes
+
+        // Create a symlink to the real directory
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_dir, base.join("link")).unwrap();
+
+            // Create a parent dir containing both real and link
+            let parent = base.join("parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::os::unix::fs::symlink(&real_dir, parent.join("link_inside")).unwrap();
+            std::fs::write(parent.join("own_file.txt"), "data").unwrap(); // 4 bytes
+
+            let size = path_size(&parent);
+            // Should only count own_file.txt, NOT follow link_inside.
+            // On Unix, disk usage is block-rounded, so just verify it's
+            // roughly one block (the own_file.txt) and not two files' worth.
+            let real_dir_size = path_size(&real_dir);
+            assert!(size > 0);
+            assert!(
+                size < real_dir_size * 2,
+                "symlink target should not be counted"
+            );
+        }
+
+        // The real directory should be counted normally
+        let size = path_size(&real_dir);
+        assert!(size > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_size_counts_hardlinks_fully() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create a file
+        let original = base.join("original.txt");
+        std::fs::write(&original, "hardlink test data").unwrap(); // 18 bytes
+
+        // Create a hardlink to the same file
+        std::fs::hard_link(&original, base.join("hardlink.txt")).unwrap();
+
+        let size = path_size(base);
+        let single_size = path_size(&original);
+        // Both hardlinks should be counted (disk usage for each entry)
+        assert_eq!(size, single_size * 2);
     }
 }

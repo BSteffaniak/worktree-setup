@@ -325,6 +325,191 @@ fn render_items(
     Ok(())
 }
 
+/// Custom multi-select widget for choosing worktrees to remove.
+///
+/// Simpler than [`select_worktrees_with_sizes`] — no background threads,
+/// no spinners, no size computation. The main worktree is shown but
+/// **disabled**: it cannot be toggled and is skipped by "toggle all".
+///
+/// Key bindings match `dialoguer::MultiSelect`:
+/// * `↑`/`k` — move cursor up
+/// * `↓`/`j`/`Tab` — move cursor down
+/// * `Space` — toggle selection (no-op on disabled items)
+/// * `a` — toggle all (excludes disabled items)
+/// * `Enter` — confirm
+/// * `Escape`/`q` — cancel
+///
+/// All items start **unchecked**.
+///
+/// # Returns
+///
+/// `Ok(Some(indices))` on confirm, `Ok(None)` on cancel.
+/// Indices refer to positions in the original `worktrees` slice.
+///
+/// # Errors
+///
+/// * If terminal I/O fails
+#[allow(dead_code)] // called from run_remove (step 6)
+pub fn select_worktrees_for_removal(worktrees: &[WorktreeInfo]) -> io::Result<Option<Vec<usize>>> {
+    let count = worktrees.len();
+    if count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let labels: Vec<String> = worktrees.iter().map(format_worktree_label).collect();
+    let disabled: Vec<bool> = worktrees.iter().map(|wt| wt.is_main).collect();
+
+    let mut checked = vec![false; count];
+    let mut cursor: usize = 0;
+
+    let term = Term::stderr();
+
+    // Spawn a thread that reads keys and sends them over a channel.
+    let (key_tx, key_rx) = mpsc::channel::<Key>();
+    let input_done = std::sync::Arc::new(AtomicBool::new(false));
+    let input_done_clone = input_done.clone();
+
+    let input_term = term.clone();
+    let input_handle = std::thread::spawn(move || {
+        loop {
+            if input_done_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(key) = input_term.read_key()
+                && key_tx.send(key).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    term.hide_cursor()?;
+
+    // Prompt header
+    let prompt_line = format!(
+        "{} {}",
+        "?".green().bold(),
+        "Select worktrees to remove (space to toggle, enter to confirm):".bold()
+    );
+    term.write_line(&prompt_line)?;
+    render_removal_items(&term, &labels, &checked, &disabled, cursor)?;
+
+    let result = run_removal_select_loop(
+        &term,
+        &labels,
+        &mut checked,
+        &disabled,
+        &mut cursor,
+        &key_rx,
+    );
+
+    // Cleanup
+    term.show_cursor()?;
+    term.clear_last_lines(count + 1)?; // +1 for prompt line
+    input_done.store(true, Ordering::Relaxed);
+    drop(input_handle);
+
+    result
+}
+
+/// Main loop for the removal multi-select widget.
+fn run_removal_select_loop(
+    term: &Term,
+    labels: &[String],
+    checked: &mut [bool],
+    disabled: &[bool],
+    cursor: &mut usize,
+    key_rx: &mpsc::Receiver<Key>,
+) -> io::Result<Option<Vec<usize>>> {
+    let count = labels.len();
+
+    loop {
+        // Block until a key is available (no spinner to animate)
+        let Ok(key) = key_rx.recv() else {
+            return Ok(None);
+        };
+
+        match key {
+            // Move down
+            Key::ArrowDown | Key::Tab | Key::Char('j') => {
+                *cursor = (*cursor + 1) % count;
+            }
+            // Move up
+            Key::ArrowUp | Key::BackTab | Key::Char('k') => {
+                *cursor = (*cursor + count - 1) % count;
+            }
+            // Toggle current (only if not disabled)
+            Key::Char(' ') => {
+                if !disabled[*cursor] {
+                    checked[*cursor] = !checked[*cursor];
+                }
+            }
+            // Toggle all (excludes disabled items)
+            Key::Char('a') => {
+                let all_enabled_checked = checked
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !disabled[*i])
+                    .all(|(_, &c)| c);
+                for (i, c) in checked.iter_mut().enumerate() {
+                    if !disabled[i] {
+                        *c = !all_enabled_checked;
+                    }
+                }
+            }
+            // Confirm
+            Key::Enter => {
+                let selected: Vec<usize> = checked
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c)
+                    .map(|(i, _)| i)
+                    .collect();
+                return Ok(Some(selected));
+            }
+            // Cancel
+            Key::Escape | Key::Char('q') => {
+                return Ok(None);
+            }
+            _ => continue, // no redraw needed
+        }
+
+        // Redraw
+        term.clear_last_lines(count)?;
+        render_removal_items(term, labels, checked, disabled, *cursor)?;
+    }
+}
+
+/// Render all items for the removal multi-select widget.
+///
+/// Matches dialoguer's plain theme styling:
+/// - `>` arrow for active item, 2-space indent for inactive
+/// - `[x]` / `[ ]` ASCII checkboxes
+/// - Disabled items (main worktree) shown with dim text and `[-]` checkbox
+fn render_removal_items(
+    term: &Term,
+    labels: &[String],
+    checked: &[bool],
+    disabled: &[bool],
+    cursor: usize,
+) -> io::Result<()> {
+    for (i, label) in labels.iter().enumerate() {
+        let is_active = i == cursor;
+        let prefix = if is_active { ">" } else { " " };
+
+        if disabled[i] {
+            let line = format!("{prefix} [-] {label}").dimmed();
+            term.write_line(&line.to_string())?;
+        } else {
+            let checkbox = if checked[i] { "[x]" } else { "[ ]" };
+            term.write_line(&format!("{prefix} {checkbox} {label}"))?;
+        }
+    }
+
+    term.flush()?;
+    Ok(())
+}
+
 /// Prompt for the target worktree path.
 ///
 /// # Errors

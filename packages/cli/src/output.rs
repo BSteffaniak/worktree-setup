@@ -254,3 +254,103 @@ pub fn print_multi_worktree_clean_summary(
         format_size(total_size)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Remove subcommand output
+// ---------------------------------------------------------------------------
+
+/// Information about a worktree to be removed, for display purposes.
+#[allow(dead_code)] // used in step 6
+pub struct RemoveDisplayInfo {
+    /// Branch name (if any).
+    pub branch: Option<String>,
+    /// Filesystem path.
+    pub path: String,
+    /// Whether the worktree has uncommitted changes.
+    pub has_changes: bool,
+}
+
+/// Print a preview of worktrees that will be removed.
+///
+/// Lists each worktree with its branch and path. Worktrees with
+/// uncommitted changes are flagged with a warning.
+#[allow(dead_code)] // used in step 6
+pub fn print_remove_preview(worktrees: &[RemoveDisplayInfo]) {
+    if worktrees.is_empty() {
+        println!("No worktrees to remove.");
+        return;
+    }
+
+    println!(
+        "\nWill remove {} worktree{}:",
+        worktrees.len(),
+        if worktrees.len() == 1 { "" } else { "s" }
+    );
+
+    for wt in worktrees {
+        let label = wt.branch.as_deref().unwrap_or("(detached)");
+        let warning = if wt.has_changes {
+            format!(" {}", "(has uncommitted changes)".yellow())
+        } else {
+            String::new()
+        };
+        println!(
+            "  {} {} {}{}",
+            "•".dimmed(),
+            label.cyan(),
+            wt.path.dimmed(),
+            warning,
+        );
+    }
+    println!();
+}
+
+/// Print a summary after worktree removal completes.
+#[allow(dead_code)] // used in step 6
+pub fn print_remove_summary(removed: usize, failed: usize) {
+    if failed == 0 {
+        println!(
+            "{}",
+            format!(
+                "Removed {} worktree{}.",
+                removed,
+                if removed == 1 { "" } else { "s" }
+            )
+            .green()
+        );
+    } else {
+        println!(
+            "Removed {} worktree{}, {} failed.",
+            removed,
+            if removed == 1 { "" } else { "s" },
+            failed,
+        );
+    }
+}
+
+/// Print a summary of branches that were deleted after worktree removal.
+#[allow(dead_code)] // used in step 6
+pub fn print_branch_delete_summary(deleted: &[String]) {
+    if deleted.is_empty() {
+        return;
+    }
+
+    println!(
+        "Deleted {} branch{}:",
+        deleted.len(),
+        if deleted.len() == 1 { "" } else { "es" }
+    );
+    for branch in deleted {
+        println!("  {} {}", "•".dimmed(), branch.cyan());
+    }
+}
+
+/// Print a note that the user's CWD was inside a removed worktree.
+#[allow(dead_code)] // used in step 6
+pub fn print_cwd_removed_note() {
+    println!(
+        "\n{} Your current directory was inside the removed worktree. Run {} to return to a valid directory.",
+        "Note:".yellow().bold(),
+        "cd ..".bold(),
+    );
+}

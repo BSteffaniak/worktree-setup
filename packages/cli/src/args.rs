@@ -106,6 +106,14 @@ pub enum Command {
     /// of what will be deleted with sizes, and prompts for confirmation.
     /// Supports exact paths and glob patterns.
     Clean(CleanArgs),
+
+    /// Remove worktrees and optionally delete their local branches.
+    ///
+    /// With a positional path, removes that specific worktree. When run
+    /// from inside a linked worktree (no path given), removes the current
+    /// worktree. When run from the main worktree (no path given), opens
+    /// an interactive multi-select picker.
+    Remove(RemoveArgs),
 }
 
 /// Arguments for the `setup` subcommand.
@@ -241,6 +249,35 @@ pub struct CleanArgs {
     /// Disable progress bars (useful for CI environments).
     #[arg(long = "no-progress")]
     pub no_progress: bool,
+
+    /// Enable verbose output.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
+}
+
+/// Arguments for the `remove` subcommand.
+#[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct RemoveArgs {
+    /// Path to the worktree to remove.
+    ///
+    /// If omitted and the current directory is inside a linked worktree,
+    /// that worktree is removed. If omitted and the current directory is
+    /// the main worktree, an interactive multi-select picker is shown.
+    #[arg(index = 1)]
+    pub target_path: Option<PathBuf>,
+
+    /// Skip confirmation prompt and remove immediately.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// Preview what would be removed without actually removing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Run without prompts (requires --force or --dry-run).
+    #[arg(long)]
+    pub non_interactive: bool,
 
     /// Enable verbose output.
     #[arg(long, short = 'v')]

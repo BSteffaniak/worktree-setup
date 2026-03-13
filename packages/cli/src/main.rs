@@ -22,7 +22,7 @@ use clap::Parser;
 use colored::Colorize;
 use path_clean::PathClean;
 
-use args::{Args, CleanArgs, SetupArgs};
+use args::{Args, CleanArgs, RemoveArgs, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
     CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ResolvedProfile,
@@ -46,6 +46,7 @@ fn main() {
     let verbose = match &args.command {
         Some(args::Command::Setup(setup_args)) => setup_args.verbose,
         Some(args::Command::Clean(clean_args)) => clean_args.verbose,
+        Some(args::Command::Remove(remove_args)) => remove_args.verbose,
         None => args.verbose,
     };
 
@@ -60,6 +61,7 @@ fn main() {
     let result = match args.command {
         Some(args::Command::Setup(ref setup_args)) => run_setup(setup_args),
         Some(args::Command::Clean(ref clean_args)) => run_clean(clean_args),
+        Some(args::Command::Remove(ref remove_args)) => run_remove(remove_args),
         None => run_create(&args),
     };
 
@@ -845,6 +847,27 @@ fn resolve_clean_glob(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Remove subcommand
+// ---------------------------------------------------------------------------
+
+/// Remove one or more worktrees and optionally delete their local branches.
+///
+/// Dispatch logic:
+/// * Positional path given → remove that specific worktree
+/// * No path, CWD is inside a linked worktree → remove that worktree
+/// * No path, CWD is main worktree / repo root → interactive multi-select
+#[allow(clippy::unnecessary_wraps)] // stub — will be fully implemented
+fn run_remove(_args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // TODO: implement in step 6
+    eprintln!("remove subcommand not yet implemented");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Clean subcommand
+// ---------------------------------------------------------------------------
 
 /// Run the `clean` subcommand.
 ///

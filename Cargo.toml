@@ -7,18 +7,18 @@ authors = ["Braden Steffaniak"]
 edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/BSteffaniak/worktree-setup"
-version = "0.2.0"
+version = "0.3.0"
 readme = "README.md"
 keywords = ["git", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Internal packages
-worktree_setup_cli = { version = "0.2.0", path = "packages/cli", default-features = false }
-worktree_setup_config = { version = "0.2.0", path = "packages/config", default-features = false }
-worktree_setup_copy = { version = "0.2.0", path = "packages/copy", default-features = false }
-worktree_setup_git = { version = "0.2.0", path = "packages/git", default-features = false }
-worktree_setup_operations = { version = "0.2.0", path = "packages/operations", default-features = false }
+worktree_setup_cli = { version = "0.3.0", path = "packages/cli", default-features = false }
+worktree_setup_config = { version = "0.3.0", path = "packages/config", default-features = false }
+worktree_setup_copy = { version = "0.3.0", path = "packages/copy", default-features = false }
+worktree_setup_git = { version = "0.3.0", path = "packages/git", default-features = false }
+worktree_setup_operations = { version = "0.3.0", path = "packages/operations", default-features = false }
 
 # Git
 git2 = { version = "0.20.3", default-features = false }

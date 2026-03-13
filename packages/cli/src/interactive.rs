@@ -6,12 +6,19 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
+use colored::Colorize;
+use console::{Key, Term};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 use worktree_setup_config::{CreationMethod, LoadedConfig};
 use worktree_setup_git::{
     Repository, WorktreeCreateOptions, WorktreeInfo, fetch_remote, get_remote_branches, get_remotes,
 };
+
+use crate::output;
 
 /// Select which configs to apply from a list.
 ///
@@ -57,28 +64,265 @@ fn format_worktree_label(wt: &WorktreeInfo) -> String {
     )
 }
 
-/// Select which worktrees to clean from a list.
+/// Resolved clean data for a single worktree, produced by a background thread.
+pub struct WorktreeResolution {
+    /// Index of the worktree in the original list.
+    pub index: usize,
+    /// Resolved absolute paths paired with their display strings.
+    pub resolved: Vec<(PathBuf, String)>,
+    /// Preview items with type and size info.
+    pub items: Vec<output::CleanItem>,
+    /// Human-readable summary (e.g. "3 items, 150.2 MiB").
+    pub summary: String,
+}
+
+/// Spinner frames (braille dots).
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Tick interval for the spinner animation (milliseconds).
+const SPINNER_TICK_MS: u64 = 80;
+
+/// Custom multi-select widget that shows live-updating size info per worktree.
 ///
-/// Displays each worktree with its branch name and path.
-/// All worktrees are unchecked by default.
+/// Displays all worktrees immediately with animated spinners. As background
+/// threads resolve clean paths and compute sizes, spinners are replaced with
+/// summary text (e.g., "3 items, 150.2 MiB" or "nothing to clean").
+///
+/// Key bindings match `dialoguer::MultiSelect`:
+/// * `↑`/`k` — move cursor up
+/// * `↓`/`j`/`Tab` — move cursor down
+/// * `Space` — toggle selection
+/// * `a` — toggle all
+/// * `Enter` — confirm
+/// * `Escape`/`q` — cancel
+///
+/// # Arguments
+///
+/// * `worktrees` - The worktrees to display
+/// * `result_rx` - Channel receiving `WorktreeResolution`s from background threads
+/// * `done` - Atomic flag signaling background work is complete
+///
+/// # Returns
+///
+/// `Ok((Some(indices), resolutions))` on confirm, `Ok((None, resolutions))` on cancel.
+/// The `resolutions` vector contains all `WorktreeResolution`s received from
+/// background threads during the session.
 ///
 /// # Errors
 ///
-/// * If the user cancels the selection
-pub fn select_worktrees(worktrees: &[WorktreeInfo]) -> io::Result<Vec<usize>> {
-    if worktrees.is_empty() {
-        return Ok(Vec::new());
+/// * If terminal I/O fails
+#[allow(clippy::too_many_lines)]
+pub fn select_worktrees_with_sizes(
+    worktrees: &[WorktreeInfo],
+    result_rx: &mpsc::Receiver<WorktreeResolution>,
+    done: &AtomicBool,
+) -> io::Result<(Option<Vec<usize>>, Vec<WorktreeResolution>)> {
+    let count = worktrees.len();
+    if count == 0 {
+        return Ok((Some(Vec::new()), Vec::new()));
     }
 
-    let items: Vec<String> = worktrees.iter().map(format_worktree_label).collect();
+    let term = Term::stderr();
+    let labels: Vec<String> = worktrees.iter().map(format_worktree_label).collect();
 
-    let selections = MultiSelect::new()
-        .with_prompt("Select worktrees to clean")
-        .items(&items)
-        .defaults(&vec![false; items.len()])
-        .interact()?;
+    let mut state = SelectState {
+        checked: vec![false; count],
+        statuses: vec![None; count],
+        resolutions: Vec::new(),
+        cursor: 0,
+        spinner_frame: 0,
+    };
 
-    Ok(selections)
+    // Spawn a thread that reads keys and sends them over a channel.
+    // This lets us poll for keys without blocking the render loop.
+    let (key_tx, key_rx) = mpsc::channel::<Key>();
+    let input_done = std::sync::Arc::new(AtomicBool::new(false));
+    let input_done_clone = input_done.clone();
+
+    let input_term = term.clone();
+    let input_handle = std::thread::spawn(move || {
+        loop {
+            if input_done_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(key) = input_term.read_key()
+                && key_tx.send(key).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    term.hide_cursor()?;
+
+    // Initial render — print the prompt header + all items
+    let prompt_line = format!(
+        "{} {}",
+        "?".green().bold(),
+        "Select worktrees to clean (space to toggle, enter to confirm):".bold()
+    );
+    term.write_line(&prompt_line)?;
+    render_items(
+        &term,
+        &labels,
+        &state.checked,
+        &state.statuses,
+        state.cursor,
+        state.spinner_frame,
+    )?;
+
+    let result = run_select_loop(&term, &labels, &mut state, &key_rx, result_rx, done);
+
+    // Cleanup: show cursor, clear the rendered lines, signal input thread to stop
+    term.show_cursor()?;
+    // +1 for the prompt line
+    term.clear_last_lines(count + 1)?;
+    input_done.store(true, Ordering::Relaxed);
+
+    // We can't join the input thread (it's blocked on read_key), so detach it.
+    drop(input_handle);
+
+    // Return (selection, resolutions) — map the inner result
+    result.map(|sel| (sel, state.resolutions))
+}
+
+/// Mutable state for the custom multi-select widget.
+struct SelectState {
+    checked: Vec<bool>,
+    statuses: Vec<Option<String>>,
+    resolutions: Vec<WorktreeResolution>,
+    cursor: usize,
+    spinner_frame: usize,
+}
+
+/// Main loop for the custom multi-select widget.
+///
+/// Polls for key events and background results, re-renders on changes.
+#[allow(clippy::too_many_arguments)]
+fn run_select_loop(
+    term: &Term,
+    labels: &[String],
+    state: &mut SelectState,
+    key_rx: &mpsc::Receiver<Key>,
+    result_rx: &mpsc::Receiver<WorktreeResolution>,
+    done: &AtomicBool,
+) -> io::Result<Option<Vec<usize>>> {
+    let count = labels.len();
+
+    loop {
+        // Drain all available background results
+        let mut needs_redraw = false;
+        while let Ok(res) = result_rx.try_recv() {
+            if res.index < count {
+                state.statuses[res.index] = Some(res.summary.clone());
+                needs_redraw = true;
+            }
+            state.resolutions.push(res);
+        }
+
+        // Process all available key events
+        while let Ok(key) = key_rx.try_recv() {
+            needs_redraw = true;
+            match key {
+                // Move down
+                Key::ArrowDown | Key::Tab | Key::Char('j') => {
+                    state.cursor = (state.cursor + 1) % count;
+                }
+                // Move up
+                Key::ArrowUp | Key::BackTab | Key::Char('k') => {
+                    state.cursor = (state.cursor + count - 1) % count;
+                }
+                // Toggle current
+                Key::Char(' ') => {
+                    state.checked[state.cursor] = !state.checked[state.cursor];
+                }
+                // Toggle all
+                Key::Char('a') => {
+                    let all_checked = state.checked.iter().all(|&c| c);
+                    for c in &mut state.checked {
+                        *c = !all_checked;
+                    }
+                }
+                // Confirm
+                Key::Enter => {
+                    let selected: Vec<usize> = state
+                        .checked
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| **c)
+                        .map(|(i, _)| i)
+                        .collect();
+                    return Ok(Some(selected));
+                }
+                // Cancel
+                Key::Escape | Key::Char('q') => {
+                    return Ok(None);
+                }
+                _ => {
+                    needs_redraw = false;
+                }
+            }
+        }
+
+        // Advance spinner if there are still unresolved items
+        let has_pending =
+            state.statuses.iter().any(Option::is_none) && !done.load(Ordering::Relaxed);
+        if has_pending {
+            state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            // Clear previous render and redraw
+            term.clear_last_lines(count)?;
+            render_items(
+                term,
+                labels,
+                &state.checked,
+                &state.statuses,
+                state.cursor,
+                state.spinner_frame,
+            )?;
+        }
+
+        // Sleep to avoid busy-waiting (also controls spinner speed)
+        std::thread::sleep(Duration::from_millis(SPINNER_TICK_MS));
+    }
+}
+
+/// Render all items for the custom multi-select widget.
+///
+/// Matches dialoguer's plain theme styling:
+/// - `>` arrow for active item, 2-space indent for inactive
+/// - `[x]` / `[ ]` ASCII checkboxes
+/// - No color on checkbox text; size summary in dim
+fn render_items(
+    term: &Term,
+    labels: &[String],
+    checked: &[bool],
+    statuses: &[Option<String>],
+    cursor: usize,
+    spinner_frame: usize,
+) -> io::Result<()> {
+    for (i, label) in labels.iter().enumerate() {
+        let is_active = i == cursor;
+
+        let prefix = if is_active { ">" } else { " " };
+        let checkbox = if checked[i] { "[x]" } else { "[ ]" };
+
+        let status = statuses[i].as_ref().map_or_else(
+            || {
+                let frame = SPINNER_FRAMES[spinner_frame];
+                format!("  {frame} resolving...").yellow().to_string()
+            },
+            |s| format!("  {s}").dimmed().to_string(),
+        );
+
+        term.write_line(&format!("{prefix} {checkbox} {label}{status}"))?;
+    }
+
+    term.flush()?;
+    Ok(())
 }
 
 /// Prompt for the target worktree path.

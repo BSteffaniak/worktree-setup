@@ -14,6 +14,9 @@ mod progress;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use clap::Parser;
 use colored::Colorize;
@@ -877,8 +880,9 @@ struct WorktreeCleanGroup {
     items: Vec<output::CleanItem>,
 }
 
-/// Run multi-worktree clean: prompt for worktree selection, resolve clean
-/// paths for each, show grouped preview, single confirmation, then delete all.
+/// Run multi-worktree clean: discover configs, spawn background resolution
+/// threads, show an interactive multi-select with live size updates, then
+/// preview and delete using cached results.
 fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
@@ -907,17 +911,13 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         );
     }
 
-    let selected_indices = interactive::select_worktrees(&worktrees)?;
-    if selected_indices.is_empty() {
-        println!("No worktrees selected. Exiting.");
+    // Discover configs and select which to use BEFORE showing the worktree
+    // picker so that background threads can start resolving immediately.
+    let selected_configs = discover_and_select_clean_configs(args, &repo_root)?;
+
+    if selected_configs.is_empty() {
         return Ok(());
     }
-
-    let selected_worktrees: Vec<_> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
-
-    // Discover configs and select which to use
-    let selected_configs = discover_and_select_clean_configs(args, &repo_root)?;
-    let selected_configs: Vec<&LoadedConfig> = selected_configs.iter().collect();
 
     // Check if any selected config has clean paths
     let has_clean_paths = selected_configs.iter().any(|c| !c.config.clean.is_empty());
@@ -926,8 +926,74 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    // Resolve clean paths for each selected worktree
-    let groups = resolve_multi_worktree_clean(&selected_worktrees, &selected_configs, &repo_root);
+    // Spawn background resolution threads — one per worktree — so all
+    // worktrees resolve concurrently. Each thread resolves clean paths and
+    // computes sizes, then sends a WorktreeResolution to the shared channel.
+    let (result_tx, result_rx) = mpsc::channel::<interactive::WorktreeResolution>();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_joiner = done.clone();
+
+    let configs_arc: Arc<Vec<LoadedConfig>> = Arc::new(selected_configs);
+    let repo_root_arc: Arc<PathBuf> = Arc::new(repo_root.clone());
+
+    let mut bg_handles = Vec::new();
+    for (idx, wt) in worktrees.iter().enumerate() {
+        let tx = result_tx.clone();
+        let configs = configs_arc.clone();
+        let root = repo_root_arc.clone();
+        let wt = wt.clone();
+
+        bg_handles.push(std::thread::spawn(move || {
+            let configs_refs: Vec<&LoadedConfig> = configs.iter().collect();
+            let resolution = resolve_single_worktree(idx, &wt, &configs_refs, &root);
+            let _ = tx.send(resolution);
+        }));
+    }
+    // Drop the original sender so the channel closes when all threads finish
+    drop(result_tx);
+
+    // Spawn a joiner thread that waits for all workers and sets done flag
+    let joiner_handle = std::thread::spawn(move || {
+        for handle in bg_handles {
+            let _ = handle.join();
+        }
+        done_for_joiner.store(true, Ordering::Relaxed);
+    });
+
+    // Show the interactive multi-select with live-updating sizes
+    let (selected_indices, mut cached_resolutions) =
+        interactive::select_worktrees_with_sizes(&worktrees, &result_rx, &done)?;
+
+    let Some(selected_indices) = selected_indices else {
+        println!("Cancelled.");
+        return Ok(());
+    };
+
+    if selected_indices.is_empty() {
+        println!("No worktrees selected. Exiting.");
+        return Ok(());
+    }
+
+    // Wait for all background threads to finish and drain remaining results
+    let _ = joiner_handle.join();
+    while let Ok(res) = result_rx.try_recv() {
+        cached_resolutions.push(res);
+    }
+
+    // Build groups from cached resolutions for the selected worktrees.
+    // The cached_resolutions are indexed by worktree index, so we match
+    // selected indices to their resolutions.
+    let groups = build_groups_from_cache(&selected_indices, &cached_resolutions, &worktrees);
+
+    // Fall back to re-resolving for any selected worktrees that weren't
+    // in the cache (e.g., if the user confirmed before all resolved).
+    let groups = if groups.len() == selected_indices.len() {
+        groups
+    } else {
+        let configs_refs: Vec<&LoadedConfig> = configs_arc.iter().collect();
+        let selected_wts: Vec<_> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
+        resolve_multi_worktree_clean(&selected_wts, &configs_refs, &repo_root)
+    };
 
     // Check if there's anything to clean
     let total_items: usize = groups.iter().map(|g| g.items.len()).sum();
@@ -955,6 +1021,79 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
 
     // Confirm and delete
     confirm_and_delete_multi(args.force, args.non_interactive, &groups)
+}
+
+/// Build `WorktreeCleanGroup`s from cached `WorktreeResolution`s.
+fn build_groups_from_cache(
+    selected_indices: &[usize],
+    resolutions: &[interactive::WorktreeResolution],
+    worktrees: &[worktree_setup_git::WorktreeInfo],
+) -> Vec<WorktreeCleanGroup> {
+    let mut groups = Vec::new();
+
+    for &idx in selected_indices {
+        if let Some(res) = resolutions.iter().find(|r| r.index == idx) {
+            groups.push(WorktreeCleanGroup {
+                label: worktree_clean_label(&worktrees[idx]),
+                resolved: res.resolved.clone(),
+                items: res.items.clone(),
+            });
+        }
+    }
+
+    groups
+}
+
+/// Resolve clean paths for a single worktree (used by background threads).
+fn resolve_single_worktree(
+    index: usize,
+    wt: &worktree_setup_git::WorktreeInfo,
+    configs: &[&LoadedConfig],
+    repo_root: &Path,
+) -> interactive::WorktreeResolution {
+    let target_path = &wt.path;
+    let Ok(target_canonical) = target_path.canonicalize() else {
+        return interactive::WorktreeResolution {
+            index,
+            resolved: Vec::new(),
+            items: Vec::new(),
+            summary: "inaccessible".to_string(),
+        };
+    };
+
+    let resolved = resolve_clean_paths(configs, target_path, &target_canonical, repo_root);
+
+    let items: Vec<output::CleanItem> = resolved
+        .iter()
+        .map(|(abs_path, rel_path)| {
+            let is_dir = abs_path.is_dir();
+            let size = path_size(abs_path);
+            output::CleanItem {
+                relative_path: rel_path.clone(),
+                is_dir,
+                size,
+            }
+        })
+        .collect();
+
+    let summary = if items.is_empty() {
+        "nothing to clean".to_string()
+    } else {
+        let total_size: u64 = items.iter().map(|i| i.size).sum();
+        format!(
+            "{} item{}, {}",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            output::format_size(total_size)
+        )
+    };
+
+    interactive::WorktreeResolution {
+        index,
+        resolved,
+        items,
+        summary,
+    }
 }
 
 /// Discover configs, resolve profiles, and select which configs to use for cleaning.

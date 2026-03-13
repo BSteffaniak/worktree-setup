@@ -25,14 +25,14 @@ use path_clean::PathClean;
 use args::{Args, CleanArgs, RemoveArgs, SetupArgs};
 use progress::ProgressManager;
 use worktree_setup_config::{
-    CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode, ResolvedProfile,
-    discover_configs, load_config, resolve_profiles,
+    BranchDeletePolicy, CreationMethod, LoadedConfig, PostSetupKeyword, PostSetupMode,
+    ResolvedProfile, discover_configs, load_config, load_global_config, resolve_profiles,
 };
 use worktree_setup_git::{
-    GitError, WorktreeCreateOptions, create_worktree, discover_repo, fetch_remote,
-    get_current_branch, get_default_branch, get_local_branches, get_main_worktree,
-    get_recent_branches, get_remotes, get_repo_root, get_unstaged_and_untracked_files,
-    get_worktrees, prune_worktrees,
+    GitError, Repository, WorktreeCreateOptions, WorktreeInfo, create_worktree, delete_branch,
+    discover_repo, fetch_remote, get_current_branch, get_default_branch, get_local_branches,
+    get_main_worktree, get_recent_branches, get_remotes, get_repo_root,
+    get_unstaged_and_untracked_files, get_worktrees, prune_worktrees, remove_worktree,
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
@@ -858,10 +858,416 @@ fn resolve_clean_glob(
 /// * Positional path given → remove that specific worktree
 /// * No path, CWD is inside a linked worktree → remove that worktree
 /// * No path, CWD is main worktree / repo root → interactive multi-select
-#[allow(clippy::unnecessary_wraps)] // stub — will be fully implemented
-fn run_remove(_args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: implement in step 6
-    eprintln!("remove subcommand not yet implemented");
+fn run_remove(args: &RemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let repo = discover_repo(&cwd)?;
+    let repo_root = get_repo_root(&repo)?;
+    let global_config = load_global_config(Some(&repo_root))?;
+    let worktrees = get_worktrees(&repo)?;
+
+    output::print_header("Worktree Remove");
+    output::print_repo_info(&repo_root.to_string_lossy());
+    println!();
+
+    if let Some(ref target) = args.target_path {
+        // Mode 1: explicit positional path
+        let target_path = if target.is_absolute() {
+            target.clone()
+        } else {
+            cwd.join(target).clean()
+        };
+        return run_remove_single(
+            args,
+            &repo,
+            &repo_root,
+            &worktrees,
+            &target_path,
+            &global_config,
+        );
+    }
+
+    // Detect whether CWD is inside a linked (non-main) worktree
+    let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+
+    find_containing_linked_worktree(&cwd_canonical, &worktrees).map_or_else(
+        || {
+            // Mode 3: CWD is main worktree or repo root — interactive
+            run_remove_interactive(args, &repo, &worktrees, &global_config)
+        },
+        |wt| {
+            // Mode 2: CWD is inside a linked worktree — remove it
+            run_remove_single(
+                args,
+                &repo,
+                &repo_root,
+                &worktrees,
+                &wt.path,
+                &global_config,
+            )
+        },
+    )
+}
+
+/// Find the linked (non-main) worktree that contains the given path, if any.
+fn find_containing_linked_worktree<'a>(
+    path: &Path,
+    worktrees: &'a [WorktreeInfo],
+) -> Option<&'a WorktreeInfo> {
+    worktrees.iter().find(|wt| {
+        if wt.is_main {
+            return false;
+        }
+        wt.path.canonicalize().map_or_else(
+            |_| path.starts_with(&wt.path),
+            |wt_canonical| path.starts_with(&wt_canonical),
+        )
+    })
+}
+
+/// Check if a worktree has uncommitted changes.
+///
+/// Returns `true` if the worktree has unstaged or untracked files.
+/// Returns `false` on any error (conservative — don't block removal).
+fn worktree_has_changes(worktree_path: &Path) -> bool {
+    Repository::open(worktree_path).is_ok_and(|wt_repo| {
+        get_unstaged_and_untracked_files(&wt_repo).is_ok_and(|files| !files.is_empty())
+    })
+}
+
+/// Handle branch deletion for a removed worktree based on the global config policy.
+fn handle_branch_deletion(
+    repo: &Repository,
+    branch: &str,
+    policy: BranchDeletePolicy,
+    non_interactive: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let should_delete = match policy {
+        BranchDeletePolicy::Always => true,
+        BranchDeletePolicy::Never => return Ok(None),
+        BranchDeletePolicy::Ask => {
+            if non_interactive {
+                // In non-interactive mode with Ask policy, skip branch deletion
+                return Ok(None);
+            }
+            let prompt = format!("Delete local branch '{branch}'?");
+            dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()?
+        }
+    };
+
+    if !should_delete {
+        return Ok(None);
+    }
+
+    if dry_run {
+        println!("  Would delete branch '{branch}'");
+        return Ok(Some(branch.to_string()));
+    }
+
+    // Try safe delete first, fall back to force if requested
+    match delete_branch(repo, branch, false) {
+        Ok(()) => Ok(Some(branch.to_string())),
+        Err(_) if force => {
+            delete_branch(repo, branch, true)?;
+            Ok(Some(branch.to_string()))
+        }
+        Err(e) => {
+            output::print_warning(&format!(
+                "Could not delete branch '{branch}': {e}. Use --force to force-delete."
+            ));
+            Ok(None)
+        }
+    }
+}
+
+/// Remove a single worktree with confirmation, dirty check, and branch deletion.
+fn run_remove_single(
+    args: &RemoveArgs,
+    repo: &Repository,
+    repo_root: &Path,
+    worktrees: &[WorktreeInfo],
+    target_path: &Path,
+    global_config: &worktree_setup_config::GlobalConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Find the worktree matching the target path
+    let target_canonical = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
+
+    let wt = worktrees
+        .iter()
+        .find(|w| w.path.canonicalize().unwrap_or_else(|_| w.path.clone()) == target_canonical)
+        .ok_or_else(|| {
+            format!(
+                "No worktree found at '{}'. Use 'git worktree list' to see registered worktrees.",
+                target_path.display()
+            )
+        })?;
+
+    // Guard: cannot remove the main worktree
+    if wt.is_main {
+        return Err(format!(
+            "Cannot remove the main worktree at '{}'.",
+            target_path.display()
+        )
+        .into());
+    }
+
+    // Check for uncommitted changes
+    let has_changes = worktree_has_changes(&wt.path);
+
+    // Build preview
+    let display_info = vec![output::RemoveDisplayInfo {
+        branch: wt.branch.clone(),
+        path: wt.path.to_string_lossy().to_string(),
+        has_changes,
+    }];
+    output::print_remove_preview(&display_info);
+
+    // Dry run
+    if args.dry_run {
+        if let Some(ref branch) = wt.branch {
+            handle_branch_deletion(
+                repo,
+                branch,
+                global_config.remove.branch_delete,
+                args.non_interactive,
+                args.force,
+                true,
+            )?;
+        }
+        println!("\n{}", "Dry run — nothing was removed.".dimmed());
+        return Ok(());
+    }
+
+    // Confirmation
+    if !args.force {
+        if args.non_interactive {
+            return Err(
+                "Remove requires confirmation. Use --force to skip, or --dry-run to preview."
+                    .into(),
+            );
+        }
+
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt("Proceed with removal?")
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Detect if CWD is inside the worktree being removed
+    let cwd = env::current_dir()?;
+    let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let cwd_inside = cwd_canonical.starts_with(&target_canonical);
+
+    // Remove the worktree
+    let force_remove = args.force || has_changes;
+    match remove_worktree(repo, &wt.path, force_remove) {
+        Ok(()) => {
+            output::print_remove_summary(1, 0);
+        }
+        Err(e) => {
+            output::print_error(&format!("Failed to remove worktree: {e}"));
+            output::print_remove_summary(0, 1);
+            return Err(e.into());
+        }
+    }
+
+    // Branch deletion
+    let mut deleted_branches = Vec::new();
+    if let Some(ref branch) = wt.branch {
+        // Re-open repo from repo_root since the worktree is now gone
+        let repo = discover_repo(repo_root)?;
+        if let Ok(Some(deleted)) = handle_branch_deletion(
+            &repo,
+            branch,
+            global_config.remove.branch_delete,
+            args.non_interactive,
+            args.force,
+            false,
+        ) {
+            deleted_branches.push(deleted);
+        }
+    }
+
+    output::print_branch_delete_summary(&deleted_branches);
+
+    if cwd_inside {
+        output::print_cwd_removed_note();
+    }
+
+    Ok(())
+}
+
+/// Interactive multi-select removal of worktrees.
+fn run_remove_interactive(
+    args: &RemoveArgs,
+    repo: &Repository,
+    worktrees: &[WorktreeInfo],
+    global_config: &worktree_setup_config::GlobalConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let linked_count = worktrees.iter().filter(|w| !w.is_main).count();
+    if linked_count == 0 {
+        output::print_info("No linked worktrees to remove.");
+        return Ok(());
+    }
+
+    if args.non_interactive {
+        return Err("Interactive worktree selection requires a terminal. \
+             Provide a target path for non-interactive removal."
+            .into());
+    }
+
+    // Show the picker
+    let selection = interactive::select_worktrees_for_removal(worktrees)?;
+
+    let Some(selected_indices) = selection else {
+        println!("Cancelled.");
+        return Ok(());
+    };
+
+    if selected_indices.is_empty() {
+        println!("No worktrees selected. Exiting.");
+        return Ok(());
+    }
+
+    let selected: Vec<&WorktreeInfo> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
+
+    // Check for uncommitted changes and build preview
+    let display_infos: Vec<output::RemoveDisplayInfo> = selected
+        .iter()
+        .map(|wt| {
+            let has_changes = worktree_has_changes(&wt.path);
+            output::RemoveDisplayInfo {
+                branch: wt.branch.clone(),
+                path: wt.path.to_string_lossy().to_string(),
+                has_changes,
+            }
+        })
+        .collect();
+
+    output::print_remove_preview(&display_infos);
+
+    // Dry run
+    if args.dry_run {
+        for wt in &selected {
+            if let Some(ref branch) = wt.branch {
+                handle_branch_deletion(
+                    repo,
+                    branch,
+                    global_config.remove.branch_delete,
+                    args.non_interactive,
+                    args.force,
+                    true,
+                )?;
+            }
+        }
+        println!("\n{}", "Dry run — nothing was removed.".dimmed());
+        return Ok(());
+    }
+
+    // Confirmation
+    if !args.force {
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Remove {} worktree{}?",
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            ))
+            .default(false)
+            .interact()?;
+
+        if !confirm {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    execute_worktree_removals(
+        args,
+        repo,
+        worktrees,
+        &selected,
+        &display_infos,
+        global_config,
+    )
+}
+
+/// Execute the actual removal of selected worktrees and their branches.
+fn execute_worktree_removals(
+    args: &RemoveArgs,
+    repo: &Repository,
+    worktrees: &[WorktreeInfo],
+    selected: &[&WorktreeInfo],
+    display_infos: &[output::RemoveDisplayInfo],
+    global_config: &worktree_setup_config::GlobalConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    let mut deleted_branches = Vec::new();
+
+    // Detect if CWD is inside any selected worktree
+    let cwd = env::current_dir()?;
+    let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let mut cwd_was_removed = false;
+
+    for (idx, wt) in selected.iter().enumerate() {
+        let has_changes = display_infos[idx].has_changes;
+        let force_remove = args.force || has_changes;
+
+        let wt_canonical = wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone());
+        if cwd_canonical.starts_with(&wt_canonical) {
+            cwd_was_removed = true;
+        }
+
+        match remove_worktree(repo, &wt.path, force_remove) {
+            Ok(()) => {
+                removed += 1;
+            }
+            Err(e) => {
+                output::print_warning(&format!(
+                    "Failed to remove worktree at '{}': {e}",
+                    wt.path.display()
+                ));
+                failed += 1;
+                continue; // skip branch deletion for failed worktrees
+            }
+        }
+
+        // Branch deletion
+        if let Some(ref branch) = wt.branch {
+            // Re-open repo from a still-valid path for each branch deletion
+            if let Ok(fresh_repo) = discover_repo(&worktrees[0].path)
+                && let Ok(Some(deleted)) = handle_branch_deletion(
+                    &fresh_repo,
+                    branch,
+                    global_config.remove.branch_delete,
+                    args.non_interactive,
+                    args.force,
+                    false,
+                )
+            {
+                deleted_branches.push(deleted);
+            }
+        }
+    }
+
+    output::print_remove_summary(removed, failed);
+    output::print_branch_delete_summary(&deleted_branches);
+
+    if cwd_was_removed {
+        output::print_cwd_removed_note();
+    }
+
     Ok(())
 }
 

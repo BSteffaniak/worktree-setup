@@ -349,7 +349,6 @@ fn render_items(
 /// # Errors
 ///
 /// * If terminal I/O fails
-#[allow(dead_code)] // called from run_remove (step 6)
 pub fn select_worktrees_for_removal(worktrees: &[WorktreeInfo]) -> io::Result<Option<Vec<usize>>> {
     let count = worktrees.len();
     if count == 0 {

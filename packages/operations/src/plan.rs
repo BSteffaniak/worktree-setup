@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use worktree_setup_config::LoadedConfig;
-use worktree_setup_copy::count_files_with_progress;
+use worktree_setup_copy::{count_files, count_files_with_progress};
 use worktree_setup_glob::{GlobResolverOptions, is_glob_pattern, resolve_glob};
 
 use crate::ApplyConfigOptions;
@@ -124,7 +124,7 @@ fn escapes_containment(path: &Path, containment_root: Option<&PathBuf>) -> bool 
 ///
 /// # Errors
 ///
-/// * If glob pattern matching fails
+/// * If file counting fails during directory scanning
 pub fn plan_operations(
     config: &LoadedConfig,
     main_worktree: &Path,
@@ -176,7 +176,7 @@ struct PlanContext<'a, F> {
 ///
 /// # Errors
 ///
-/// * If glob pattern matching fails
+/// * If file counting fails during directory scanning
 pub fn plan_operations_with_progress<F>(
     config: &LoadedConfig,
     main_worktree: &Path,
@@ -573,13 +573,20 @@ fn plan_glob_exact<F>(
 
     let (will_skip, skip_reason, op_type) = glob_target_status(&target, ctx.overwrite);
 
+    let is_directory = source.is_dir();
+    let file_count = if is_directory {
+        count_files(&source)
+    } else {
+        1
+    };
+
     operations.push(PlannedOperation {
         display_path: display_path.to_string_lossy().to_string(),
         operation_type: op_type,
         source,
         target,
-        file_count: 1,
-        is_directory: false,
+        file_count,
+        is_directory,
         will_skip,
         skip_reason,
         force_overwrite: false,
@@ -627,13 +634,20 @@ fn plan_glob_pattern<F>(
 
         let (will_skip, skip_reason, op_type) = glob_target_status(&target, ctx.overwrite);
 
+        let is_directory = entry.canonical.is_dir();
+        let file_count = if is_directory {
+            count_files(&entry.canonical)
+        } else {
+            1
+        };
+
         operations.push(PlannedOperation {
             display_path: display_path.to_string_lossy().to_string(),
             operation_type: op_type,
             source: entry.canonical.clone(),
             target,
-            file_count: 1,
-            is_directory: false,
+            file_count,
+            is_directory,
             will_skip,
             skip_reason,
             force_overwrite: false,
@@ -1284,5 +1298,76 @@ mod tests {
         let display_paths: BTreeSet<&str> = ops.iter().map(|op| op.display_path.as_str()).collect();
         assert!(display_paths.contains("a/dist"));
         assert!(display_paths.contains("b/dist"));
+
+        // Directories should have is_directory = true and correct file_count
+        for op in &ops {
+            assert!(op.is_directory, "{} should be a directory", op.display_path);
+            assert_eq!(op.file_count, 1, "{} should have 1 file", op.display_path);
+        }
+    }
+
+    #[test]
+    fn test_plan_glob_exact_directory_handling() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create a directory with multiple files (exact path, not a glob pattern)
+        let dist_dir = main_dir.path().join("dist");
+        fs::create_dir_all(&dist_dir).unwrap();
+        fs::write(dist_dir.join("bundle.js"), "code").unwrap();
+        fs::write(dist_dir.join("style.css"), "css").unwrap();
+        fs::create_dir_all(dist_dir.join("assets")).unwrap();
+        fs::write(dist_dir.join("assets/logo.png"), "img").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy_glob: vec!["dist".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.path().join("worktree.config.toml"),
+            config_dir: main_dir.path().to_path_buf(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].is_directory);
+        assert_eq!(ops[0].file_count, 3); // 3 files in the directory
+        assert_eq!(ops[0].operation_type, OperationType::CopyGlob);
+    }
+
+    #[test]
+    fn test_plan_glob_pattern_file_not_directory() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create regular files (not directories) matching a glob
+        fs::write(main_dir.path().join("app.js"), "code").unwrap();
+        fs::write(main_dir.path().join("lib.js"), "code").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy_glob: vec!["*.js".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.path().join("worktree.config.toml"),
+            config_dir: main_dir.path().to_path_buf(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 2);
+        for op in &ops {
+            assert!(
+                !op.is_directory,
+                "{} should not be a directory",
+                op.display_path
+            );
+            assert_eq!(op.file_count, 1);
+        }
     }
 }

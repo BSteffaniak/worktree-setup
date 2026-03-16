@@ -45,10 +45,6 @@ pub enum OperationError {
         error: std::io::Error,
     },
 
-    /// Glob pattern error.
-    #[error("Glob pattern error: {0}")]
-    GlobError(String),
-
     /// Git operation error.
     #[error("Git error: {0}")]
     GitError(#[from] worktree_setup_git::GitError),

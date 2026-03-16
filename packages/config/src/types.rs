@@ -73,15 +73,16 @@ pub struct Config {
 
     /// Allow file operations to reference paths outside the worktree boundary.
     ///
-    /// By default (`false`), all resolved paths are containment-checked:
-    /// they must be inside the target worktree directory. Set to `true` to
-    /// disable this check for this config (e.g., for referencing shared
-    /// caches or directories outside the worktree).
+    /// * `None` (default when omitted) — inherit from the global config's
+    ///   `[security] allow_path_escape` setting.
+    /// * `Some(true)` — allow paths to escape the worktree boundary for
+    ///   this config, overriding a global `false`.
+    /// * `Some(false)` — enforce containment for this config, overriding a
+    ///   global `true`.
     ///
     /// Can also be set globally in the global config under `[security]`.
-    /// Per-config `true` overrides a global `false`.
     #[serde(default)]
-    pub allow_path_escape: bool,
+    pub allow_path_escape: Option<bool>,
 }
 
 /// A loaded configuration with metadata.

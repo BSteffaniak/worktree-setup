@@ -178,6 +178,11 @@ fn resolve_and_print_profile(
 /// This handles scanning, planning, progress display, unstaged file copying,
 /// and execution of all file operations (symlinks, copies, overwrites,
 /// templates, globs).
+///
+/// The `global_config` is used to resolve per-config `allow_path_escape`:
+/// * `Some(true)` → allow escape
+/// * `Some(false)` → enforce containment
+/// * `None` → inherit from `global_config.security.allow_path_escape`
 fn execute_file_operations(
     selected_configs: &[&LoadedConfig],
     main_worktree_path: &Path,
@@ -185,13 +190,9 @@ fn execute_file_operations(
     copy_unstaged_override: Option<bool>,
     overwrite_existing: bool,
     show_progress: bool,
+    global_config: &worktree_setup_config::GlobalConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress_mgr = ProgressManager::new(show_progress);
-    let options = ApplyConfigOptions {
-        copy_unstaged: copy_unstaged_override,
-        overwrite_existing,
-        allow_path_escape: false,
-    };
 
     // Calculate total operations across all configs for scanning progress
     let config_op_counts: Vec<usize> = selected_configs
@@ -213,6 +214,18 @@ fn execute_file_operations(
     let mut all_operations = Vec::new();
     let mut offset = 0usize;
     for (config, &config_count) in selected_configs.iter().zip(&config_op_counts) {
+        // Resolve allow_path_escape per-config: per-config overrides global
+        let allow_path_escape = config
+            .config
+            .allow_path_escape
+            .unwrap_or(global_config.security.allow_path_escape);
+
+        let options = ApplyConfigOptions {
+            copy_unstaged: copy_unstaged_override,
+            overwrite_existing,
+            allow_path_escape,
+        };
+
         let current_offset = offset;
         let ops = plan_operations_with_progress(
             config,
@@ -530,6 +543,8 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|p| p.defaults.copy_unstaged)
         });
 
+        let global_config = load_global_config(Some(&repo_root))?;
+
         println!("\nApplying file operations to: {}", target_path.display());
         println!("Source (main worktree): {}\n", main_worktree.path.display());
 
@@ -540,6 +555,7 @@ fn run_setup(args: &SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             copy_unstaged_override,
             overwrite_existing,
             args.should_show_progress(),
+            &global_config,
         )?;
 
         println!();
@@ -2126,12 +2142,14 @@ fn run_create(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply config setup operations (only if configs were selected)
     if !selected_configs.is_empty() {
+        let global_config = load_global_config(Some(&repo_root))?;
         apply_create_operations(
             args,
             &selected_configs,
             resolved_profile.as_ref(),
             &main_worktree.path,
             &target_path,
+            &global_config,
         )?;
     }
 
@@ -2146,6 +2164,7 @@ fn apply_create_operations(
     resolved_profile: Option<&ResolvedProfile>,
     main_worktree_path: &Path,
     target_path: &Path,
+    global_config: &worktree_setup_config::GlobalConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSetting up worktree: {}", target_path.display());
     println!("Main worktree: {}\n", main_worktree_path.display());
@@ -2162,6 +2181,7 @@ fn apply_create_operations(
         copy_unstaged_override,
         false, // No overwrite in create flow (fresh worktree)
         args.should_show_progress(),
+        global_config,
     )?;
 
     println!();

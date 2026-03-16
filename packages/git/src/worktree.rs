@@ -100,19 +100,20 @@ fn get_worktree_info_from_repo(repo: &Repository, path: &Path, is_main: bool) ->
 
 /// Get the main worktree.
 ///
+/// This is more efficient than [`get_worktrees`] when only the main worktree
+/// info is needed — it reads HEAD directly from the provided `repo` handle
+/// without opening every linked worktree.
+///
 /// # Arguments
 ///
 /// * `repo` - The repository
 ///
 /// # Errors
 ///
-/// * If no main worktree is found
+/// * If the repo root cannot be determined
 pub fn get_main_worktree(repo: &Repository) -> Result<WorktreeInfo, GitError> {
-    let worktrees = get_worktrees(repo)?;
-    worktrees
-        .into_iter()
-        .find(|wt| wt.is_main)
-        .ok_or(GitError::NoMainWorktree)
+    let main_path = get_repo_root(repo)?;
+    Ok(get_worktree_info_from_repo(repo, &main_path, true))
 }
 
 /// Create a new worktree using git CLI.

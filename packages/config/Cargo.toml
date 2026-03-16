@@ -15,8 +15,11 @@ dirs = { workspace = true }
 glob = { workspace = true }
 jwalk = { workspace = true }
 log = { workspace = true }
+rquickjs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+swc_common = { workspace = true }
+swc_ts_fast_strip = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 

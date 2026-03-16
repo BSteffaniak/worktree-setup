@@ -12,12 +12,20 @@ use std::path::{Path, PathBuf};
 use crate::error::ConfigError;
 use crate::types::LoadedConfig;
 
+/// Directories to skip during config discovery.
+///
+/// These are pruned at the directory level via `process_read_dir`,
+/// so the walker never descends into them — avoiding traversal of
+/// potentially millions of files inside `node_modules`.
+const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target"];
+
 /// Discover all worktree configuration files in a repository.
 ///
 /// Searches for files matching `worktree.config.{toml,ts}` and
 /// `worktree.*.config.{toml,ts}` patterns using fast parallel directory traversal.
 ///
-/// Automatically skips `node_modules`, `.git`, and `target` directories.
+/// Automatically prunes `node_modules`, `.git`, and `target` directories
+/// at the directory level so their contents are never traversed.
 ///
 /// # Arguments
 ///
@@ -29,24 +37,32 @@ use crate::types::LoadedConfig;
 pub fn discover_configs(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     log::debug!("Discovering configs in {}", repo_root.display());
 
-    let mut configs: Vec<PathBuf> = jwalk::WalkDir::new(repo_root)
+    let mut configs: Vec<PathBuf> = jwalk::WalkDirGeneric::<((), ())>::new(repo_root)
         .skip_hidden(false)
         .sort(false)
+        .process_read_dir(|_depth, _path, _state, children| {
+            // Prune directories we never want to enter.  Setting
+            // `read_children_path = None` prevents jwalk from descending.
+            // Removing entries entirely prevents them from appearing in
+            // the iterator output at all.
+            children.retain(|entry_result| {
+                let Ok(entry) = entry_result.as_ref() else {
+                    return false;
+                };
+                if entry.file_type.is_dir() {
+                    let name = entry.file_name.to_string_lossy();
+                    if SKIP_DIRS.iter().any(|&skip| name == skip) {
+                        return false;
+                    }
+                }
+                true
+            });
+        })
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| {
             // Only files
             if !entry.file_type().is_file() {
-                return false;
-            }
-
-            // Skip node_modules, .git, target directories
-            let path = entry.path();
-            let path_str = path.to_string_lossy();
-            if path_str.contains("node_modules")
-                || path_str.contains("/.git/")
-                || path_str.contains("/target/")
-            {
                 return false;
             }
 

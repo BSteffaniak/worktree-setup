@@ -79,10 +79,6 @@ pub enum GitError {
         source: git2::Error,
     },
 
-    /// No main worktree found.
-    #[error("No main worktree found")]
-    NoMainWorktree,
-
     /// Worktree not found.
     #[error("Worktree not found: {0}")]
     WorktreeNotFound(String),

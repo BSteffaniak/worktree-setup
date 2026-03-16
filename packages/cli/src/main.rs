@@ -73,23 +73,52 @@ fn main() {
 
 /// Discover and load configs from a repo root, printing status.
 ///
+/// Shows a spinner during discovery and loading to provide visual feedback,
+/// especially when TypeScript configs require evaluation.
+///
 /// Returns the loaded configs. Prints warnings for configs that fail to load.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn discover_and_load_configs(
     repo_root: &Path,
 ) -> Result<Vec<LoadedConfig>, Box<dyn std::error::Error>> {
+    let spinner = indicatif::ProgressBar::new_spinner();
+    spinner.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "])
+            .template("{spinner:.cyan} {msg}")
+            .expect("Invalid spinner template"),
+    );
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    spinner.set_message("Discovering configs...");
+
     let config_paths = discover_configs(repo_root)?;
 
     let mut all_configs: Vec<LoadedConfig> = Vec::new();
     if config_paths.is_empty() {
+        spinner.finish_and_clear();
         println!("No config files found.\n");
     } else {
+        let total = config_paths.len();
+        spinner.set_message(format!(
+            "Loading {total} config{}...",
+            if total == 1 { "" } else { "s" }
+        ));
+
+        let mut warnings: Vec<String> = Vec::new();
         for path in config_paths {
             match load_config(&path, repo_root) {
                 Ok(config) => all_configs.push(config),
                 Err(e) => {
-                    output::print_warning(&format!("Failed to load {}: {}", path.display(), e));
+                    warnings.push(format!("Failed to load {}: {}", path.display(), e));
                 }
             }
+        }
+
+        spinner.finish_and_clear();
+
+        // Print any warnings that occurred during loading
+        for warning in &warnings {
+            output::print_warning(warning);
         }
 
         if all_configs.is_empty() {

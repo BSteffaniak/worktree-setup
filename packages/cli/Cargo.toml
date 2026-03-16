@@ -34,4 +34,5 @@ default = []
 fail-on-warnings = []
 
 [dev-dependencies]
+git2 = { workspace = true }
 tempfile = { workspace = true }

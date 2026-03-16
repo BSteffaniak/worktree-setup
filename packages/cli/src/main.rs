@@ -838,12 +838,25 @@ fn handle_branch_deletion(
         return Ok(Some(branch.to_string()));
     }
 
-    // Try safe delete first, fall back to force if requested
+    // Try safe delete first, fall back to force if requested or confirmed
     match delete_branch(repo, branch, false) {
         Ok(()) => Ok(Some(branch.to_string())),
         Err(_) if force => {
             delete_branch(repo, branch, true)?;
             Ok(Some(branch.to_string()))
+        }
+        Err(_) if !non_interactive => {
+            let prompt = format!("Branch '{branch}' is not fully merged. Force-delete?");
+            let confirmed = dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()?;
+            if confirmed {
+                delete_branch(repo, branch, true)?;
+                Ok(Some(branch.to_string()))
+            } else {
+                Ok(None)
+            }
         }
         Err(e) => {
             output::print_warning(&format!(
@@ -2036,6 +2049,41 @@ fn create_worktree_with_recovery(
                 }
             }
         }
+        Err(ref e) if is_branch_exists_error(e).is_some() => {
+            let branch = is_branch_exists_error(e).unwrap();
+
+            if non_interactive {
+                return Err(format!(
+                    "Branch '{branch}' already exists. \
+                     Use a different branch name or delete it first."
+                )
+                .into());
+            }
+
+            // Interactive recovery
+            match interactive::prompt_branch_exists_recovery(&branch)? {
+                interactive::BranchExistsAction::UseExisting => {
+                    println!("Using existing branch '{branch}'...");
+                    let reuse_opts = WorktreeCreateOptions {
+                        branch: Some(branch),
+                        new_branch: None,
+                        detach: options.detach,
+                        force: options.force,
+                    };
+                    create_worktree(repo, path, &reuse_opts)?;
+                    Ok(())
+                }
+                interactive::BranchExistsAction::DeleteAndCreate => {
+                    println!("Deleting branch '{branch}' and retrying...");
+                    delete_branch(repo, &branch, true)?;
+                    create_worktree(repo, path, options)?;
+                    Ok(())
+                }
+                interactive::BranchExistsAction::Cancel => {
+                    Err("Worktree creation cancelled.".into())
+                }
+            }
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -2047,6 +2095,24 @@ fn is_stale_worktree_error(err: &GitError) -> bool {
             .message()
             .contains("is a missing but already registered worktree"),
         _ => false,
+    }
+}
+
+/// Check if a `GitError` is a "branch already exists" error.
+///
+/// Returns the branch name if the error matches, `None` otherwise.
+fn is_branch_exists_error(err: &GitError) -> Option<String> {
+    match err {
+        GitError::WorktreeCreateError { source, .. } => {
+            let msg = source.message();
+            if msg.contains("a branch named") && msg.contains("already exists") {
+                // Extract branch name from: "a branch named 'foo' already exists"
+                msg.split('\'').nth(1).map(String::from)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -3362,6 +3428,126 @@ mod tests {
         assert!(
             !stdout.contains("unmerged-force-branch"),
             "unmerged branch should be force-deleted"
+        );
+    }
+
+    #[test]
+    fn test_handle_branch_deletion_unmerged_non_interactive_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        // Create a worktree with an unmerged branch, add a commit, remove worktree
+        let wt_path = dir.path().join("unmerged-wt2");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "unmerged-skip-branch"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(wt_path.join("extra.txt"), "extra").unwrap();
+        Command::new("git")
+            .args(["add", "extra.txt"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "unmerged work"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt_path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+
+        // Always policy, non-interactive, no force — should warn and skip
+        let result = handle_branch_deletion(
+            &repo,
+            "unmerged-skip-branch",
+            BranchDeletePolicy::Always,
+            true, // non_interactive
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "unmerged branch without --force in non-interactive mode should be skipped"
+        );
+
+        // Branch should still exist
+        let output = Command::new("git")
+            .args(["branch", "--list", "unmerged-skip-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("unmerged-skip-branch"),
+            "branch should still exist when skipped"
+        );
+    }
+
+    #[test]
+    fn test_is_branch_exists_error_matches() {
+        let err = GitError::WorktreeCreateError {
+            path: PathBuf::from("/tmp/test"),
+            source: git2::Error::from_str(
+                "Preparing worktree (new branch 'my-feature')\n\
+                 fatal: a branch named 'my-feature' already exists",
+            ),
+        };
+        let result = is_branch_exists_error(&err);
+        assert_eq!(result, Some("my-feature".to_string()));
+    }
+
+    #[test]
+    fn test_is_branch_exists_error_no_match() {
+        let err = GitError::WorktreeCreateError {
+            path: PathBuf::from("/tmp/test"),
+            source: git2::Error::from_str("fatal: is a missing but already registered worktree"),
+        };
+        assert!(is_branch_exists_error(&err).is_none());
+
+        // Non-WorktreeCreateError variant
+        let err2 = GitError::WorktreeListError(git2::Error::from_str("something"));
+        assert!(is_branch_exists_error(&err2).is_none());
+    }
+
+    #[test]
+    fn test_create_worktree_branch_exists_non_interactive_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_repo(dir.path());
+
+        // Create a branch that will conflict
+        Command::new("git")
+            .args(["branch", "existing-branch"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let repo = worktree_setup_git::open_repo(dir.path()).unwrap();
+        let wt_path = dir.path().join("new-wt");
+        let options = WorktreeCreateOptions {
+            branch: Some("master".to_string()),
+            new_branch: Some("existing-branch".to_string()),
+            detach: false,
+            force: false,
+        };
+
+        // Non-interactive should return an error, not prompt
+        let result = create_worktree_with_recovery(&repo, &wt_path, &options, true);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already exists"),
+            "error should mention branch already exists, got: {err_msg}"
         );
     }
 }

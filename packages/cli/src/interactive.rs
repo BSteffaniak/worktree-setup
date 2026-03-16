@@ -1127,6 +1127,48 @@ pub fn prompt_stale_worktree_recovery() -> io::Result<StaleWorktreeAction> {
     })
 }
 
+/// Recovery action when a branch already exists during worktree creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchExistsAction {
+    /// Use the existing branch instead of creating a new one.
+    UseExisting,
+    /// Delete the existing branch and retry creation.
+    DeleteAndCreate,
+    /// Cancel and return the original error.
+    Cancel,
+}
+
+/// Prompt the user for how to handle an existing branch conflict.
+///
+/// Shown when `git worktree add -b <branch>` fails because a branch
+/// with that name already exists.
+///
+/// # Errors
+///
+/// * If the terminal prompt fails
+#[must_use = "caller must act on the chosen recovery action"]
+pub fn prompt_branch_exists_recovery(branch: &str) -> io::Result<BranchExistsAction> {
+    let options = [
+        "Use the existing branch",
+        "Delete the branch and create fresh",
+        "Cancel",
+    ];
+
+    let choice = Select::new()
+        .with_prompt(format!(
+            "Branch '{branch}' already exists. What would you like to do?"
+        ))
+        .items(options)
+        .default(0)
+        .interact()?;
+
+    Ok(match choice {
+        0 => BranchExistsAction::UseExisting,
+        1 => BranchExistsAction::DeleteAndCreate,
+        _ => BranchExistsAction::Cancel,
+    })
+}
+
 /// Result of the setup operations prompt.
 #[derive(Debug, Clone)]
 pub struct SetupOperationChoices {

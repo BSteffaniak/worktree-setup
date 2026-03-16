@@ -366,6 +366,9 @@ If neither file exists, defaults are used. Example:
 ```toml
 [remove]
 branch_delete = "ASK"
+
+[security]
+allow_path_escape = false
 ```
 
 ### Branch Delete Policy
@@ -378,19 +381,30 @@ Controls whether local branches are deleted after removing a worktree:
 | `ALWAYS` | Delete without asking               |
 | `NEVER`  | Never delete, don't ask             |
 
+### Security
+
+Controls containment enforcement for file operations:
+
+| Field               | Type | Default | Description                                          |
+| ------------------- | ---- | ------- | ---------------------------------------------------- |
+| `allow_path_escape` | bool | `false` | When `false`, paths that escape the worktree are rejected |
+
+Per-config `allowPathEscape` overrides the global setting. When neither is set, containment is enforced (paths must stay within the worktree boundary).
+
 ## Config Reference
 
-| Field          | Type     | Description                                        |
-| -------------- | -------- | -------------------------------------------------- |
-| `description`  | string   | Label shown during config selection                |
-| `symlinks`     | string[] | Paths to symlink from master worktree              |
-| `copy`         | string[] | Paths to copy (skipped if target exists)           |
-| `overwrite`    | string[] | Paths to copy (always overwrites)                  |
-| `copyGlob`     | string[] | Glob patterns to copy                              |
-| `copyUnstaged` | bool     | Copy modified/untracked files from master worktree |
-| `templates`    | array    | Copy source to target if target doesn't exist      |
-| `postSetup`    | string[] | Commands to run after setup                        |
-| `clean`        | string[] | Paths and glob patterns to delete with `clean`     |
+| Field             | Type     | Description                                        |
+| ----------------- | -------- | -------------------------------------------------- |
+| `description`     | string   | Label shown during config selection                |
+| `symlinks`        | string[] | Paths to symlink from master worktree              |
+| `copy`            | string[] | Paths to copy (skipped if target exists)           |
+| `overwrite`       | string[] | Paths to copy (always overwrites)                  |
+| `copyGlob`        | string[] | Glob patterns to copy                              |
+| `copyUnstaged`    | bool     | Copy modified/untracked files from master worktree |
+| `templates`       | array    | Copy source to target if target doesn't exist      |
+| `postSetup`       | string[] | Commands to run after setup                        |
+| `clean`           | string[] | Paths and glob patterns to delete with `clean`     |
+| `allowPathEscape` | bool     | Allow paths to escape the worktree boundary        |
 
 **Path resolution:** All paths are relative to the config file's directory by default. Prefix with `/` for repo-root-relative paths (e.g., `"/.envrc"` → `<repo-root>/.envrc`).
 

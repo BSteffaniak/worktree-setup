@@ -47,6 +47,20 @@ pub struct RemoveConfig {
     pub branch_delete: BranchDeletePolicy,
 }
 
+/// Security-related configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Allow file operations to reference paths outside the worktree boundary.
+    ///
+    /// By default (`false`), all resolved paths are containment-checked:
+    /// they must be inside the target worktree directory. Set to `true` to
+    /// disable this globally.
+    ///
+    /// Individual configs can override this with `allowPathEscape = true`.
+    #[serde(default)]
+    pub allow_path_escape: bool,
+}
+
 /// Global configuration for worktree-setup.
 ///
 /// Loaded from an optional global file and an optional repo-level file.
@@ -56,6 +70,10 @@ pub struct GlobalConfig {
     /// Settings for the `remove` subcommand.
     #[serde(default)]
     pub remove: RemoveConfig,
+
+    /// Security-related settings.
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl GlobalConfig {
@@ -65,6 +83,7 @@ impl GlobalConfig {
     /// layer repo-level config on top of global config.
     pub const fn merge(&mut self, other: &Self) {
         self.remove.branch_delete = other.remove.branch_delete;
+        self.security.allow_path_escape = other.security.allow_path_escape;
     }
 }
 
@@ -219,6 +238,7 @@ branch_delete = "NEVER"
             remove: RemoveConfig {
                 branch_delete: BranchDeletePolicy::Always,
             },
+            ..Default::default()
         };
         base.merge(&overlay);
         assert_eq!(base.remove.branch_delete, BranchDeletePolicy::Always);
@@ -296,5 +316,34 @@ value = 42
         // deserialization is lenient — unknown fields are ignored.
         let config: GlobalConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.remove.branch_delete, BranchDeletePolicy::Ask);
+    }
+
+    #[test]
+    fn default_security_allows_no_path_escape() {
+        let config = GlobalConfig::default();
+        assert!(!config.security.allow_path_escape);
+    }
+
+    #[test]
+    fn parse_security_allow_path_escape() {
+        let toml_str = r"
+[security]
+allow_path_escape = true
+";
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.security.allow_path_escape);
+    }
+
+    #[test]
+    fn merge_overrides_security() {
+        let mut base = GlobalConfig::default();
+        let overlay = GlobalConfig {
+            security: SecurityConfig {
+                allow_path_escape: true,
+            },
+            ..Default::default()
+        };
+        base.merge(&overlay);
+        assert!(base.security.allow_path_escape);
     }
 }

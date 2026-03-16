@@ -4,10 +4,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use worktree_setup_config::LoadedConfig;
 use worktree_setup_copy::count_files_with_progress;
+use worktree_setup_glob::{GlobResolverOptions, is_glob_pattern, resolve_glob};
 
 use crate::ApplyConfigOptions;
 use crate::error::OperationError;
@@ -92,6 +94,22 @@ fn resolve_path(base: &Path, config_relative_dir: &Path, path: &str) -> (PathBuf
     )
 }
 
+/// Check whether a resolved path escapes the containment boundary.
+///
+/// Returns `true` if containment is enforced and the canonical form of
+/// `path` is not a descendant of `containment_root`.
+fn escapes_containment(path: &Path, containment_root: Option<&PathBuf>) -> bool {
+    let Some(root) = containment_root else {
+        return false; // containment not enforced
+    };
+    let Ok(canonical) = path.canonicalize() else {
+        // If we can't canonicalize (e.g., path doesn't exist yet), check
+        // the parent directory instead — the target might not exist yet.
+        return false;
+    };
+    !canonical.starts_with(root)
+}
+
 /// Plan all operations for a config without executing.
 ///
 /// This enumerates all operations that would be performed, along with file counts
@@ -128,6 +146,11 @@ struct PlanContext<'a, F> {
     main_worktree: &'a Path,
     target_worktree: &'a Path,
     overwrite: bool,
+    /// Canonical containment root for path-escape checks.
+    ///
+    /// When `Some`, resolved paths must be descendants of this root.
+    /// When `None`, containment is not enforced (path escape allowed).
+    containment_root: Option<PathBuf>,
     on_progress: &'a F,
     total_ops: usize,
 }
@@ -169,6 +192,12 @@ where
         .strip_prefix(main_worktree)
         .unwrap_or(&config.config_dir);
 
+    let containment_root = if options.allow_path_escape {
+        None
+    } else {
+        main_worktree.canonicalize().ok()
+    };
+
     let total_ops = config.config.symlinks.len()
         + config.config.copy.len()
         + config.config.overwrite.len()
@@ -180,6 +209,7 @@ where
         main_worktree,
         target_worktree,
         overwrite: options.overwrite_existing,
+        containment_root,
         on_progress,
         total_ops,
     };
@@ -202,7 +232,7 @@ where
         &ctx,
         &mut current_op,
         &config.config.copy_glob,
-    )?);
+    ));
     operations.extend(plan_template_ops(
         &ctx,
         &mut current_op,
@@ -231,17 +261,24 @@ where
 
         (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
-        let (will_skip, skip_reason, force) = if !source.exists() {
-            (true, Some("not found".to_string()), false)
-        } else if target.exists() || target.is_symlink() {
-            if ctx.overwrite {
-                (false, None, true)
+        let (will_skip, skip_reason, force) =
+            if escapes_containment(&source, ctx.containment_root.as_ref()) {
+                (
+                    true,
+                    Some("path escapes worktree boundary".to_string()),
+                    false,
+                )
+            } else if !source.exists() {
+                (true, Some("not found".to_string()), false)
+            } else if target.exists() || target.is_symlink() {
+                if ctx.overwrite {
+                    (false, None, true)
+                } else {
+                    (true, Some("exists".to_string()), false)
+                }
             } else {
-                (true, Some("exists".to_string()), false)
-            }
-        } else {
-            (false, None, false)
-        };
+                (false, None, false)
+            };
 
         operations.push(PlannedOperation {
             display_path: display_str,
@@ -278,16 +315,44 @@ where
 
         (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
-        let (will_skip, skip_reason, file_count, is_directory, op_type) = if !source.exists() {
-            (
-                true,
-                Some("not found".to_string()),
-                0,
-                false,
-                OperationType::Copy,
-            )
-        } else if target.exists() {
-            if ctx.overwrite {
+        let (will_skip, skip_reason, file_count, is_directory, op_type) =
+            if escapes_containment(&source, ctx.containment_root.as_ref()) {
+                (
+                    true,
+                    Some("path escapes worktree boundary".to_string()),
+                    0,
+                    false,
+                    OperationType::Copy,
+                )
+            } else if !source.exists() {
+                (
+                    true,
+                    Some("not found".to_string()),
+                    0,
+                    false,
+                    OperationType::Copy,
+                )
+            } else if target.exists() {
+                if ctx.overwrite {
+                    let is_dir = source.is_dir();
+                    let count = if is_dir {
+                        count_files_with_progress(&source, |n| {
+                            (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
+                        })
+                    } else {
+                        1
+                    };
+                    (false, None, count, is_dir, OperationType::Overwrite)
+                } else {
+                    (
+                        true,
+                        Some("exists".to_string()),
+                        0,
+                        false,
+                        OperationType::Copy,
+                    )
+                }
+            } else {
                 let is_dir = source.is_dir();
                 let count = if is_dir {
                     count_files_with_progress(&source, |n| {
@@ -296,27 +361,8 @@ where
                 } else {
                     1
                 };
-                (false, None, count, is_dir, OperationType::Overwrite)
-            } else {
-                (
-                    true,
-                    Some("exists".to_string()),
-                    0,
-                    false,
-                    OperationType::Copy,
-                )
-            }
-        } else {
-            let is_dir = source.is_dir();
-            let count = if is_dir {
-                count_files_with_progress(&source, |n| {
-                    (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
-                })
-            } else {
-                1
+                (false, None, count, is_dir, OperationType::Copy)
             };
-            (false, None, count, is_dir, OperationType::Copy)
-        };
 
         operations.push(PlannedOperation {
             display_path: display_str,
@@ -354,19 +400,27 @@ where
 
         (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, None);
 
-        let (will_skip, skip_reason, file_count, is_directory) = if source.exists() {
-            let is_dir = source.is_dir();
-            let count = if is_dir {
-                count_files_with_progress(&source, |n| {
-                    (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
-                })
+        let (will_skip, skip_reason, file_count, is_directory) =
+            if escapes_containment(&source, ctx.containment_root.as_ref()) {
+                (
+                    true,
+                    Some("path escapes worktree boundary".to_string()),
+                    0,
+                    false,
+                )
+            } else if source.exists() {
+                let is_dir = source.is_dir();
+                let count = if is_dir {
+                    count_files_with_progress(&source, |n| {
+                        (ctx.on_progress)(*current_op, ctx.total_ops, &display_str, Some(n));
+                    })
+                } else {
+                    1
+                };
+                (false, None, count, is_dir)
             } else {
-                1
+                (true, Some("not found".to_string()), 0, false)
             };
-            (false, None, count, is_dir)
-        } else {
-            (true, Some("not found".to_string()), 0, false)
-        };
 
         operations.push(PlannedOperation {
             display_path: display_str,
@@ -384,24 +438,54 @@ where
     operations
 }
 
+/// Determine the skip/overwrite status for a glob target path.
+fn glob_target_status(target: &Path, overwrite: bool) -> (bool, Option<String>, OperationType) {
+    if target.exists() {
+        if overwrite {
+            (false, None, OperationType::Overwrite)
+        } else {
+            (true, Some("exists".to_string()), OperationType::CopyGlob)
+        }
+    } else {
+        (false, None, OperationType::CopyGlob)
+    }
+}
+
 /// Plan glob copy operations.
 ///
-/// # Errors
+/// Uses `worktree_setup_glob::resolve_glob` for directory traversal with
+/// `walkdir` + `globset`, providing:
 ///
-/// * If glob pattern matching fails
+/// * Consistent symlink handling (`follow_links(false)`)
+/// * Directory pruning (matched directories are not descended into)
+/// * Containment enforcement (paths outside the worktree boundary are skipped)
+/// * Deduplication across patterns via a shared `seen` set
 fn plan_glob_ops<F>(
     ctx: &PlanContext<'_, F>,
     current_op: &mut usize,
     patterns: &[String],
-) -> Result<Vec<PlannedOperation>, OperationError>
+) -> Vec<PlannedOperation>
 where
     F: Fn(usize, usize, &str, Option<u64>),
 {
     let mut operations = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    // Build options: skip symlinks always, enforce containment if we have a root
+    let options = GlobResolverOptions {
+        skip_symlinks: true,
+        enforce_containment: ctx.containment_root.is_some(),
+    };
+
+    // Fallback containment root (only used when enforce_containment is true)
+    let empty_root = PathBuf::new();
+    let containment_root = ctx.containment_root.as_ref().unwrap_or(&empty_root);
 
     for pattern in patterns {
         *current_op += 1;
 
+        // Determine search directory and display prefix based on root-relative
+        // vs config-relative path
         let (search_dir, display_prefix, glob_pattern) = pattern.strip_prefix('/').map_or_else(
             || {
                 (
@@ -413,53 +497,148 @@ where
             |stripped| (ctx.main_worktree.to_path_buf(), PathBuf::new(), stripped),
         );
 
-        let full_pattern = search_dir.join(glob_pattern).to_string_lossy().to_string();
-
         (ctx.on_progress)(*current_op, ctx.total_ops, pattern, None);
 
-        for entry in glob::glob(&full_pattern)? {
-            if let Ok(source) = entry
-                && let Ok(rel_path) = source.strip_prefix(&search_dir)
-            {
-                let target = if pattern.starts_with('/') {
-                    ctx.target_worktree.join(rel_path)
-                } else {
-                    ctx.target_worktree
-                        .join(ctx.config_relative_dir)
-                        .join(rel_path)
-                };
-                let display_path = if display_prefix.as_os_str().is_empty() {
-                    rel_path.to_path_buf()
-                } else {
-                    display_prefix.join(rel_path)
-                };
-
-                let (will_skip, skip_reason, op_type) = if target.exists() {
-                    if ctx.overwrite {
-                        (false, None, OperationType::Overwrite)
-                    } else {
-                        (true, Some("exists".to_string()), OperationType::CopyGlob)
-                    }
-                } else {
-                    (false, None, OperationType::CopyGlob)
-                };
-
-                operations.push(PlannedOperation {
-                    display_path: display_path.to_string_lossy().to_string(),
-                    operation_type: op_type,
-                    source,
-                    target,
-                    file_count: 1,
-                    is_directory: false,
-                    will_skip,
-                    skip_reason,
-                    force_overwrite: false,
-                });
-            }
+        if is_glob_pattern(glob_pattern) {
+            plan_glob_pattern(
+                ctx,
+                &mut operations,
+                &mut seen,
+                &options,
+                containment_root,
+                pattern,
+                &search_dir,
+                &display_prefix,
+                glob_pattern,
+            );
+        } else {
+            plan_glob_exact(
+                ctx,
+                &mut operations,
+                &mut seen,
+                &search_dir,
+                &display_prefix,
+                pattern,
+                glob_pattern,
+            );
         }
     }
 
-    Ok(operations)
+    operations
+}
+
+/// Plan a single exact (non-glob) path within `plan_glob_ops`.
+fn plan_glob_exact<F>(
+    ctx: &PlanContext<'_, F>,
+    operations: &mut Vec<PlannedOperation>,
+    seen: &mut BTreeSet<PathBuf>,
+    search_dir: &Path,
+    display_prefix: &Path,
+    pattern: &str,
+    glob_pattern: &str,
+) where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let source = search_dir.join(glob_pattern);
+    if !source.exists() {
+        return;
+    }
+
+    // Containment check on exact path
+    if escapes_containment(&source, ctx.containment_root.as_ref()) {
+        log::warn!("copyGlob exact path escapes worktree boundary, skipping: {pattern}");
+        return;
+    }
+
+    // Dedup via canonical path
+    if let Ok(canonical) = source.canonicalize()
+        && !seen.insert(canonical)
+    {
+        return;
+    }
+
+    let rel_path = glob_pattern;
+    let target = if pattern.starts_with('/') {
+        ctx.target_worktree.join(rel_path)
+    } else {
+        ctx.target_worktree
+            .join(ctx.config_relative_dir)
+            .join(rel_path)
+    };
+    let display_path = if display_prefix.as_os_str().is_empty() {
+        PathBuf::from(rel_path)
+    } else {
+        display_prefix.join(rel_path)
+    };
+
+    let (will_skip, skip_reason, op_type) = glob_target_status(&target, ctx.overwrite);
+
+    operations.push(PlannedOperation {
+        display_path: display_path.to_string_lossy().to_string(),
+        operation_type: op_type,
+        source,
+        target,
+        file_count: 1,
+        is_directory: false,
+        will_skip,
+        skip_reason,
+        force_overwrite: false,
+    });
+}
+
+/// Plan a glob pattern within `plan_glob_ops` using `walkdir` + `globset`.
+#[allow(clippy::too_many_arguments)]
+fn plan_glob_pattern<F>(
+    ctx: &PlanContext<'_, F>,
+    operations: &mut Vec<PlannedOperation>,
+    seen: &mut BTreeSet<PathBuf>,
+    options: &GlobResolverOptions,
+    containment_root: &Path,
+    pattern: &str,
+    search_dir: &Path,
+    display_prefix: &Path,
+    glob_pattern: &str,
+) where
+    F: Fn(usize, usize, &str, Option<u64>),
+{
+    let resolved = resolve_glob(glob_pattern, search_dir, containment_root, seen, options);
+
+    let canonical_search = search_dir
+        .canonicalize()
+        .unwrap_or_else(|_| search_dir.to_path_buf());
+
+    for entry in &resolved {
+        let Ok(rel_path) = entry.canonical.strip_prefix(&canonical_search) else {
+            continue;
+        };
+
+        let target = if pattern.starts_with('/') {
+            ctx.target_worktree.join(rel_path)
+        } else {
+            ctx.target_worktree
+                .join(ctx.config_relative_dir)
+                .join(rel_path)
+        };
+        let display_path = if display_prefix.as_os_str().is_empty() {
+            rel_path.to_path_buf()
+        } else {
+            display_prefix.join(rel_path)
+        };
+
+        let (will_skip, skip_reason, op_type) = glob_target_status(&target, ctx.overwrite);
+
+        operations.push(PlannedOperation {
+            display_path: display_path.to_string_lossy().to_string(),
+            operation_type: op_type,
+            source: entry.canonical.clone(),
+            target,
+            file_count: 1,
+            is_directory: false,
+            will_skip,
+            skip_reason,
+            force_overwrite: false,
+        });
+    }
 }
 
 /// Plan template operations.
@@ -486,17 +665,24 @@ where
 
         (ctx.on_progress)(*current_op, ctx.total_ops, &display_path, None);
 
-        let (will_skip, skip_reason, op_type) = if !source.exists() {
-            (true, Some("not found".to_string()), OperationType::Template)
-        } else if target.exists() {
-            if ctx.overwrite {
-                (false, None, OperationType::Overwrite)
+        let (will_skip, skip_reason, op_type) =
+            if escapes_containment(&source, ctx.containment_root.as_ref()) {
+                (
+                    true,
+                    Some("path escapes worktree boundary".to_string()),
+                    OperationType::Template,
+                )
+            } else if !source.exists() {
+                (true, Some("not found".to_string()), OperationType::Template)
+            } else if target.exists() {
+                if ctx.overwrite {
+                    (false, None, OperationType::Overwrite)
+                } else {
+                    (true, Some("exists".to_string()), OperationType::Template)
+                }
             } else {
-                (true, Some("exists".to_string()), OperationType::Template)
-            }
-        } else {
-            (false, None, OperationType::Template)
-        };
+                (false, None, OperationType::Template)
+            };
 
         operations.push(PlannedOperation {
             display_path,
@@ -562,6 +748,7 @@ pub fn plan_unstaged_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use tempfile::TempDir;
     use worktree_setup_config::Config;
@@ -858,5 +1045,244 @@ mod tests {
             ops[0].target,
             target_dir.path().join("apps/myapp/.env.local")
         );
+    }
+
+    #[test]
+    fn test_containment_symlink_escapes_boundary() {
+        let root = TempDir::new().unwrap();
+        let main_dir = root.path().join("main");
+        let outer_dir = root.path().join("outer");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&main_dir).unwrap();
+        fs::create_dir_all(&outer_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        // Create a file outside the main worktree
+        fs::write(outer_dir.join("secret.txt"), "secret").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                symlinks: vec!["../outer/secret.txt".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.join("worktree.config.toml"),
+            config_dir: main_dir.clone(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        // Default: containment enforced (allow_path_escape = false)
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, &main_dir, &target_dir, &options).unwrap();
+
+        // The operation should be planned but skipped due to containment
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].will_skip);
+        assert_eq!(
+            ops[0].skip_reason,
+            Some("path escapes worktree boundary".to_string())
+        );
+    }
+
+    #[test]
+    fn test_containment_copy_escapes_boundary() {
+        let root = TempDir::new().unwrap();
+        let main_dir = root.path().join("main");
+        let outer_dir = root.path().join("outer");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&main_dir).unwrap();
+        fs::create_dir_all(&outer_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        fs::write(outer_dir.join("secret.txt"), "secret").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy: vec!["../outer/secret.txt".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.join("worktree.config.toml"),
+            config_dir: main_dir.clone(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, &main_dir, &target_dir, &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].will_skip);
+        assert_eq!(
+            ops[0].skip_reason,
+            Some("path escapes worktree boundary".to_string())
+        );
+    }
+
+    #[test]
+    fn test_containment_overwrite_escapes_boundary() {
+        let root = TempDir::new().unwrap();
+        let main_dir = root.path().join("main");
+        let outer_dir = root.path().join("outer");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&main_dir).unwrap();
+        fs::create_dir_all(&outer_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        fs::write(outer_dir.join("secret.txt"), "secret").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                overwrite: vec!["../outer/secret.txt".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.join("worktree.config.toml"),
+            config_dir: main_dir.clone(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, &main_dir, &target_dir, &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].will_skip);
+        assert_eq!(
+            ops[0].skip_reason,
+            Some("path escapes worktree boundary".to_string())
+        );
+    }
+
+    #[test]
+    fn test_containment_template_escapes_boundary() {
+        let root = TempDir::new().unwrap();
+        let main_dir = root.path().join("main");
+        let outer_dir = root.path().join("outer");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&main_dir).unwrap();
+        fs::create_dir_all(&outer_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        fs::write(outer_dir.join("template.txt"), "secret").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                templates: vec![worktree_setup_config::TemplateMapping {
+                    source: "../outer/template.txt".to_string(),
+                    target: "output.txt".to_string(),
+                }],
+                ..Default::default()
+            },
+            config_path: main_dir.join("worktree.config.toml"),
+            config_dir: main_dir.clone(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, &main_dir, &target_dir, &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].will_skip);
+        assert_eq!(
+            ops[0].skip_reason,
+            Some("path escapes worktree boundary".to_string())
+        );
+    }
+
+    #[test]
+    fn test_containment_allow_path_escape_permits_outside_paths() {
+        let root = TempDir::new().unwrap();
+        let main_dir = root.path().join("main");
+        let outer_dir = root.path().join("outer");
+        let target_dir = TempDir::new().unwrap();
+        fs::create_dir_all(&main_dir).unwrap();
+        fs::create_dir_all(&outer_dir).unwrap();
+
+        fs::write(outer_dir.join("secret.txt"), "secret").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy: vec!["../outer/secret.txt".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.join("worktree.config.toml"),
+            config_dir: main_dir.clone(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        // Allow path escape
+        let options = ApplyConfigOptions {
+            allow_path_escape: true,
+            ..Default::default()
+        };
+        let ops = plan_operations(&config, &main_dir, target_dir.path(), &options).unwrap();
+
+        assert_eq!(ops.len(), 1);
+        // Should NOT be skipped — path escape allowed and target is separate
+        assert!(!ops[0].will_skip);
+    }
+
+    #[test]
+    fn test_plan_glob_ops_with_walkdir() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create files matching a glob pattern
+        fs::write(main_dir.path().join("file1.txt"), "a").unwrap();
+        fs::write(main_dir.path().join("file2.txt"), "b").unwrap();
+        fs::write(main_dir.path().join("file3.log"), "c").unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy_glob: vec!["*.txt".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.path().join("worktree.config.toml"),
+            config_dir: main_dir.path().to_path_buf(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        // Should match file1.txt and file2.txt, but not file3.log
+        assert_eq!(ops.len(), 2);
+        assert!(
+            ops.iter()
+                .all(|op| op.operation_type == OperationType::CopyGlob)
+        );
+
+        let display_paths: BTreeSet<&str> = ops.iter().map(|op| op.display_path.as_str()).collect();
+        assert!(display_paths.contains("file1.txt"));
+        assert!(display_paths.contains("file2.txt"));
+    }
+
+    #[test]
+    fn test_plan_glob_ops_nested_pattern() {
+        let main_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+
+        // Create nested directory structure
+        fs::create_dir_all(main_dir.path().join("a/dist")).unwrap();
+        fs::write(main_dir.path().join("a/dist/bundle.js"), "code").unwrap();
+        fs::create_dir_all(main_dir.path().join("b/dist")).unwrap();
+        fs::write(main_dir.path().join("b/dist/bundle.js"), "code").unwrap();
+        fs::create_dir_all(main_dir.path().join("c/src")).unwrap();
+
+        let config = LoadedConfig {
+            config: Config {
+                copy_glob: vec!["**/dist".to_string()],
+                ..Default::default()
+            },
+            config_path: main_dir.path().join("worktree.config.toml"),
+            config_dir: main_dir.path().to_path_buf(),
+            relative_path: "worktree.config.toml".to_string(),
+        };
+
+        let options = ApplyConfigOptions::default();
+        let ops = plan_operations(&config, main_dir.path(), target_dir.path(), &options).unwrap();
+
+        // Should match a/dist and b/dist directories
+        assert_eq!(ops.len(), 2);
+
+        let display_paths: BTreeSet<&str> = ops.iter().map(|op| op.display_path.as_str()).collect();
+        assert!(display_paths.contains("a/dist"));
+        assert!(display_paths.contains("b/dist"));
     }
 }

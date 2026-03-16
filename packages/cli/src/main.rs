@@ -190,6 +190,7 @@ fn execute_file_operations(
     let options = ApplyConfigOptions {
         copy_unstaged: copy_unstaged_override,
         overwrite_existing,
+        allow_path_escape: false,
     };
 
     // Calculate total operations across all configs for scanning progress
@@ -591,65 +592,6 @@ fn resolve_setup_target(cwd: &Path, target: Option<&PathBuf>) -> PathBuf {
 
 // ─── Subcommand: clean ──────────────────────────────────────────────────────
 
-/// Check whether a pattern string contains glob metacharacters.
-fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
-}
-
-/// Calculate the disk usage of a path (file or directory, recursive).
-///
-/// Uses `walkdir` with `follow_links(false)` to avoid traversing symlinks.
-/// On Unix, reports actual disk usage via `st_blocks * 512` (matching `du`
-/// and `ncdu` behavior). On other platforms, falls back to apparent size.
-fn path_size(path: &Path) -> u64 {
-    if path.is_symlink() {
-        return path.symlink_metadata().map_or(0, |m| file_disk_usage(&m));
-    }
-    if path.is_file() {
-        return path.metadata().map_or(0, |m| file_disk_usage(&m));
-    }
-    if !path.is_dir() {
-        return 0;
-    }
-
-    let mut total = 0u64;
-
-    for entry in walkdir::WalkDir::new(path).follow_links(false).min_depth(1) {
-        let Ok(entry) = entry else {
-            continue;
-        };
-
-        // Skip directories and symlinks — we only count regular file sizes
-        let ft = entry.file_type();
-        if ft.is_dir() || ft.is_symlink() {
-            continue;
-        }
-
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-
-        total += file_disk_usage(&meta);
-    }
-    total
-}
-
-/// Return the disk usage of a single file from its metadata.
-///
-/// On Unix, uses `st_blocks * 512` for actual disk usage.
-/// On other platforms, falls back to the file's apparent size.
-fn file_disk_usage(meta: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.blocks() * 512
-    }
-    #[cfg(not(unix))]
-    {
-        meta.len()
-    }
-}
-
 /// Resolve clean paths from selected configs into concrete items to delete.
 ///
 /// For each config's `clean` entries:
@@ -669,7 +611,11 @@ fn resolve_clean_paths(
     target_canonical: &Path,
     repo_root: &Path,
 ) -> Vec<(PathBuf, String)> {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut resolver = worktree_setup_glob::GlobResolver::new(
+        target_canonical.to_path_buf(),
+        worktree_setup_glob::GlobResolverOptions::default(),
+    );
+
     let mut results: Vec<(PathBuf, String)> = Vec::new();
 
     for config in selected_configs {
@@ -690,162 +636,27 @@ fn resolve_clean_paths(
                 || (pattern.as_str(), target_config_dir.clone()),
                 |stripped| (stripped, target_path.to_path_buf()),
             );
-            if is_glob_pattern(effective_pattern) {
-                resolve_clean_glob(
-                    effective_pattern,
-                    &base_dir,
-                    target_canonical,
-                    &mut seen,
-                    &mut results,
-                );
-            } else {
-                resolve_clean_exact(
-                    effective_pattern,
-                    &base_dir,
-                    target_canonical,
-                    &mut seen,
-                    &mut results,
-                );
+
+            let matched = resolver.resolve(effective_pattern, &base_dir);
+            for entry in matched {
+                results.push((entry.canonical, entry.display));
             }
         }
     }
 
     // Filter out paths that are descendants of other resolved paths.
-    // E.g., "**/dist" may match "node_modules/.bun/foo/dist" which is
-    // already inside "node_modules" — keep only the ancestor.
-    results
+    let as_resolved: Vec<worktree_setup_glob::ResolvedPath> = results
         .iter()
-        .filter(|(path, _)| {
-            !results
-                .iter()
-                .any(|(other, _)| other != path && path.starts_with(other))
+        .map(|(canonical, display)| worktree_setup_glob::ResolvedPath {
+            canonical: canonical.clone(),
+            display: display.clone(),
         })
-        .cloned()
+        .collect();
+    let filtered = worktree_setup_glob::filter_descendants(&as_resolved);
+    filtered
+        .into_iter()
+        .map(|r| (r.canonical, r.display))
         .collect()
-}
-
-/// Resolve a single exact clean path.
-fn resolve_clean_exact(
-    pattern: &str,
-    base_dir: &Path,
-    target_canonical: &Path,
-    seen: &mut std::collections::BTreeSet<PathBuf>,
-    results: &mut Vec<(PathBuf, String)>,
-) {
-    let candidate = base_dir.join(pattern);
-
-    if !candidate.exists() {
-        log::debug!(
-            "Clean path does not exist, skipping: {}",
-            candidate.display()
-        );
-        return;
-    }
-
-    let Ok(canonical) = candidate.canonicalize() else {
-        log::warn!("Could not canonicalize clean path: {}", candidate.display());
-        return;
-    };
-
-    if !canonical.starts_with(target_canonical) {
-        log::warn!("Clean path escapes target directory, skipping: {pattern}");
-        return;
-    }
-
-    if seen.insert(canonical.clone()) {
-        let relative = canonical.strip_prefix(target_canonical).map_or_else(
-            |_| candidate.to_string_lossy().to_string(),
-            |r| r.to_string_lossy().to_string(),
-        );
-        results.push((canonical, relative));
-    }
-}
-
-/// Resolve a glob clean pattern using `walkdir` + `globset`.
-///
-/// Walks the directory tree under `base_dir` with `follow_links(false)` to
-/// avoid traversing symlinks. Each entry's relative path is matched against
-/// the compiled glob pattern. When a directory matches, it is added to results
-/// and pruned (not recursed into) — this avoids walking into matched
-/// directories like `node_modules/` which may contain thousands of entries.
-fn resolve_clean_glob(
-    pattern: &str,
-    base_dir: &Path,
-    target_canonical: &Path,
-    seen: &mut std::collections::BTreeSet<PathBuf>,
-    results: &mut Vec<(PathBuf, String)>,
-) {
-    let glob = match globset::Glob::new(pattern) {
-        Ok(g) => g.compile_matcher(),
-        Err(e) => {
-            log::warn!("Invalid glob pattern '{pattern}': {e}");
-            return;
-        }
-    };
-
-    let mut it = walkdir::WalkDir::new(base_dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter();
-
-    loop {
-        let entry = match it.next() {
-            None => break,
-            Some(Err(e)) => {
-                log::debug!("Error during directory walk: {e}");
-                continue;
-            }
-            Some(Ok(entry)) => entry,
-        };
-
-        // Skip symlinks entirely — don't match or descend into them
-        if entry.file_type().is_symlink() {
-            continue;
-        }
-
-        let path = entry.path();
-
-        let Ok(relative) = path.strip_prefix(base_dir) else {
-            continue;
-        };
-
-        if !glob.is_match(relative) {
-            continue;
-        }
-
-        // We have a match — canonicalize and apply containment/dedup checks
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-
-        if !canonical.starts_with(target_canonical) {
-            log::warn!("Clean path escapes target directory, skipping: {pattern}");
-            continue;
-        }
-
-        // Skip if this path is inside an already-resolved path
-        if seen
-            .iter()
-            .any(|existing| canonical.starts_with(existing) && *existing != canonical)
-        {
-            continue;
-        }
-
-        if seen.insert(canonical.clone()) {
-            let display = canonical.strip_prefix(target_canonical).map_or_else(
-                |_| path.to_string_lossy().to_string(),
-                |r| r.to_string_lossy().to_string(),
-            );
-            results.push((canonical, display));
-        }
-
-        // If the match is a directory, prune it — don't recurse into it.
-        // This is the key performance optimization: e.g., after matching
-        // `node_modules/`, we skip the thousands of entries inside it.
-        if entry.file_type().is_dir() {
-            it.skip_current_dir();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,7 +1356,7 @@ fn resolve_single_worktree(
         .iter()
         .map(|(abs_path, rel_path)| {
             let is_dir = abs_path.is_dir();
-            let size = path_size(abs_path);
+            let size = worktree_setup_copy::disk_usage(abs_path);
             output::CleanItem {
                 relative_path: rel_path.clone(),
                 is_dir,
@@ -1646,7 +1457,7 @@ fn resolve_multi_worktree_clean(
             .iter()
             .map(|(abs_path, rel_path)| {
                 let is_dir = abs_path.is_dir();
-                let size = path_size(abs_path);
+                let size = worktree_setup_copy::disk_usage(abs_path);
                 output::CleanItem {
                     relative_path: rel_path.clone(),
                     is_dir,
@@ -1832,7 +1643,7 @@ fn run_clean_single(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> 
         .iter()
         .map(|(abs_path, rel_path)| {
             let is_dir = abs_path.is_dir();
-            let size = path_size(abs_path);
+            let size = worktree_setup_copy::disk_usage(abs_path);
             output::CleanItem {
                 relative_path: rel_path.clone(),
                 is_dir,
@@ -2583,19 +2394,6 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // ─── is_glob_pattern ────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_glob_pattern() {
-        assert!(!is_glob_pattern("node_modules"));
-        assert!(!is_glob_pattern(".turbo"));
-        assert!(!is_glob_pattern("path/to/dir"));
-        assert!(is_glob_pattern("**/dist"));
-        assert!(is_glob_pattern("*.log"));
-        assert!(is_glob_pattern("src/[ab]"));
-        assert!(is_glob_pattern("dir?name"));
-    }
-
     // ─── format_size ────────────────────────────────────────────────────
 
     #[test]
@@ -3010,63 +2808,6 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].1.ends_with("node_modules"));
         assert!(!resolved[0].1.contains("pkg"));
-    }
-
-    #[test]
-    fn test_path_size_does_not_follow_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-
-        // Create a real directory with a file
-        let real_dir = base.join("real");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        std::fs::write(real_dir.join("file.txt"), "hello world").unwrap(); // 11 bytes
-
-        // Create a symlink to the real directory
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&real_dir, base.join("link")).unwrap();
-
-            // Create a parent dir containing both real and link
-            let parent = base.join("parent");
-            std::fs::create_dir_all(&parent).unwrap();
-            std::os::unix::fs::symlink(&real_dir, parent.join("link_inside")).unwrap();
-            std::fs::write(parent.join("own_file.txt"), "data").unwrap(); // 4 bytes
-
-            let size = path_size(&parent);
-            // Should only count own_file.txt, NOT follow link_inside.
-            // On Unix, disk usage is block-rounded, so just verify it's
-            // roughly one block (the own_file.txt) and not two files' worth.
-            let real_dir_size = path_size(&real_dir);
-            assert!(size > 0);
-            assert!(
-                size < real_dir_size * 2,
-                "symlink target should not be counted"
-            );
-        }
-
-        // The real directory should be counted normally
-        let size = path_size(&real_dir);
-        assert!(size > 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_path_size_counts_hardlinks_fully() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-
-        // Create a file
-        let original = base.join("original.txt");
-        std::fs::write(&original, "hardlink test data").unwrap(); // 18 bytes
-
-        // Create a hardlink to the same file
-        std::fs::hard_link(&original, base.join("hardlink.txt")).unwrap();
-
-        let size = path_size(base);
-        let single_size = path_size(&original);
-        // Both hardlinks should be counted (disk usage for each entry)
-        assert_eq!(size, single_size * 2);
     }
 
     // ─── worktree_clean_label ───────────────────────────────────────────

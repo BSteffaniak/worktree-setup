@@ -47,7 +47,7 @@ pub enum OperationError {
 
     /// Glob pattern error.
     #[error("Glob pattern error: {0}")]
-    GlobError(#[from] glob::PatternError),
+    GlobError(String),
 
     /// Git operation error.
     #[error("Git error: {0}")]

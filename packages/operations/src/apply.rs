@@ -34,6 +34,11 @@ pub struct ApplyConfigOptions {
     pub copy_unstaged: Option<bool>,
     /// Overwrite existing files instead of skipping them.
     pub overwrite_existing: bool,
+    /// Whether to allow paths to escape the worktree boundary.
+    ///
+    /// When `false` (default), resolved paths that escape the worktree
+    /// root are skipped with a `"path escapes worktree boundary"` reason.
+    pub allow_path_escape: bool,
 }
 
 /// Result of applying a configuration.

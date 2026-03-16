@@ -70,6 +70,18 @@ pub struct Config {
     /// value carries optional defaults and additional config patterns.
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileDefinition>,
+
+    /// Allow file operations to reference paths outside the worktree boundary.
+    ///
+    /// By default (`false`), all resolved paths are containment-checked:
+    /// they must be inside the target worktree directory. Set to `true` to
+    /// disable this check for this config (e.g., for referencing shared
+    /// caches or directories outside the worktree).
+    ///
+    /// Can also be set globally in the global config under `[security]`.
+    /// Per-config `true` overrides a global `false`.
+    #[serde(default)]
+    pub allow_path_escape: bool,
 }
 
 /// A loaded configuration with metadata.

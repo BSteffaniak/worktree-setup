@@ -454,7 +454,7 @@ fn glob_target_status(target: &Path, overwrite: bool) -> (bool, Option<String>, 
 /// Plan glob copy operations.
 ///
 /// Uses `worktree_setup_glob::resolve_glob` for directory traversal with
-/// `walkdir` + `globset`, providing:
+/// `jwalk` + `globset`, providing:
 ///
 /// * Consistent symlink handling (`follow_links(false)`)
 /// * Directory pruning (matched directories are not descended into)
@@ -475,6 +475,7 @@ where
     let options = GlobResolverOptions {
         skip_symlinks: true,
         enforce_containment: ctx.containment_root.is_some(),
+        ..Default::default()
     };
 
     // Fallback containment root (only used when enforce_containment is true)
@@ -593,7 +594,7 @@ fn plan_glob_exact<F>(
     });
 }
 
-/// Plan a glob pattern within `plan_glob_ops` using `walkdir` + `globset`.
+/// Plan a glob pattern within `plan_glob_ops` using `jwalk` + `globset`.
 #[allow(clippy::too_many_arguments)]
 fn plan_glob_pattern<F>(
     ctx: &PlanContext<'_, F>,

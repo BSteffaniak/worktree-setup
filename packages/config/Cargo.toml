@@ -22,6 +22,7 @@ swc_common = { workspace = true }
 swc_ts_fast_strip = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+worktree_setup_glob = { workspace = true }
 
 [features]
 default = []

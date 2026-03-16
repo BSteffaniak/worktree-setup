@@ -1,6 +1,6 @@
 [package]
 name = "worktree_setup_glob"
-description = "Glob pattern resolution with walkdir traversal for worktree-setup"
+description = "Glob pattern resolution with parallel directory traversal for worktree-setup"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,8 +12,8 @@ categories.workspace = true
 
 [dependencies]
 globset = { workspace = true }
+jwalk = { workspace = true }
 log = { workspace = true }
-walkdir = { workspace = true }
 
 [features]
 default = []

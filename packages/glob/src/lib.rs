@@ -1,4 +1,4 @@
-//! Glob pattern resolution with consistent `walkdir` + `globset` traversal.
+//! Glob pattern resolution with parallel `jwalk` + `globset` traversal.
 //!
 //! Provides a unified file-searching architecture for worktree-setup. All glob
 //! pattern resolution goes through this crate, ensuring consistent behavior:
@@ -7,6 +7,7 @@
 //! * Matched directories are pruned (not recursed into)
 //! * Resolved paths are containment-checked against a boundary root
 //! * Results are deduplicated by canonical path
+//! * Configurable directory skipping (e.g., `node_modules`, `.git`, `target`)
 //!
 //! # Examples
 //!
@@ -32,6 +33,6 @@
 mod resolve;
 
 pub use resolve::{
-    GlobResolver, GlobResolverOptions, ResolvedPath, filter_descendants, is_glob_pattern,
-    resolve_exact, resolve_glob,
+    DEFAULT_SKIP_DIRS, GlobResolver, GlobResolverOptions, ResolvedPath, filter_descendants,
+    is_glob_pattern, resolve_exact, resolve_glob,
 };

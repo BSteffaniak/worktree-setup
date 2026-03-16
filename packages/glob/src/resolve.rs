@@ -1,9 +1,21 @@
 //! Core glob resolution implementation.
 //!
-//! Uses `walkdir` for directory traversal and `globset` for pattern matching.
+//! Uses `jwalk` for parallel directory traversal and `globset` for pattern matching.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// Directories commonly skipped during filesystem traversal.
+///
+/// These directories tend to be very large and are almost never relevant
+/// to config discovery or file operations. Callers can pass this list
+/// via [`GlobResolverOptions::skip_dirs`] to avoid descending into them.
+///
+/// Includes:
+/// * `node_modules` — npm/pnpm/bun dependency trees
+/// * `.git` — git internal data
+/// * `target` — Rust/Cargo build artifacts
+pub const DEFAULT_SKIP_DIRS: &[&str] = &["node_modules", ".git", "target"];
 
 /// A resolved path from glob or exact pattern matching.
 #[derive(Debug, Clone)]
@@ -28,6 +40,15 @@ pub struct GlobResolverOptions {
     /// When `true`, any resolved path that does not start with the
     /// containment root is silently skipped.
     pub enforce_containment: bool,
+
+    /// Directory names to skip during traversal (default: empty).
+    ///
+    /// When a directory's name matches any entry in this list, it is
+    /// pruned entirely — neither yielded nor descended into.
+    ///
+    /// Use [`DEFAULT_SKIP_DIRS`] for a standard set of directories
+    /// to skip (e.g., `node_modules`, `.git`, `target`).
+    pub skip_dirs: Vec<String>,
 }
 
 impl Default for GlobResolverOptions {
@@ -35,6 +56,7 @@ impl Default for GlobResolverOptions {
         Self {
             skip_symlinks: true,
             enforce_containment: true,
+            skip_dirs: Vec::new(),
         }
     }
 }
@@ -175,13 +197,16 @@ pub fn resolve_exact(
     Some(ResolvedPath { canonical, display })
 }
 
-/// Resolve a glob pattern using `walkdir` + `globset`.
+/// Resolve a glob pattern using parallel `jwalk` traversal and `globset` matching.
 ///
 /// Walks the directory tree under `base_dir` with `follow_links(false)`.
 /// Each entry's relative path is matched against the compiled glob pattern.
 /// When a directory matches, it is added to results and pruned (not recursed
 /// into) — this avoids walking into matched directories like `node_modules/`
 /// which may contain thousands of entries.
+///
+/// Directories listed in [`GlobResolverOptions::skip_dirs`] are pruned
+/// at the directory level and never yielded or descended into.
 ///
 /// # Arguments
 ///
@@ -206,24 +231,83 @@ pub fn resolve_glob(
         }
     };
 
-    let mut results = Vec::new();
-    let mut it = walkdir::WalkDir::new(base_dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter();
+    let skip_symlinks = options.skip_symlinks;
+    let skip_dirs = options.skip_dirs.clone();
+    let base_dir_owned = base_dir.to_path_buf();
+    let glob_for_prune = glob.clone();
 
-    loop {
-        let entry = match it.next() {
-            None => break,
-            Some(Err(e)) => {
-                log::debug!("Error during directory walk: {e}");
-                continue;
-            }
-            Some(Ok(entry)) => entry,
+    // Use jwalk for parallel directory traversal.
+    //
+    // The `process_read_dir` callback handles three kinds of pruning:
+    //
+    // 1. **skip_dirs** — directories whose names match the skip list are
+    //    removed from children entirely (not yielded, not descended into).
+    //
+    // 2. **Glob-matched directories** — directories that match the glob
+    //    pattern have `read_children_path` set to `None`, so they are
+    //    yielded but not descended into. This is the on-match pruning
+    //    optimization that prevents walking into e.g. matched
+    //    `node_modules/` trees.
+    //
+    // 3. **Symlinks** — when `skip_symlinks` is true, symlink entries
+    //    are removed from children entirely.
+    let walker = jwalk::WalkDirGeneric::<((), ())>::new(base_dir)
+        .skip_hidden(false)
+        .follow_links(false)
+        .sort(true)
+        .process_read_dir(move |depth, path, _state, children| {
+            children.retain_mut(|entry_result| {
+                let Ok(entry) = entry_result.as_mut() else {
+                    return false;
+                };
+
+                // Skip symlinks if configured
+                if skip_symlinks && entry.file_type.is_symlink() {
+                    return false;
+                }
+
+                let name = entry.file_name.to_string_lossy();
+
+                if entry.file_type.is_dir() {
+                    // jwalk calls process_read_dir for the walk root's
+                    // *parent* first (depth=None). In this callback `path`
+                    // is the parent of the walk root and the single child
+                    // IS the walk root. strip_prefix(base_dir) fails here,
+                    // producing a bogus absolute relative path. Skip all
+                    // pruning — we always want to descend into the root.
+                    if depth.is_none() {
+                        return true;
+                    }
+
+                    // Prune skip_dirs entirely (don't yield, don't descend)
+                    if skip_dirs.iter().any(|skip| name.as_ref() == skip.as_str()) {
+                        return false;
+                    }
+
+                    // On-match pruning: if this directory matches the glob,
+                    // yield it but don't descend into it.
+                    let relative = path
+                        .strip_prefix(&base_dir_owned)
+                        .unwrap_or(path)
+                        .join(name.as_ref());
+                    if glob_for_prune.is_match(&relative) {
+                        entry.read_children_path = None;
+                    }
+                }
+
+                true
+            });
+        });
+
+    let mut results = Vec::new();
+
+    for entry_result in walker {
+        let Ok(entry) = entry_result else {
+            continue;
         };
 
-        // Skip symlinks if configured (default: true)
-        if options.skip_symlinks && entry.file_type().is_symlink() {
+        // Skip the root directory itself (depth 0)
+        if entry.depth == 0 {
             continue;
         }
 
@@ -264,13 +348,6 @@ pub fn resolve_glob(
             |r| r.to_string_lossy().to_string(),
         );
         results.push(ResolvedPath { canonical, display });
-
-        // If the match is a directory, prune it — don't recurse into it.
-        // This is the key performance optimization: e.g., after matching
-        // `node_modules/`, we skip the thousands of entries inside it.
-        if entry.file_type().is_dir() {
-            it.skip_current_dir();
-        }
     }
 
     results
@@ -481,5 +558,34 @@ mod tests {
         let r2 = r.resolve("sha*", root); // glob that also matches "shared"
         assert_eq!(r1.len(), 1);
         assert!(r2.is_empty()); // deduped by the seen set
+    }
+
+    #[test]
+    fn test_resolve_glob_with_skip_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Create dist directories both inside and outside node_modules
+        fs::create_dir_all(root.join("src/dist")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg/dist")).unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+
+        let canonical = root.canonicalize().unwrap();
+        let options = GlobResolverOptions {
+            skip_dirs: DEFAULT_SKIP_DIRS.iter().map(|&s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let mut r = GlobResolver::new(canonical, options);
+        let results = r.resolve("**/dist", root);
+
+        // Only src/dist should match; node_modules is skipped entirely
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].display, "src/dist");
+    }
+
+    #[test]
+    fn test_default_skip_dirs_constant() {
+        assert!(DEFAULT_SKIP_DIRS.contains(&"node_modules"));
+        assert!(DEFAULT_SKIP_DIRS.contains(&".git"));
+        assert!(DEFAULT_SKIP_DIRS.contains(&"target"));
     }
 }

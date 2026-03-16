@@ -9,23 +9,19 @@
 
 use std::path::{Path, PathBuf};
 
+use worktree_setup_glob::DEFAULT_SKIP_DIRS;
+
 use crate::error::ConfigError;
 use crate::types::LoadedConfig;
-
-/// Directories to skip during config discovery.
-///
-/// These are pruned at the directory level via `process_read_dir`,
-/// so the walker never descends into them — avoiding traversal of
-/// potentially millions of files inside `node_modules`.
-const SKIP_DIRS: &[&str] = &["node_modules", ".git", "target"];
 
 /// Discover all worktree configuration files in a repository.
 ///
 /// Searches for files matching `worktree.config.{toml,ts}` and
 /// `worktree.*.config.{toml,ts}` patterns using fast parallel directory traversal.
 ///
-/// Automatically prunes `node_modules`, `.git`, and `target` directories
-/// at the directory level so their contents are never traversed.
+/// Automatically prunes directories listed in [`DEFAULT_SKIP_DIRS`]
+/// (`node_modules`, `.git`, `target`) at the directory level so their
+/// contents are never traversed.
 ///
 /// # Arguments
 ///
@@ -51,7 +47,7 @@ pub fn discover_configs(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
                 };
                 if entry.file_type.is_dir() {
                     let name = entry.file_name.to_string_lossy();
-                    if SKIP_DIRS.iter().any(|&skip| name == skip) {
+                    if DEFAULT_SKIP_DIRS.iter().any(|&skip| name == skip) {
                         return false;
                     }
                 }

@@ -1087,6 +1087,37 @@ pub fn prompt_run_install(default: bool) -> io::Result<bool> {
         .interact()?)
 }
 
+/// Drain any buffered keystrokes from stdin.
+///
+/// Prevents stale input from leaking into the next interactive prompt.
+/// This is important when a prompt follows another prompt or a
+/// non-trivial operation — the user may have pressed extra keys
+/// (e.g. Enter or `y`) while waiting, and those buffered keystrokes
+/// would be consumed immediately by the next prompt.
+///
+/// Uses non-blocking reads to drain all pending bytes, then restores
+/// the original file descriptor flags.
+#[cfg(unix)]
+pub fn flush_stdin() {
+    use std::os::fd::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return;
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let mut buf = [0u8; 256];
+        while libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 {}
+        libc::fcntl(fd, libc::F_SETFL, flags);
+    }
+}
+
+/// Drain any buffered keystrokes from stdin (no-op on non-Unix).
+#[cfg(not(unix))]
+pub fn flush_stdin() {}
+
 /// Recovery action for a stale worktree registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleWorktreeAction {

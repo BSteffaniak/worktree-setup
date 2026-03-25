@@ -846,6 +846,7 @@ fn handle_branch_deletion(
             Ok(Some(branch.to_string()))
         }
         Err(_) if !non_interactive => {
+            interactive::flush_stdin();
             let prompt = format!("Branch '{branch}' is not fully merged. Force-delete?");
             let confirmed = dialoguer::Confirm::new()
                 .with_prompt(prompt)
@@ -2029,6 +2030,7 @@ fn create_worktree_with_recovery(
             }
 
             // Interactive recovery
+            interactive::flush_stdin();
             match interactive::prompt_stale_worktree_recovery()? {
                 interactive::StaleWorktreeAction::Prune => {
                     println!("Pruning stale worktrees...");
@@ -2061,6 +2063,7 @@ fn create_worktree_with_recovery(
             }
 
             // Interactive recovery
+            interactive::flush_stdin();
             match interactive::prompt_branch_exists_recovery(&branch)? {
                 interactive::BranchExistsAction::UseExisting => {
                     println!("Using existing branch '{branch}'...");

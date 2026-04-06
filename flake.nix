@@ -8,6 +8,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    cargoMacheteSrc = {
+      url = "github:BSteffaniak/cargo-machete/ignored-dirs";
+      flake = false;
+    };
   };
 
   outputs =
@@ -16,6 +20,7 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
+      cargoMacheteSrc,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -34,6 +39,16 @@
           ];
         };
 
+        cargoMachete = pkgs.rustPlatform.buildRustPackage {
+          pname = "cargo-machete";
+          version = "ignored-dirs";
+          src = cargoMacheteSrc;
+          cargoLock = {
+            lockFile = "${cargoMacheteSrc}/Cargo.lock";
+          };
+          doCheck = false;
+        };
+
         # Build dependencies
         buildInputs = with pkgs; [
           rustToolchain
@@ -47,12 +62,16 @@
           inherit buildInputs;
 
           packages = with pkgs; [
+            cargo-deny
+            cargoMachete
             fish
           ];
 
           shellHook = ''
             echo "worktree-setup Development Environment"
             echo "Rust: $(rustc --version)"
+            echo "  - cargo-deny ($(cargo deny --version))"
+            echo "  - cargo-machete ($(cargo machete --version))"
             echo ""
             echo "Build with: cargo build --release"
             echo "Install with: cargo install --path packages/cli"

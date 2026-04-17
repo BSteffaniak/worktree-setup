@@ -2210,6 +2210,7 @@ dependencies = [
  "git2",
  "indicatif",
  "libc",
+ "log",
  "path-clean",
  "pretty_env_logger",
  "tempfile",

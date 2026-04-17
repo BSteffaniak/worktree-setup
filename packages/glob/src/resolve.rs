@@ -236,7 +236,16 @@ pub fn resolve_glob(
     let base_dir_owned = base_dir.to_path_buf();
     let glob_for_prune = glob.clone();
 
-    // Use jwalk for parallel directory traversal.
+    // Use jwalk for directory traversal.
+    //
+    // We use `Parallelism::Serial` here because callers frequently run many
+    // `resolve_glob` invocations concurrently (e.g. one per worktree).
+    // jwalk's default `Parallelism::RayonDefaultPool` has a 1-second
+    // busy_timeout on rayon pool startup — when the shared rayon thread
+    // pool is saturated by many simultaneous walks, most spawns time out
+    // and jwalk silently returns an error (which, when ignored, looks like
+    // a clean-but-empty directory). Running the inner walk serially is
+    // correct and predictable; parallelism is achieved at the caller level.
     //
     // The `process_read_dir` callback handles three kinds of pruning:
     //
@@ -255,6 +264,7 @@ pub fn resolve_glob(
         .skip_hidden(false)
         .follow_links(false)
         .sort(true)
+        .parallelism(jwalk::Parallelism::Serial)
         .process_read_dir(move |depth, path, _state, children| {
             children.retain_mut(|entry_result| {
                 let Ok(entry) = entry_result.as_mut() else {
@@ -302,8 +312,18 @@ pub fn resolve_glob(
     let mut results = Vec::new();
 
     for entry_result in walker {
-        let Ok(entry) = entry_result else {
-            continue;
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                // Surface walker errors so silent data loss is impossible —
+                // particularly the jwalk busy-timeout that previously made
+                // concurrent walks return empty results.
+                log::warn!(
+                    "Glob walker error for pattern {pattern:?} in {}: {err}",
+                    base_dir.display()
+                );
+                continue;
+            }
         };
 
         // Skip the root directory itself (depth 0)
@@ -587,5 +607,218 @@ mod tests {
         assert!(DEFAULT_SKIP_DIRS.contains(&"node_modules"));
         assert!(DEFAULT_SKIP_DIRS.contains(&".git"));
         assert!(DEFAULT_SKIP_DIRS.contains(&"target"));
+    }
+
+    /// Sanity check on the underlying `globset` crate: `**/name` should
+    /// match a bare `name` (zero-depth match) per the documented semantics
+    /// ("`**/foo` matches `foo` and `bar/foo`").
+    #[test]
+    fn test_globset_double_star_matches_bare_name() {
+        let glob = globset::Glob::new("**/node_modules")
+            .unwrap()
+            .compile_matcher();
+        // This is the documented behavior; if it fails here, the bug is in
+        // globset itself.
+        assert!(
+            glob.is_match("node_modules"),
+            "globset `**/node_modules` should match bare `node_modules`"
+        );
+        assert!(glob.is_match("a/node_modules"));
+        assert!(glob.is_match("a/b/node_modules"));
+    }
+
+    /// **Regression test for clean-command bug.**
+    ///
+    /// Worktrees with a top-level `node_modules` directory were reporting
+    /// "nothing to clean" despite many GiB of content, because the glob
+    /// walker yielded the top-level match at `relative = "node_modules"`
+    /// (a single-component relative path) and — depending on path form —
+    /// `globset::is_match` did not match it against `**/node_modules`.
+    #[test]
+    fn test_resolve_glob_matches_top_level_for_double_star_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Top-level node_modules (this is what was being missed)
+        fs::create_dir_all(root.join("node_modules/pkg-a")).unwrap();
+        // And a deep one that was being matched
+        fs::create_dir_all(root.join("apps/a/node_modules")).unwrap();
+
+        let mut r = resolver(root);
+        let results = r.resolve("**/node_modules", root);
+
+        let displays: BTreeSet<&str> = results.iter().map(|r| r.display.as_str()).collect();
+        assert!(
+            displays.contains("node_modules"),
+            "top-level `node_modules` must be matched, got: {displays:?}"
+        );
+        assert!(
+            displays.contains("apps/a/node_modules"),
+            "deep `apps/a/node_modules` must be matched, got: {displays:?}"
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    /// When a top-level `node_modules` contains a flattened package tree
+    /// (as produced by bun/npm with thousands of nested packages, many of
+    /// which have their own empty `node_modules/`), the top-level dir
+    /// must still be yielded — AND the walker must prune into it to avoid
+    /// a combinatorial descent.
+    #[test]
+    fn test_resolve_glob_top_level_prunes_inner_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Top-level node_modules with nested package that itself has
+        // node_modules inside (pnpm/bun-style nested dep).
+        fs::create_dir_all(root.join("node_modules/foo/node_modules/bar")).unwrap();
+        fs::create_dir_all(root.join("node_modules/baz/node_modules")).unwrap();
+        fs::write(root.join("node_modules/foo/index.js"), "x").unwrap();
+
+        let mut r = resolver(root);
+        let results = r.resolve("**/node_modules", root);
+
+        // Only the TOP-LEVEL `node_modules` should be returned — inner
+        // `node_modules/foo/node_modules` etc. are descendants and must
+        // not pollute the result set (they would be wastefully re-walked
+        // and then deleted by the caller via the outer match anyway).
+        assert_eq!(
+            results.len(),
+            1,
+            "expected only top-level node_modules, got: {:?}",
+            results.iter().map(|r| &r.display).collect::<Vec<_>>()
+        );
+        assert_eq!(results[0].display, "node_modules");
+    }
+
+    /// `filter_descendants` must keep the top-level match and drop deeper
+    /// ones when both are present.
+    #[test]
+    fn test_filter_descendants_keeps_top_level_node_modules() {
+        let top = ResolvedPath {
+            canonical: PathBuf::from("/wt/node_modules"),
+            display: "node_modules".to_string(),
+        };
+        let inner = ResolvedPath {
+            canonical: PathBuf::from("/wt/node_modules/foo/node_modules"),
+            display: "node_modules/foo/node_modules".to_string(),
+        };
+        let deep_outside = ResolvedPath {
+            canonical: PathBuf::from("/wt/apps/a/node_modules"),
+            display: "apps/a/node_modules".to_string(),
+        };
+
+        let filtered = filter_descendants(&[top, inner, deep_outside]);
+        let displays: BTreeSet<&str> = filtered.iter().map(|r| r.display.as_str()).collect();
+        assert!(displays.contains("node_modules"));
+        assert!(displays.contains("apps/a/node_modules"));
+        assert!(!displays.contains("node_modules/foo/node_modules"));
+        assert_eq!(filtered.len(), 2);
+    }
+
+    /// Cross-pattern case: `**/node_modules` resolves the top-level dir;
+    /// `**/.turbo` running afterwards on the same resolver must not
+    /// re-walk inside the already-resolved `node_modules` subtree.
+    ///
+    /// This is both a correctness check (no false `**/.turbo` matches
+    /// inside `node_modules/*/.turbo`) and a perf check (the walker
+    /// should prune the entire subtree).
+    #[test]
+    fn test_resolve_cross_pattern_prunes_previously_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Top-level node_modules with a .turbo dir inside some package
+        fs::create_dir_all(root.join("node_modules/some-pkg/.turbo")).unwrap();
+        // A real .turbo outside node_modules that we DO want to match
+        fs::create_dir_all(root.join("apps/a/.turbo")).unwrap();
+
+        let mut r = resolver(root);
+        let r1 = r.resolve("**/node_modules", root);
+        assert_eq!(r1.len(), 1, "top-level node_modules should match");
+
+        let r2 = r.resolve("**/.turbo", root);
+        let displays: BTreeSet<&str> = r2.iter().map(|r| r.display.as_str()).collect();
+        assert!(
+            displays.contains("apps/a/.turbo"),
+            "apps/a/.turbo should match, got: {displays:?}"
+        );
+        assert!(
+            !displays.contains("node_modules/some-pkg/.turbo"),
+            ".turbo inside already-resolved node_modules must not match, got: {displays:?}"
+        );
+    }
+
+    /// **Regression test for the "clean says nothing to clean" bug.**
+    ///
+    /// When many `resolve_glob` calls run concurrently (one per worktree in
+    /// multi-worktree clean), jwalk's default `Parallelism::RayonDefaultPool`
+    /// has a 1-second startup timeout that was causing most concurrent walks
+    /// to silently return empty results. This test reproduces the scenario:
+    /// spawn many threads that each invoke the resolver against their own
+    /// tempdir, and assert that every thread gets the expected match count.
+    ///
+    /// Each root has a moderately sized tree so the walker can't trivially
+    /// finish within the 1-second rayon startup timeout when contending
+    /// with other concurrent walkers. This reliably reproduces the bug on
+    /// the old code (`RayonDefaultPool`) and passes on the new code
+    /// (`Parallelism::Serial`).
+    #[test]
+    fn test_resolve_glob_concurrent_callers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Scale the tree so walks take non-trivial time (enough to contend
+        // when many threads race on the rayon pool).
+        const THREADS: usize = 48;
+        const APPS_PER_ROOT: usize = 30;
+        const SUBDIRS_PER_APP: usize = 30;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots: Vec<std::path::PathBuf> = (0..THREADS)
+            .map(|i| {
+                let root = tmp.path().join(format!("wt-{i}"));
+                for j in 0..APPS_PER_ROOT {
+                    let app = root.join(format!("apps/app-{j}"));
+                    // Each app has its own node_modules (a match target)
+                    fs::create_dir_all(app.join("node_modules")).unwrap();
+                    // Plus many unrelated subdirs to give the walker work to do
+                    for k in 0..SUBDIRS_PER_APP {
+                        fs::create_dir_all(app.join(format!("src/dir-{k}"))).unwrap();
+                        fs::write(app.join(format!("src/dir-{k}/file.txt")), "noise").unwrap();
+                    }
+                }
+                root
+            })
+            .collect();
+
+        // Run resolvers concurrently, one per root, and assert each gets
+        // the expected match count.
+        let failures = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for root in roots {
+            let failures = failures.clone();
+            handles.push(std::thread::spawn(move || {
+                let canonical = root.canonicalize().unwrap();
+                let mut r = GlobResolver::new(canonical, GlobResolverOptions::default());
+                let results = r.resolve("**/node_modules", &root);
+                if results.len() != APPS_PER_ROOT {
+                    eprintln!(
+                        "concurrent walker returned {} results for {}, expected {}",
+                        results.len(),
+                        root.display(),
+                        APPS_PER_ROOT
+                    );
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let failed = failures.load(Ordering::Relaxed);
+        assert_eq!(
+            failed, 0,
+            "{failed}/{THREADS} concurrent resolvers returned wrong match counts — \
+             likely a regression of the jwalk busy-timeout bug"
+        );
     }
 }

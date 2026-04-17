@@ -57,11 +57,14 @@ where
         return 0;
     }
 
-    // Use jwalk with sort disabled for speed
+    // Use jwalk with sort disabled for speed. `Parallelism::Serial` avoids
+    // contention with other concurrent walks on the shared rayon pool (see
+    // notes on `disk_usage`).
     let mut count = 0u64;
     for _entry in jwalk::WalkDir::new(path)
         .skip_hidden(false)
         .sort(false)
+        .parallelism(jwalk::Parallelism::Serial)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -102,10 +105,16 @@ pub fn disk_usage(path: &Path) -> u64 {
 
     let mut total = 0u64;
 
+    // Use `Parallelism::Serial` to avoid contention on jwalk's shared rayon
+    // pool when many `disk_usage` calls run concurrently (e.g. one per
+    // worktree). The default `RayonDefaultPool` has a 1-second startup
+    // timeout that causes walks to silently return errors under heavy
+    // concurrent load.
     for entry in jwalk::WalkDir::new(path)
         .skip_hidden(false)
         .sort(false)
         .follow_links(false)
+        .parallelism(jwalk::Parallelism::Serial)
         .into_iter()
         .filter_map(Result::ok)
     {

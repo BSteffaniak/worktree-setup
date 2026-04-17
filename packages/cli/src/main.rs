@@ -656,6 +656,12 @@ fn resolve_clean_paths(
     target_canonical: &Path,
     repo_root: &Path,
 ) -> Vec<(PathBuf, String)> {
+    log::debug!(
+        "resolve_clean_paths: target={} configs={}",
+        target_path.display(),
+        selected_configs.len()
+    );
+
     let mut resolver = worktree_setup_glob::GlobResolver::new(
         target_canonical.to_path_buf(),
         worktree_setup_glob::GlobResolverOptions::default(),
@@ -683,6 +689,11 @@ fn resolve_clean_paths(
             );
 
             let matched = resolver.resolve(effective_pattern, &base_dir);
+            log::debug!(
+                "  pattern={pattern:?} base={} matched={}",
+                base_dir.display(),
+                matched.len(),
+            );
             for entry in matched {
                 results.push((entry.canonical, entry.display));
             }
@@ -1401,6 +1412,10 @@ fn resolve_single_worktree(
 ) -> interactive::WorktreeResolution {
     let target_path = &wt.path;
     let Ok(target_canonical) = target_path.canonicalize() else {
+        log::warn!(
+            "resolve_single_worktree[{index}]: cannot canonicalize {}",
+            target_path.display()
+        );
         return interactive::WorktreeResolution {
             index,
             resolved: Vec::new(),

@@ -263,13 +263,20 @@ where
     })
 }
 
-/// Enumerate all files in a directory using jwalk for parallel traversal.
+/// Enumerate all files in a directory using jwalk.
+///
+/// Uses `Parallelism::Serial` to avoid the shared-rayon-pool busy-timeout
+/// bug that causes silent empty results under concurrent load (see
+/// `test_resolve_glob_concurrent_callers` in `worktree_setup_glob`).
+/// Caller-level parallelism is the correct level to coordinate concurrent
+/// directory enumeration.
 fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, CopyError> {
     let mut entries = Vec::new();
 
     for entry in jwalk::WalkDir::new(source)
         .skip_hidden(false)
         .follow_links(false)
+        .parallelism(jwalk::Parallelism::Serial)
     {
         let entry = entry.map_err(|e| CopyError::EnumerationError {
             path: source.to_path_buf(),
@@ -376,6 +383,7 @@ fn copy_symlink(source: &Path, target: &Path) -> Result<(), CopyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
@@ -485,5 +493,75 @@ mod tests {
 
         assert!(matches!(result, CopyResult::Created { files_copied: 1 }));
         assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+    }
+
+    /// **Regression test for jwalk busy-timeout bug**, analogous to
+    /// `test_resolve_glob_concurrent_callers` in the `glob` crate.
+    ///
+    /// When many `copy_directory` calls run concurrently, each one
+    /// invokes `enumerate_directory` which walks the source tree. With
+    /// jwalk's default `Parallelism::RayonDefaultPool`, concurrent
+    /// walks race on a shared pool and most hit a 1-second startup
+    /// timeout, silently returning empty enumerations — which would
+    /// produce zero-file "successful" copies. `Parallelism::Serial`
+    /// avoids this entirely; this test locks that choice in.
+    #[test]
+    fn test_copy_directory_concurrent_callers() {
+        const THREADS: usize = 48;
+        const FILES_PER_SOURCE: usize = 30;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Build source dirs with predictable content.
+        let jobs: Vec<(PathBuf, PathBuf)> = (0..THREADS)
+            .map(|i| {
+                let source = tmp.path().join(format!("src-{i}"));
+                fs::create_dir_all(&source).unwrap();
+                for j in 0..FILES_PER_SOURCE {
+                    let sub = source.join(format!("sub/dir-{j}"));
+                    fs::create_dir_all(&sub).unwrap();
+                    fs::write(sub.join("file.txt"), format!("content-{i}-{j}")).unwrap();
+                }
+                let target = tmp.path().join(format!("dst-{i}"));
+                (source, target)
+            })
+            .collect();
+
+        let failures = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for (source, target) in jobs {
+            let failures = failures.clone();
+            handles.push(std::thread::spawn(move || {
+                let result = copy_directory(&source, &target, |_| {}).unwrap();
+                match result {
+                    CopyResult::Created { files_copied } => {
+                        let expected = u64::try_from(FILES_PER_SOURCE).unwrap();
+                        if files_copied != expected {
+                            eprintln!(
+                                "copy_directory({}) copied {} files, expected {}",
+                                source.display(),
+                                files_copied,
+                                FILES_PER_SOURCE,
+                            );
+                            failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    other => {
+                        eprintln!("copy_directory({}) => {:?}", source.display(), other);
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let failed = failures.load(Ordering::Relaxed);
+        assert_eq!(
+            failed, 0,
+            "{failed}/{THREADS} concurrent copy_directory calls copied the wrong number of \
+             files — likely a regression of the jwalk busy-timeout bug"
+        );
     }
 }

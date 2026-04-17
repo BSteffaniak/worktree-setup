@@ -648,13 +648,35 @@ fn resolve_setup_target(cwd: &Path, target: Option<&PathBuf>) -> PathBuf {
 /// Returned value is always at least `1` and never exceeds
 /// `num_worktrees` (when > 0).
 fn resolve_max_parallel(args: &CleanArgs, num_worktrees: usize) -> usize {
-    let default = num_cpus::get().min(num_worktrees.max(1)).max(1);
-    let explicit = args.max_parallel.or_else(|| {
-        std::env::var("WORKTREE_SETUP_MAX_PARALLEL")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-    });
-    explicit.map_or(default, |n| n.max(1).min(num_worktrees.max(1)))
+    let env_value = std::env::var("WORKTREE_SETUP_MAX_PARALLEL").ok();
+    resolve_max_parallel_inner(
+        args.max_parallel,
+        env_value.as_deref(),
+        num_cpus::get(),
+        num_worktrees,
+    )
+}
+
+/// Inner, pure helper for `resolve_max_parallel` — all inputs are
+/// passed explicitly, so this function is deterministic and testable
+/// without touching process-global state.
+///
+/// Priority: `explicit_flag` > `env_value` > default.
+/// Default: `min(num_cpus, max(num_worktrees, 1))`.
+/// Clamping: result is always in `[1, max(num_worktrees, 1)]`.
+fn resolve_max_parallel_inner(
+    explicit_flag: Option<usize>,
+    env_value: Option<&str>,
+    num_cpus: usize,
+    num_worktrees: usize,
+) -> usize {
+    let cap = num_worktrees.max(1);
+    let default = num_cpus.min(cap).max(1);
+
+    let parsed_env = env_value.and_then(|s| s.parse::<usize>().ok());
+    let explicit = explicit_flag.or(parsed_env);
+
+    explicit.map_or(default, |n| n.max(1).min(cap))
 }
 
 /// Resolve clean paths from selected configs into concrete items to delete.
@@ -1291,10 +1313,116 @@ struct WorktreeCleanGroup {
     items: Vec<output::CleanItem>,
 }
 
+/// Build the shared rayon thread pool used by the multi-worktree
+/// clean pipeline. Pool size follows `resolve_max_parallel`.
+fn build_clean_pool(
+    args: &CleanArgs,
+    num_worktrees: usize,
+) -> Result<Arc<rayon::ThreadPool>, Box<dyn std::error::Error>> {
+    let max_parallel = resolve_max_parallel(args, num_worktrees);
+    log::debug!("clean: max_parallel={max_parallel} worktrees={num_worktrees}");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_parallel)
+        .thread_name(|i| format!("wt-clean-{i}"))
+        .build()?;
+    Ok(Arc::new(pool))
+}
+
+/// Handle for the background resolution pipeline: the channel receiver
+/// delivering [`WorktreeResolution`]s as they complete, plus the `done`
+/// flag the picker consults to stop the spinner.
+struct BackgroundResolution {
+    rx: mpsc::Receiver<interactive::WorktreeResolution>,
+    done: Arc<AtomicBool>,
+}
+
+/// Spawn one pool task per worktree; each task resolves clean paths
+/// and computes sizes in parallel via the shared pool, sending a
+/// `WorktreeResolution` into the shared channel.
+///
+/// The `done` flag flips to `true` when the last task completes so
+/// the picker can stop animating its spinner.
+fn start_background_resolution(
+    worktrees: &[worktree_setup_git::WorktreeInfo],
+    configs_arc: &Arc<Vec<LoadedConfig>>,
+    repo_root_arc: &Arc<PathBuf>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> BackgroundResolution {
+    let (tx, rx) = mpsc::channel::<interactive::WorktreeResolution>();
+    let done = Arc::new(AtomicBool::new(false));
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(worktrees.len()));
+
+    for (idx, wt) in worktrees.iter().enumerate() {
+        let tx = tx.clone();
+        let configs = configs_arc.clone();
+        let root = repo_root_arc.clone();
+        let wt = wt.clone();
+        let pool_for_task = pool.clone();
+        let remaining_for_task = remaining.clone();
+        let done_for_task = done.clone();
+
+        pool.spawn(move || {
+            let configs_refs: Vec<&LoadedConfig> = configs.iter().collect();
+            let resolution =
+                resolve_single_worktree_with_pool(idx, &wt, &configs_refs, &root, &pool_for_task);
+            let _ = tx.send(resolution);
+
+            // Mark done when the last task finishes so the picker can
+            // stop its spinner animation.
+            if remaining_for_task.fetch_sub(1, Ordering::Relaxed) == 1 {
+                done_for_task.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    // Drop the original sender so the channel closes once all tasks
+    // complete.
+    drop(tx);
+
+    BackgroundResolution { rx, done }
+}
+
+/// Block-drain any resolutions remaining in the channel. Iterating
+/// `rx` consumes it and yields until the channel closes (i.e. when
+/// the last pool-task sender is dropped), ensuring we wait for all
+/// in-flight resolutions to complete.
+fn drain_resolutions_blocking(
+    rx: mpsc::Receiver<interactive::WorktreeResolution>,
+    mut initial: Vec<interactive::WorktreeResolution>,
+) -> Vec<interactive::WorktreeResolution> {
+    for res in rx {
+        initial.push(res);
+    }
+    initial
+}
+
+/// Build the final grouped results for the selected worktrees,
+/// preferring cached resolutions and falling back to synchronous
+/// re-resolution on the shared pool if any are missing.
+fn build_final_groups(
+    selected_indices: &[usize],
+    cached: &[interactive::WorktreeResolution],
+    worktrees: &[worktree_setup_git::WorktreeInfo],
+    configs_arc: &Arc<Vec<LoadedConfig>>,
+    repo_root: &Path,
+    pool: &rayon::ThreadPool,
+) -> Vec<WorktreeCleanGroup> {
+    let groups = build_groups_from_cache(selected_indices, cached, worktrees);
+    if groups.len() == selected_indices.len() {
+        return groups;
+    }
+
+    // Fall back to re-resolving on the pool for any selected worktrees
+    // that weren't in the cache (rare, but possible if the user
+    // confirmed before all background tasks completed).
+    let configs_refs: Vec<&LoadedConfig> = configs_arc.iter().collect();
+    let selected_wts: Vec<_> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
+    resolve_multi_worktree_clean(&selected_wts, &configs_refs, repo_root, pool)
+}
+
 /// Run multi-worktree clean: discover configs, spawn background resolution
 /// threads, show an interactive multi-select with live size updates, then
 /// preview and delete using cached results.
-#[allow(clippy::too_many_lines)]
 fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
@@ -1338,62 +1466,15 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    // Spawn background resolution tasks on a bounded rayon pool — one
-    // task per worktree, each resolves clean paths and computes sizes
-    // in parallel, then sends a `WorktreeResolution` to the shared
-    // channel. The pool size (see `resolve_max_parallel`) bounds both
-    // concurrent worktree walks AND the inner per-match `disk_usage`
-    // parallelism, giving us controlled I/O concurrency with rayon's
-    // work-stealing scheduler.
-    let max_parallel = resolve_max_parallel(args, worktrees.len());
-    log::debug!(
-        "clean: max_parallel={max_parallel} worktrees={}",
-        worktrees.len()
-    );
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(max_parallel)
-            .thread_name(|i| format!("wt-clean-{i}"))
-            .build()?,
-    );
-
-    let (result_tx, result_rx) = mpsc::channel::<interactive::WorktreeResolution>();
-    let done = Arc::new(AtomicBool::new(false));
-    let done_for_joiner = done.clone();
-
+    // Build the shared pool and kick off background resolution.
+    let pool = build_clean_pool(args, worktrees.len())?;
     let configs_arc: Arc<Vec<LoadedConfig>> = Arc::new(selected_configs);
     let repo_root_arc: Arc<PathBuf> = Arc::new(repo_root.clone());
+    let bg = start_background_resolution(&worktrees, &configs_arc, &repo_root_arc, &pool);
 
-    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(worktrees.len()));
-
-    for (idx, wt) in worktrees.iter().enumerate() {
-        let tx = result_tx.clone();
-        let configs = configs_arc.clone();
-        let root = repo_root_arc.clone();
-        let wt = wt.clone();
-        let pool_for_task = pool.clone();
-        let remaining_for_task = remaining.clone();
-        let done_for_task = done_for_joiner.clone();
-
-        pool.spawn(move || {
-            let configs_refs: Vec<&LoadedConfig> = configs.iter().collect();
-            let resolution =
-                resolve_single_worktree_with_pool(idx, &wt, &configs_refs, &root, &pool_for_task);
-            let _ = tx.send(resolution);
-
-            // Mark done when the last task finishes so the picker can
-            // stop its spinner animation.
-            if remaining_for_task.fetch_sub(1, Ordering::Relaxed) == 1 {
-                done_for_task.store(true, Ordering::Relaxed);
-            }
-        });
-    }
-    // Drop the original sender so the channel closes once all tasks complete.
-    drop(result_tx);
-
-    // Show the interactive multi-select with live-updating sizes
-    let (selected_indices, mut cached_resolutions) =
-        interactive::select_worktrees_with_sizes(&worktrees, &result_rx, &done)?;
+    // Show the interactive multi-select with live-updating sizes.
+    let (selected_indices, cached_resolutions) =
+        interactive::select_worktrees_with_sizes(&worktrees, &bg.rx, &bg.done)?;
 
     let Some(selected_indices) = selected_indices else {
         println!("Cancelled.");
@@ -1405,28 +1486,19 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    // Drain remaining results from the pool. `recv()` blocks until a
-    // result is available or the channel closes (which happens when the
-    // last pool task drops its sender). This ensures we wait for all
-    // in-flight resolutions before previewing/deleting.
-    while let Ok(res) = result_rx.recv() {
-        cached_resolutions.push(res);
-    }
+    // Wait for any remaining in-flight resolutions.
+    let cached_resolutions = drain_resolutions_blocking(bg.rx, cached_resolutions);
 
-    // Build groups from cached resolutions for the selected worktrees.
-    // The cached_resolutions are indexed by worktree index, so we match
-    // selected indices to their resolutions.
-    let groups = build_groups_from_cache(&selected_indices, &cached_resolutions, &worktrees);
-
-    // Fall back to re-resolving for any selected worktrees that weren't
-    // in the cache (e.g., if the user confirmed before all resolved).
-    let groups = if groups.len() == selected_indices.len() {
-        groups
-    } else {
-        let configs_refs: Vec<&LoadedConfig> = configs_arc.iter().collect();
-        let selected_wts: Vec<_> = selected_indices.iter().map(|&i| &worktrees[i]).collect();
-        resolve_multi_worktree_clean(&selected_wts, &configs_refs, &repo_root)
-    };
+    // Build final groups — prefer cache; fall back to synchronous
+    // re-resolution for any missing entries.
+    let groups = build_final_groups(
+        &selected_indices,
+        &cached_resolutions,
+        &worktrees,
+        &configs_arc,
+        &repo_root,
+        &pool,
+    );
 
     // Check if there's anything to clean
     let total_items: usize = groups.iter().map(|g| g.items.len()).sum();
@@ -1607,48 +1679,47 @@ fn discover_and_select_clean_configs(
 }
 
 /// Resolve clean paths for each worktree, building grouped results.
+///
+/// Uses the provided rayon pool for parallel `disk_usage` computation
+/// per worktree (via [`resolve_single_worktree_with_pool`]). This is
+/// the synchronous fallback path used when the interactive picker
+/// returns before all background resolutions complete — rare in
+/// practice because we now block on channel closure, but kept for
+/// safety.
+///
+/// Preserves the HARD warning string `"Could not access worktree
+/// '<path>': <err>"` on canonicalize failure.
 fn resolve_multi_worktree_clean(
     worktrees: &[&worktree_setup_git::WorktreeInfo],
     selected_configs: &[&LoadedConfig],
     repo_root: &Path,
+    pool: &rayon::ThreadPool,
 ) -> Vec<WorktreeCleanGroup> {
     let mut groups = Vec::new();
 
-    for wt in worktrees {
+    for (idx, wt) in worktrees.iter().enumerate() {
         let target_path = &wt.path;
-        let target_canonical = match target_path.canonicalize() {
-            Ok(c) => c,
-            Err(e) => {
-                output::print_warning(&format!(
-                    "Could not access worktree '{}': {}",
-                    target_path.display(),
-                    e
-                ));
-                continue;
-            }
-        };
 
-        let resolved =
-            resolve_clean_paths(selected_configs, target_path, &target_canonical, repo_root);
+        // Check canonicalization here (not inside
+        // `resolve_single_worktree_with_pool`) because we need the
+        // original error to preserve the user-visible warning text.
+        if let Err(e) = target_path.canonicalize() {
+            output::print_warning(&format!(
+                "Could not access worktree '{}': {}",
+                target_path.display(),
+                e
+            ));
+            continue;
+        }
 
-        let items: Vec<output::CleanItem> = resolved
-            .iter()
-            .map(|(abs_path, rel_path)| {
-                let is_dir = abs_path.is_dir();
-                let size = worktree_setup_copy::disk_usage(abs_path);
-                output::CleanItem {
-                    relative_path: rel_path.clone(),
-                    is_dir,
-                    size,
-                }
-            })
-            .collect();
+        let resolution =
+            resolve_single_worktree_with_pool(idx, wt, selected_configs, repo_root, pool);
 
         let label = worktree_clean_label(wt);
         groups.push(WorktreeCleanGroup {
             label,
-            resolved,
-            items,
+            resolved: resolution.resolved,
+            items: resolution.items,
         });
     }
 
@@ -2473,6 +2544,70 @@ mod tests {
         }
     }
 
+    // ─── resolve_max_parallel_inner ─────────────────────────────────────
+
+    /// With no explicit flag and no env value, the default is
+    /// `min(num_cpus, max(num_worktrees, 1))`.
+    #[test]
+    fn test_resolve_max_parallel_default_uses_min_cpus_and_worktrees() {
+        // More CPUs than worktrees → capped at worktrees.
+        assert_eq!(resolve_max_parallel_inner(None, None, 16, 4), 4);
+        // Fewer CPUs than worktrees → capped at CPUs.
+        assert_eq!(resolve_max_parallel_inner(None, None, 4, 16), 4);
+        // Equal → either value.
+        assert_eq!(resolve_max_parallel_inner(None, None, 8, 8), 8);
+    }
+
+    /// An explicit CLI flag overrides everything else.
+    #[test]
+    fn test_resolve_max_parallel_explicit_flag_wins() {
+        // Flag wins over env.
+        assert_eq!(
+            resolve_max_parallel_inner(Some(3), Some("99"), 16, 16),
+            3,
+            "explicit flag must take precedence over env"
+        );
+        // Flag wins over default.
+        assert_eq!(resolve_max_parallel_inner(Some(5), None, 16, 50), 5);
+    }
+
+    /// The env var is consulted only when the flag is absent.
+    #[test]
+    fn test_resolve_max_parallel_env_var_used_when_flag_absent() {
+        assert_eq!(resolve_max_parallel_inner(None, Some("7"), 16, 50), 7);
+        // Malformed env value is ignored, falling through to the default.
+        assert_eq!(
+            resolve_max_parallel_inner(None, Some("not-a-number"), 4, 10),
+            4
+        );
+        // Empty env value is ignored.
+        assert_eq!(resolve_max_parallel_inner(None, Some(""), 4, 10), 4);
+    }
+
+    /// The result is always at least 1, even if inputs ask for less.
+    #[test]
+    fn test_resolve_max_parallel_clamps_to_at_least_one() {
+        // Explicit 0 → clamped to 1.
+        assert_eq!(resolve_max_parallel_inner(Some(0), None, 16, 16), 1);
+        // Env "0" → clamped to 1.
+        assert_eq!(resolve_max_parallel_inner(None, Some("0"), 16, 16), 1);
+        // num_cpus=0 (pathological) → clamped to 1 via the default branch.
+        assert_eq!(resolve_max_parallel_inner(None, None, 0, 10), 1);
+        // num_worktrees=0 (no worktrees) → result is still at least 1.
+        assert_eq!(resolve_max_parallel_inner(None, None, 16, 0), 1);
+    }
+
+    /// Explicit values never exceed `num_worktrees`.
+    #[test]
+    fn test_resolve_max_parallel_clamps_to_num_worktrees() {
+        // Flag asks for 100, only 4 worktrees → capped at 4.
+        assert_eq!(resolve_max_parallel_inner(Some(100), None, 16, 4), 4);
+        // Env asks for 50, only 3 worktrees → capped at 3.
+        assert_eq!(resolve_max_parallel_inner(None, Some("50"), 16, 3), 3);
+        // With 0 worktrees the cap floor is 1, so even a flag of 100 → 1.
+        assert_eq!(resolve_max_parallel_inner(Some(100), None, 16, 0), 1);
+    }
+
     // ─── resolve_post_setup_commands ────────────────────────────────────
 
     #[test]
@@ -3003,6 +3138,63 @@ mod tests {
         assert!(rel_paths.iter().any(|p| p == &".turbo"));
     }
 
+    /// Patterns are grouped into runs of the same `base_dir` in
+    /// `resolve_clean_paths` (to enable a single batched walk per
+    /// contiguous run). This test uses a deliberately alternating list
+    /// — root-relative, config-relative, root-relative, config-relative
+    /// — to exercise the grouping logic across run boundaries.
+    ///
+    /// Locks in: the batched grouping produces the same end result as
+    /// naive per-pattern resolution regardless of how `base_dir`s
+    /// alternate in the input.
+    #[test]
+    fn test_resolve_clean_paths_alternating_base_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let target = repo_root.join("worktree");
+        let target_app_dir = target.join("apps/my-app");
+
+        // Root-relative targets: at worktree root
+        std::fs::create_dir_all(target.join(".turbo")).unwrap();
+        std::fs::create_dir_all(target.join("dist")).unwrap();
+
+        // Config-relative targets: under apps/my-app
+        std::fs::create_dir_all(target_app_dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(target_app_dir.join("build")).unwrap();
+
+        // Alternating pattern list crosses run boundaries 3 times.
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec![
+                "/.turbo".to_string(),      // run 1: root-relative
+                "node_modules".to_string(), // run 2: config-relative
+                "/dist".to_string(),        // run 3: root-relative
+                "build".to_string(),        // run 4: config-relative
+            ],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        // All four paths must resolve, regardless of the alternating order.
+        let rel_paths: std::collections::BTreeSet<String> =
+            resolved.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(
+            resolved.len(),
+            4,
+            "expected 4 resolved paths, got: {rel_paths:?}"
+        );
+        assert!(rel_paths.iter().any(|p| p == ".turbo"));
+        assert!(rel_paths.iter().any(|p| p == "dist"));
+        assert!(rel_paths.iter().any(|p| p.ends_with("node_modules")));
+        assert!(rel_paths.iter().any(|p| p.ends_with("build")));
+    }
+
     #[test]
     fn test_resolve_clean_glob_prunes_matched_dirs() {
         // When **/node_modules matches a node_modules dir, it should NOT
@@ -3136,7 +3328,11 @@ mod tests {
         let worktrees = vec![&wt1, &wt2];
         let configs = vec![&config];
 
-        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root, &pool);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].label, "feature-a");
@@ -3173,11 +3369,231 @@ mod tests {
         let worktrees = vec![&wt];
         let configs = vec![&config];
 
-        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root, &pool);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].label, "empty-branch");
         assert!(groups[0].items.is_empty());
+    }
+
+    /// An inaccessible worktree (path that fails `canonicalize`) must
+    /// be skipped from the output and must produce a warning in the
+    /// legacy format `"Could not access worktree '<path>': <err>"`.
+    ///
+    /// This test covers the error-handling path in
+    /// `resolve_multi_worktree_clean` — preserved across the pool
+    /// refactor so the user-visible warning text doesn't drift.
+    #[test]
+    fn test_resolve_multi_worktree_clean_inaccessible_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Good worktree
+        let good_path = repo_root.join("good-wt");
+        std::fs::create_dir_all(good_path.join("apps/my-app/node_modules")).unwrap();
+
+        // Bad worktree — path doesn't exist on disk, so canonicalize fails
+        let bad_path = repo_root.join("does-not-exist");
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string()],
+        );
+
+        let good_wt = worktree_setup_git::WorktreeInfo {
+            path: good_path,
+            is_main: false,
+            branch: Some("good".to_string()),
+            commit: None,
+        };
+        let bad_wt = worktree_setup_git::WorktreeInfo {
+            path: bad_path,
+            is_main: false,
+            branch: Some("bad".to_string()),
+            commit: None,
+        };
+
+        let worktrees = vec![&good_wt, &bad_wt];
+        let configs = vec![&config];
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let groups = resolve_multi_worktree_clean(&worktrees, &configs, repo_root, &pool);
+
+        // Only the good worktree produces a group; the bad one is skipped.
+        assert_eq!(
+            groups.len(),
+            1,
+            "inaccessible worktrees must be omitted from groups"
+        );
+        assert_eq!(groups[0].label, "good");
+        assert_eq!(groups[0].items.len(), 1);
+    }
+
+    /// End-to-end check that `resolve_single_worktree_with_pool`
+    /// produces identical `WorktreeResolution` values to what would be
+    /// produced by a synchronous, single-threaded reference
+    /// implementation. Uses several worktrees and runs the
+    /// pool-based function concurrently against one shared pool.
+    ///
+    /// This is the integration-level safety net for the pool code path:
+    /// if any change to `resolve_single_worktree_with_pool` or
+    /// `size_items_in_pool` starts returning different summaries,
+    /// orderings, or items, this test catches it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_resolve_single_worktree_with_pool_matches_sequential_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.join("apps/my-app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Build 5 worktrees with a mix of clean-target content.
+        let worktree_paths: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                let wt_path = repo_root.join(format!("wt-{i}"));
+                let app = wt_path.join("apps/my-app");
+                // Always some node_modules content (size-varying).
+                std::fs::create_dir_all(app.join("node_modules")).unwrap();
+                for j in 0..=i {
+                    std::fs::write(
+                        app.join(format!("node_modules/pkg-{j}.js")),
+                        vec![b'x'; 100 * (j + 1)],
+                    )
+                    .unwrap();
+                }
+                // Every other worktree also has a .turbo dir.
+                if i % 2 == 0 {
+                    std::fs::create_dir_all(app.join(".turbo")).unwrap();
+                    std::fs::write(app.join(".turbo/log"), "log").unwrap();
+                }
+                wt_path
+            })
+            .collect();
+
+        let config = make_loaded_config_with_clean(
+            "apps/my-app/worktree.config.toml",
+            &config_dir,
+            vec!["node_modules".to_string(), ".turbo".to_string()],
+        );
+
+        let worktrees: Vec<worktree_setup_git::WorktreeInfo> = worktree_paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| worktree_setup_git::WorktreeInfo {
+                path: p.clone(),
+                is_main: false,
+                branch: Some(format!("branch-{i}")),
+                commit: None,
+            })
+            .collect();
+        let configs: Vec<&LoadedConfig> = vec![&config];
+
+        // ─── Sequential reference ───────────────────────────────────
+        let sequential: Vec<interactive::WorktreeResolution> = worktrees
+            .iter()
+            .enumerate()
+            .map(|(idx, wt)| {
+                let target_canonical = wt.path.canonicalize().unwrap();
+                let resolved =
+                    resolve_clean_paths(&configs, &wt.path, &target_canonical, repo_root);
+                let items: Vec<output::CleanItem> = resolved
+                    .iter()
+                    .map(|(abs_path, rel_path)| {
+                        let is_dir = abs_path.is_dir();
+                        let size = worktree_setup_copy::disk_usage(abs_path);
+                        output::CleanItem {
+                            relative_path: rel_path.clone(),
+                            is_dir,
+                            size,
+                        }
+                    })
+                    .collect();
+                let summary = if items.is_empty() {
+                    "nothing to clean".to_string()
+                } else {
+                    let total: u64 = items.iter().map(|i| i.size).sum();
+                    format!(
+                        "{} item{}, {}",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" },
+                        output::format_size(total)
+                    )
+                };
+                interactive::WorktreeResolution {
+                    index: idx,
+                    resolved,
+                    items,
+                    summary,
+                }
+            })
+            .collect();
+
+        // ─── Pool-based path ───────────────────────────────────────
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut pool_results: Vec<interactive::WorktreeResolution> = worktrees
+            .iter()
+            .enumerate()
+            .map(|(idx, wt)| resolve_single_worktree_with_pool(idx, wt, &configs, repo_root, &pool))
+            .collect();
+        pool_results.sort_by_key(|r| r.index);
+
+        // ─── Compare ───────────────────────────────────────────────
+        assert_eq!(
+            sequential.len(),
+            pool_results.len(),
+            "sequential and pool-based paths must produce the same \
+             number of resolutions"
+        );
+        for (seq, pool_res) in sequential.iter().zip(pool_results.iter()) {
+            assert_eq!(
+                seq.index, pool_res.index,
+                "indices must match: seq={} pool={}",
+                seq.index, pool_res.index
+            );
+            assert_eq!(
+                seq.summary, pool_res.summary,
+                "summaries must match for idx {}: seq={:?} pool={:?}",
+                seq.index, seq.summary, pool_res.summary,
+            );
+            assert_eq!(
+                seq.resolved.len(),
+                pool_res.resolved.len(),
+                "resolved path count must match for idx {}",
+                seq.index
+            );
+            // The pool path may sort items differently if `par_iter` is
+            // reordering internally; compare as sets of (rel_path, is_dir, size).
+            let seq_items: std::collections::BTreeSet<_> = seq
+                .items
+                .iter()
+                .map(|i| (i.relative_path.clone(), i.is_dir, i.size))
+                .collect();
+            let pool_items: std::collections::BTreeSet<_> = pool_res
+                .items
+                .iter()
+                .map(|i| (i.relative_path.clone(), i.is_dir, i.size))
+                .collect();
+            assert_eq!(
+                seq_items, pool_items,
+                "items must match for idx {}",
+                seq.index
+            );
+        }
     }
 
     // ─── find_containing_linked_worktree ────────────────────────────────

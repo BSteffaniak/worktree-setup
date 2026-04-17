@@ -278,154 +278,22 @@ pub fn resolve_glob(
     seen: &mut BTreeSet<PathBuf>,
     options: &GlobResolverOptions,
 ) -> Vec<ResolvedPath> {
-    let glob = match globset::Glob::new(pattern) {
-        Ok(g) => g.compile_matcher(),
+    let matcher = match globset::Glob::new(pattern) {
+        Ok(g) => Matcher::Single(g.compile_matcher()),
         Err(e) => {
             log::warn!("Invalid glob pattern '{pattern}': {e}");
             return Vec::new();
         }
     };
 
-    let skip_symlinks = options.skip_symlinks;
-    let skip_dirs = options.skip_dirs.clone();
-    let base_dir_owned = base_dir.to_path_buf();
-    let glob_for_prune = glob.clone();
-
-    // Use jwalk for directory traversal.
-    //
-    // We use `Parallelism::Serial` here because callers frequently run many
-    // `resolve_glob` invocations concurrently (e.g. one per worktree).
-    // jwalk's default `Parallelism::RayonDefaultPool` has a 1-second
-    // busy_timeout on rayon pool startup — when the shared rayon thread
-    // pool is saturated by many simultaneous walks, most spawns time out
-    // and jwalk silently returns an error (which, when ignored, looks like
-    // a clean-but-empty directory). Running the inner walk serially is
-    // correct and predictable; parallelism is achieved at the caller level.
-    //
-    // The `process_read_dir` callback handles three kinds of pruning:
-    //
-    // 1. **skip_dirs** — directories whose names match the skip list are
-    //    removed from children entirely (not yielded, not descended into).
-    //
-    // 2. **Glob-matched directories** — directories that match the glob
-    //    pattern have `read_children_path` set to `None`, so they are
-    //    yielded but not descended into. This is the on-match pruning
-    //    optimization that prevents walking into e.g. matched
-    //    `node_modules/` trees.
-    //
-    // 3. **Symlinks** — when `skip_symlinks` is true, symlink entries
-    //    are removed from children entirely.
-    let walker = jwalk::WalkDirGeneric::<((), ())>::new(base_dir)
-        .skip_hidden(false)
-        .follow_links(false)
-        .sort(true)
-        .parallelism(jwalk::Parallelism::Serial)
-        .process_read_dir(move |depth, path, _state, children| {
-            children.retain_mut(|entry_result| {
-                let Ok(entry) = entry_result.as_mut() else {
-                    return false;
-                };
-
-                // Skip symlinks if configured
-                if skip_symlinks && entry.file_type.is_symlink() {
-                    return false;
-                }
-
-                let name = entry.file_name.to_string_lossy();
-
-                if entry.file_type.is_dir() {
-                    // jwalk calls process_read_dir for the walk root's
-                    // *parent* first (depth=None). In this callback `path`
-                    // is the parent of the walk root and the single child
-                    // IS the walk root. strip_prefix(base_dir) fails here,
-                    // producing a bogus absolute relative path. Skip all
-                    // pruning — we always want to descend into the root.
-                    if depth.is_none() {
-                        return true;
-                    }
-
-                    // Prune skip_dirs entirely (don't yield, don't descend)
-                    if skip_dirs.iter().any(|skip| name.as_ref() == skip.as_str()) {
-                        return false;
-                    }
-
-                    // On-match pruning: if this directory matches the glob,
-                    // yield it but don't descend into it.
-                    let relative = path
-                        .strip_prefix(&base_dir_owned)
-                        .unwrap_or(path)
-                        .join(name.as_ref());
-                    if glob_for_prune.is_match(&relative) {
-                        entry.read_children_path = None;
-                    }
-                }
-
-                true
-            });
-        });
-
-    let mut results = Vec::new();
-
-    for entry_result in walker {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(err) => {
-                // Surface walker errors so silent data loss is impossible —
-                // particularly the jwalk busy-timeout that previously made
-                // concurrent walks return empty results.
-                log::warn!(
-                    "Glob walker error for pattern {pattern:?} in {}: {err}",
-                    base_dir.display()
-                );
-                continue;
-            }
-        };
-
-        // Skip the root directory itself (depth 0)
-        if entry.depth == 0 {
-            continue;
-        }
-
-        let path = entry.path();
-
-        let Ok(relative) = path.strip_prefix(base_dir) else {
-            continue;
-        };
-
-        if !glob.is_match(relative) {
-            continue;
-        }
-
-        // We have a match — canonicalize and apply containment/dedup checks
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-
-        if options.enforce_containment && !canonical.starts_with(containment_root) {
-            log::warn!("Glob match escapes containment boundary, skipping: {pattern}");
-            continue;
-        }
-
-        // Skip if this path is inside an already-resolved path
-        if seen
-            .iter()
-            .any(|existing| canonical.starts_with(existing) && *existing != canonical)
-        {
-            continue;
-        }
-
-        if !seen.insert(canonical.clone()) {
-            continue; // already seen
-        }
-
-        let display = canonical.strip_prefix(containment_root).map_or_else(
-            |_| path.to_string_lossy().to_string(),
-            |r| r.to_string_lossy().to_string(),
-        );
-        results.push(ResolvedPath { canonical, display });
-    }
-
-    results
+    resolve_with_matcher(
+        &matcher,
+        &MatcherLabel::Single(pattern),
+        base_dir,
+        containment_root,
+        seen,
+        options,
+    )
 }
 
 /// Resolve multiple glob patterns using a single filesystem walk.
@@ -445,7 +313,6 @@ pub fn resolve_glob(
 /// * `containment_root` - Canonical boundary path for containment checks.
 /// * `seen` - Set of already-resolved canonical paths (updated in place).
 /// * `options` - Resolution options.
-#[allow(clippy::too_many_lines)]
 pub fn resolve_globs_batched(
     patterns: &[&str],
     base_dir: &Path,
@@ -483,15 +350,76 @@ pub fn resolve_globs_batched(
         }
     };
 
+    resolve_with_matcher(
+        &Matcher::Set(set),
+        &MatcherLabel::Many(patterns),
+        base_dir,
+        containment_root,
+        seen,
+        options,
+    )
+}
+
+/// Either a single compiled glob or a compiled glob set. Used to
+/// unify the single- and batched-pattern walk paths inside
+/// `resolve_with_matcher`.
+#[derive(Clone)]
+enum Matcher {
+    Single(globset::GlobMatcher),
+    Set(globset::GlobSet),
+}
+
+impl Matcher {
+    fn is_match(&self, path: &Path) -> bool {
+        match self {
+            Self::Single(m) => m.is_match(path),
+            Self::Set(s) => s.is_match(path),
+        }
+    }
+}
+
+/// Labels for log messages — lets the shared walker produce the
+/// single-pattern wording for `resolve_glob` and the multi-pattern
+/// wording for `resolve_globs_batched` without string-building in
+/// hot paths.
+enum MatcherLabel<'a> {
+    Single(&'a str),
+    Many(&'a [&'a str]),
+}
+
+impl std::fmt::Display for MatcherLabel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(p) => write!(f, "{p:?}"),
+            Self::Many(ps) => write!(f, "{ps:?}"),
+        }
+    }
+}
+
+/// Shared walker used by both `resolve_glob` and
+/// `resolve_globs_batched`.
+///
+/// The `Matcher` parameterizes the match test; all other walker
+/// behavior (symlink and `skip_dir` pruning, on-match pruning,
+/// containment, dedup via `seen`, display-path construction) is
+/// identical and tested by the existing `test_resolve_glob_*` and
+/// `test_resolve_many_*` suites.
+///
+/// `Parallelism::Serial` is non-negotiable here — see the long comment
+/// on the jwalk busy-timeout bug and `test_resolve_glob_concurrent_callers`.
+fn resolve_with_matcher(
+    matcher: &Matcher,
+    label: &MatcherLabel<'_>,
+    base_dir: &Path,
+    containment_root: &Path,
+    seen: &mut BTreeSet<PathBuf>,
+    options: &GlobResolverOptions,
+) -> Vec<ResolvedPath> {
     let skip_symlinks = options.skip_symlinks;
     let skip_dirs = options.skip_dirs.clone();
     let base_dir_owned = base_dir.to_path_buf();
-    let set_for_prune = set.clone();
+    let matcher_for_prune = matcher.clone();
 
-    // Same walker config and pruning rules as `resolve_glob`; the only
-    // difference is we match against a `GlobSet` instead of a single
-    // compiled matcher. `Parallelism::Serial` is non-negotiable — see the
-    // comments on `resolve_glob` and `test_resolve_glob_concurrent_callers`.
     let walker = jwalk::WalkDirGeneric::<((), ())>::new(base_dir)
         .skip_hidden(false)
         .follow_links(false)
@@ -503,6 +431,7 @@ pub fn resolve_globs_batched(
                     return false;
                 };
 
+                // Skip symlinks if configured
                 if skip_symlinks && entry.file_type.is_symlink() {
                     return false;
                 }
@@ -516,17 +445,18 @@ pub fn resolve_globs_batched(
                         return true;
                     }
 
+                    // Prune skip_dirs entirely (don't yield, don't descend)
                     if skip_dirs.iter().any(|skip| name.as_ref() == skip.as_str()) {
                         return false;
                     }
 
-                    // On-match pruning: if this directory matches ANY glob
-                    // in the set, yield it but don't descend.
+                    // On-match pruning: if this directory matches the
+                    // matcher, yield it but don't descend into it.
                     let relative = path
                         .strip_prefix(&base_dir_owned)
                         .unwrap_or(path)
                         .join(name.as_ref());
-                    if set_for_prune.is_match(&relative) {
+                    if matcher_for_prune.is_match(&relative) {
                         entry.read_children_path = None;
                     }
                 }
@@ -541,14 +471,18 @@ pub fn resolve_globs_batched(
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
+                // Surface walker errors so silent data loss is impossible —
+                // particularly the jwalk busy-timeout that previously made
+                // concurrent walks return empty results.
                 log::warn!(
-                    "Glob walker error for patterns {patterns:?} in {}: {err}",
+                    "Glob walker error for {label} in {}: {err}",
                     base_dir.display()
                 );
                 continue;
             }
         };
 
+        // Skip the root directory itself (depth 0)
         if entry.depth == 0 {
             continue;
         }
@@ -559,20 +493,21 @@ pub fn resolve_globs_batched(
             continue;
         };
 
-        if !set.is_match(relative) {
+        if !matcher.is_match(relative) {
             continue;
         }
 
+        // We have a match — canonicalize and apply containment/dedup checks
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
 
         if options.enforce_containment && !canonical.starts_with(containment_root) {
-            log::warn!("Glob match escapes containment boundary, skipping: {patterns:?}");
+            log::warn!("Glob match escapes containment boundary, skipping: {label}");
             continue;
         }
 
-        // Skip if inside an already-resolved path
+        // Skip if this path is inside an already-resolved path
         if seen
             .iter()
             .any(|existing| canonical.starts_with(existing) && *existing != canonical)
@@ -581,7 +516,7 @@ pub fn resolve_globs_batched(
         }
 
         if !seen.insert(canonical.clone()) {
-            continue;
+            continue; // already seen
         }
 
         let display = canonical.strip_prefix(containment_root).map_or_else(
@@ -1187,5 +1122,59 @@ mod tests {
         // Also a different pattern matching the same path returns nothing.
         let r3 = r.resolve_many(&["*_modules"], root);
         assert!(r3.is_empty());
+    }
+
+    /// Stronger equivalence check: the full `ResolvedPath` values
+    /// (canonical AND display) returned by `resolve_many` must match
+    /// the sequential `resolve` output as sets.
+    ///
+    /// The existing `test_resolve_many_equivalent_to_sequential_resolve`
+    /// only compared display strings. This test also compares canonical
+    /// paths, locking in the invariant that the batched and sequential
+    /// paths compute identical `ResolvedPath` fields.
+    #[test]
+    fn test_resolve_many_display_strings_match_sequential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Build a fixture with a mix of glob-matchable and exact paths
+        // so the `resolve_many` exact-pattern path is exercised too.
+        fs::create_dir_all(root.join("apps/a/node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/b/node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/a/.turbo")).unwrap();
+        fs::create_dir_all(root.join("packages/p/dist")).unwrap();
+        fs::create_dir_all(root.join("keep")).unwrap();
+        fs::write(root.join("keep/README.md"), "x").unwrap();
+
+        let patterns = ["apps/a/.turbo", "**/node_modules", "**/dist"];
+
+        // Sequential reference
+        let mut r_seq = resolver(root);
+        let mut seq: Vec<ResolvedPath> = Vec::new();
+        for p in &patterns {
+            seq.extend(r_seq.resolve(p, root));
+        }
+
+        // Batched
+        let mut r_batch = resolver(root);
+        let batch = r_batch.resolve_many(&patterns, root);
+
+        // Compare as sets of (canonical, display) tuples so ordering
+        // differences between walker passes are absorbed but every
+        // field must match.
+        let seq_set: BTreeSet<(PathBuf, String)> = seq
+            .iter()
+            .map(|r| (r.canonical.clone(), r.display.clone()))
+            .collect();
+        let batch_set: BTreeSet<(PathBuf, String)> = batch
+            .iter()
+            .map(|r| (r.canonical.clone(), r.display.clone()))
+            .collect();
+
+        assert_eq!(
+            seq_set, batch_set,
+            "resolve_many must produce identical (canonical, display) \
+             pairs as sequential resolve"
+        );
+        assert_eq!(seq.len(), batch.len());
     }
 }

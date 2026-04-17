@@ -36,6 +36,16 @@ pub fn discover_configs(repo_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let mut configs: Vec<PathBuf> = jwalk::WalkDirGeneric::<((), ())>::new(repo_root)
         .skip_hidden(false)
         .sort(false)
+        // `Parallelism::Serial` is intentional here: jwalk's default
+        // `RayonDefaultPool` has a 1-second busy_timeout that causes
+        // silent `Err(Error::busy())` returns when the shared rayon pool
+        // is saturated by concurrent callers (see
+        // `test_resolve_glob_concurrent_callers` in
+        // `worktree_setup_glob`). This function is currently called once
+        // per process, but choosing serial here guards against future
+        // concurrent use and keeps our jwalk parallelism policy
+        // consistent across the workspace.
+        .parallelism(jwalk::Parallelism::Serial)
         .process_read_dir(|_depth, _path, _state, children| {
             // Prune directories we never want to enter.  Setting
             // `read_children_path = None` prevents jwalk from descending.
@@ -109,5 +119,73 @@ mod tests {
         };
 
         assert_eq!(get_config_display_name(&config), "my-app");
+    }
+
+    /// **Regression test for jwalk busy-timeout bug**, analogous to
+    /// `test_resolve_glob_concurrent_callers` in the `glob` crate.
+    ///
+    /// When many `discover_configs` calls run concurrently, they must
+    /// all produce correct results regardless of rayon pool contention.
+    /// `Parallelism::Serial` in `discover_configs` makes this trivial;
+    /// this test guards against any future revert.
+    #[test]
+    fn test_discover_configs_concurrent_callers() {
+        use std::fs;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Moderate-sized tree with configs scattered across subdirs so
+        // each walk does non-trivial work.
+        const THREADS: usize = 48;
+        const APPS_PER_ROOT: usize = 20;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots: Vec<PathBuf> = (0..THREADS)
+            .map(|i| {
+                let root = tmp.path().join(format!("repo-{i}"));
+                for j in 0..APPS_PER_ROOT {
+                    let app = root.join(format!("apps/app-{j}"));
+                    fs::create_dir_all(&app).unwrap();
+                    // One config per app (TOML) and some noise files.
+                    fs::write(app.join("worktree.config.toml"), "clean = []\n").unwrap();
+                    fs::write(app.join("package.json"), "{}").unwrap();
+                    fs::write(app.join("README.md"), "x").unwrap();
+                    for k in 0..10 {
+                        let sub = app.join(format!("src/dir-{k}"));
+                        fs::create_dir_all(&sub).unwrap();
+                        fs::write(sub.join("file.rs"), "fn main() {}").unwrap();
+                    }
+                }
+                root
+            })
+            .collect();
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for root in roots {
+            let failures = failures.clone();
+            handles.push(std::thread::spawn(move || {
+                let found = discover_configs(&root).unwrap();
+                if found.len() != APPS_PER_ROOT {
+                    eprintln!(
+                        "concurrent discover_configs returned {} configs for {}, expected {}",
+                        found.len(),
+                        root.display(),
+                        APPS_PER_ROOT,
+                    );
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let failed = failures.load(Ordering::Relaxed);
+        assert_eq!(
+            failed, 0,
+            "{failed}/{THREADS} concurrent discover_configs calls returned wrong counts — \
+             likely a regression of the jwalk busy-timeout bug"
+        );
     }
 }

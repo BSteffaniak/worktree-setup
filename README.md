@@ -24,9 +24,9 @@ cargo install worktree-setup
 
 The default command creates a worktree and applies configs. Subcommands handle other lifecycle operations:
 
-| Command                        | Description                                    |
-| ------------------------------ | ---------------------------------------------- |
-| `worktree-setup <path>`        | Create worktree + apply configs (default)      |
+| Command                        | Description                                     |
+| ------------------------------ | ----------------------------------------------- |
+| `worktree-setup <path>`        | Create worktree + apply configs (default)       |
 | `worktree-setup setup [path]`  | Apply configs to an existing directory          |
 | `worktree-setup clean [path]`  | Delete files/directories specified in configs   |
 | `worktree-setup remove [path]` | Remove worktrees and optionally delete branches |
@@ -338,28 +338,28 @@ worktree-setup ../my-worktree --profile dev --profile frontend
 
 ### Profile Defaults Reference
 
-| Field               | Type     | Description                                       |
-| ------------------- | -------- | ------------------------------------------------- |
-| `description`       | string   | Label for the profile                             |
-| `configs`           | string[] | Glob patterns to auto-select additional configs   |
-| `copyUnstaged`      | bool     | Copy unstaged/untracked files                     |
-| `overwriteExisting` | bool     | Overwrite existing files during file operations   |
-| `autoCreate`        | bool     | Skip "Create worktree?" confirmation              |
+| Field               | Type     | Description                                      |
+| ------------------- | -------- | ------------------------------------------------ |
+| `description`       | string   | Label for the profile                            |
+| `configs`           | string[] | Glob patterns to auto-select additional configs  |
+| `copyUnstaged`      | bool     | Copy unstaged/untracked files                    |
+| `overwriteExisting` | bool     | Overwrite existing files during file operations  |
+| `autoCreate`        | bool     | Skip "Create worktree?" confirmation             |
 | `creationMethod`    | string   | `"auto"`, `"current"`, `"remote"`, or `"detach"` |
-| `baseBranch`        | string   | Base branch for new worktree branches             |
-| `newBranch`         | bool     | Always create a new branch (auto-named)           |
-| `remote`            | string   | Remote name for remote branch operations          |
+| `baseBranch`        | string   | Base branch for new worktree branches            |
+| `newBranch`         | bool     | Always create a new branch (auto-named)          |
+| `remote`            | string   | Remote name for remote branch operations         |
 | `postSetup`         | string   | `"all"`, `"none"`, or `["cmd1", "cmd2"]`         |
-| `skipPostSetup`     | string[] | Commands to skip when `postSetup = "all"`         |
+| `skipPostSetup`     | string[] | Commands to skip when `postSetup = "all"`        |
 
 ## Global Configuration
 
 Global settings are loaded from two locations (repo-level overrides global):
 
-| Location                                      | Scope      |
-| --------------------------------------------- | ---------- |
-| `~/.config/worktree-setup/config.toml`        | All repos  |
-| `.worktree-setup.toml` (at repo root)         | This repo  |
+| Location                               | Scope     |
+| -------------------------------------- | --------- |
+| `~/.config/worktree-setup/config.toml` | All repos |
+| `.worktree-setup.toml` (at repo root)  | This repo |
 
 If neither file exists, defaults are used. Example:
 
@@ -375,18 +375,18 @@ allow_path_escape = false
 
 Controls whether local branches are deleted after removing a worktree:
 
-| Value    | Behavior                            |
-| -------- | ----------------------------------- |
-| `ASK`    | Prompt each time (default)          |
-| `ALWAYS` | Delete without asking               |
-| `NEVER`  | Never delete, don't ask             |
+| Value    | Behavior                   |
+| -------- | -------------------------- |
+| `ASK`    | Prompt each time (default) |
+| `ALWAYS` | Delete without asking      |
+| `NEVER`  | Never delete, don't ask    |
 
 ### Security
 
 Controls containment enforcement for file operations:
 
-| Field               | Type | Default | Description                                          |
-| ------------------- | ---- | ------- | ---------------------------------------------------- |
+| Field               | Type | Default | Description                                               |
+| ------------------- | ---- | ------- | --------------------------------------------------------- |
 | `allow_path_escape` | bool | `false` | When `false`, paths that escape the worktree are rejected |
 
 Per-config `allowPathEscape` overrides the global setting. When neither is set, containment is enforced (paths must stay within the worktree boundary).
@@ -412,40 +412,40 @@ Per-config `allowPathEscape` overrides the global setting. When neither is set, 
 
 ### Default (create + setup)
 
-| Flag                        | Description                                                      |
-| --------------------------- | ---------------------------------------------------------------- |
-| `<target-path>`             | Path where the worktree will be created                          |
-| `--branch <name>`           | Check out this branch, or use as start point with `--new-branch` |
-| `--new-branch <name>`       | Create a new branch for the worktree                             |
-| `--remote-branch <name>`    | Track a remote branch (fetches from origin first)                |
-| `--remote <name>`           | Remote name to use (auto-detected if omitted)                    |
-| `--no-infer-branch`         | Disable branch name inference from worktree directory name       |
-| `-c, --config <pattern>`    | Only use configs matching this pattern (can be repeated)         |
-| `--profile <name>`          | Use a named profile (can be repeated)                            |
-| `--unstaged`                | Copy unstaged/untracked files (overrides config)                 |
-| `--no-unstaged`             | Don't copy unstaged files (overrides config)                     |
-| `--no-install`              | Skip running post-setup commands                                 |
-| `-f, --force`               | Force worktree creation even if path is already registered       |
-| `--list`                    | List discovered configs and exit                                 |
-| `--non-interactive`         | Run without prompts (requires target-path)                       |
-| `--no-progress`             | Disable progress bars                                            |
-| `-v, --verbose`             | Enable debug output                                              |
+| Flag                     | Description                                                      |
+| ------------------------ | ---------------------------------------------------------------- |
+| `<target-path>`          | Path where the worktree will be created                          |
+| `--branch <name>`        | Check out this branch, or use as start point with `--new-branch` |
+| `--new-branch <name>`    | Create a new branch for the worktree                             |
+| `--remote-branch <name>` | Track a remote branch (fetches from origin first)                |
+| `--remote <name>`        | Remote name to use (auto-detected if omitted)                    |
+| `--no-infer-branch`      | Disable branch name inference from worktree directory name       |
+| `-c, --config <pattern>` | Only use configs matching this pattern (can be repeated)         |
+| `--profile <name>`       | Use a named profile (can be repeated)                            |
+| `--unstaged`             | Copy unstaged/untracked files (overrides config)                 |
+| `--no-unstaged`          | Don't copy unstaged files (overrides config)                     |
+| `--no-install`           | Skip running post-setup commands                                 |
+| `-f, --force`            | Force worktree creation even if path is already registered       |
+| `--list`                 | List discovered configs and exit                                 |
+| `--non-interactive`      | Run without prompts (requires target-path)                       |
+| `--no-progress`          | Disable progress bars                                            |
+| `-v, --verbose`          | Enable debug output                                              |
 
 ### setup
 
-| Flag                     | Description                                             |
-| ------------------------ | ------------------------------------------------------- |
-| `[target-path]`          | Path to the target directory (defaults to current dir)  |
+| Flag                     | Description                                              |
+| ------------------------ | -------------------------------------------------------- |
+| `[target-path]`          | Path to the target directory (defaults to current dir)   |
 | `-c, --config <pattern>` | Only use configs matching this pattern (can be repeated) |
-| `--profile <name>`       | Use a named profile (can be repeated)                   |
-| `--no-files`             | Skip file operations (symlinks, copies, templates)      |
-| `--overwrite`            | Overwrite existing files during file operations         |
-| `--unstaged`             | Copy unstaged/untracked files (overrides config)        |
-| `--no-unstaged`          | Don't copy unstaged files (overrides config)            |
-| `--no-install`           | Skip running post-setup commands                        |
-| `--non-interactive`      | Run without prompts, using defaults                     |
-| `--no-progress`          | Disable progress bars                                   |
-| `-v, --verbose`          | Enable debug output                                     |
+| `--profile <name>`       | Use a named profile (can be repeated)                    |
+| `--no-files`             | Skip file operations (symlinks, copies, templates)       |
+| `--overwrite`            | Overwrite existing files during file operations          |
+| `--unstaged`             | Copy unstaged/untracked files (overrides config)         |
+| `--no-unstaged`          | Don't copy unstaged files (overrides config)             |
+| `--no-install`           | Skip running post-setup commands                         |
+| `--non-interactive`      | Run without prompts, using defaults                      |
+| `--no-progress`          | Disable progress bars                                    |
+| `-v, --verbose`          | Enable debug output                                      |
 
 ### clean
 
@@ -459,18 +459,34 @@ Per-config `allowPathEscape` overrides the global setting. When neither is set, 
 | `--dry-run`              | Preview what would be deleted without deleting           |
 | `--non-interactive`      | Run without prompts (requires `--force` or `--dry-run`)  |
 | `--no-progress`          | Disable progress bars                                    |
+| `--max-parallel <N>`     | Cap concurrent worktree resolutions (see notes below)    |
 | `-v, --verbose`          | Enable debug output                                      |
+
+#### `--max-parallel`
+
+Controls the size of the thread pool used to resolve clean paths and
+compute disk usage across worktrees.
+
+- Default: `min(num_cpus, num_worktrees)` (or `1` if fewer)
+- Environment variable fallback: `WORKTREE_SETUP_MAX_PARALLEL`
+- CLI flag wins over the environment variable
+
+`clean` is disk-I/O-bound: on most hardware, raising `--max-parallel`
+above the default will _slow down_ the run because multiple walkers
+contend for the same disk. Lower it (e.g. `--max-parallel 4`) for
+network-mounted or slow disks; raise it only on fast NVMe arrays where
+you can verify a measurable speedup.
 
 ### remove
 
-| Flag                | Description                                              |
-| ------------------- | -------------------------------------------------------- |
-| `[target-path]`     | Path to the worktree to remove                           |
-| `-w, --worktrees`   | Interactively select worktrees to remove                 |
-| `-f, --force`       | Skip confirmation prompt                                 |
-| `--dry-run`         | Preview what would be removed without removing           |
-| `--non-interactive` | Run without prompts (requires `--force` or `--dry-run`)  |
-| `-v, --verbose`     | Enable debug output                                      |
+| Flag                | Description                                             |
+| ------------------- | ------------------------------------------------------- |
+| `[target-path]`     | Path to the worktree to remove                          |
+| `-w, --worktrees`   | Interactively select worktrees to remove                |
+| `-f, --force`       | Skip confirmation prompt                                |
+| `--dry-run`         | Preview what would be removed without removing          |
+| `--non-interactive` | Run without prompts (requires `--force` or `--dry-run`) |
+| `-v, --verbose`     | Enable debug output                                     |
 
 ## TypeScript Config
 

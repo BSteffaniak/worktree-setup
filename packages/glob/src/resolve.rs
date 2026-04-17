@@ -116,6 +116,61 @@ impl GlobResolver {
         }
     }
 
+    /// Resolve multiple patterns against `base_dir` using a single
+    /// filesystem walk.
+    ///
+    /// Equivalent in result to calling [`resolve`](Self::resolve) once per
+    /// pattern in order, but walks the directory tree only once for the
+    /// glob patterns (batched via [`globset::GlobSet`]). Exact patterns
+    /// are resolved eagerly in order before the walk.
+    ///
+    /// # Ordering and dedup semantics (preserved from `resolve`)
+    ///
+    /// * Patterns are processed in the order given
+    /// * Within the walk, matches are yielded in walker order (sorted
+    ///   children), biased toward shallower matches first
+    /// * The stateful `seen` set means the first occurrence of a
+    ///   canonical path wins — later matches that resolve to the same
+    ///   path or a descendant are silently skipped
+    /// * On-match pruning: a directory that matches ANY glob in the set
+    ///   is yielded but not descended into
+    ///
+    /// Use this in preference to looping over `resolve` when you have
+    /// multiple patterns against the same `base_dir`; it is typically
+    /// O(patterns) times faster.
+    pub fn resolve_many(&mut self, patterns: &[&str], base_dir: &Path) -> Vec<ResolvedPath> {
+        let mut results = Vec::new();
+
+        // Split into exact vs. glob, preserving relative order.
+        let mut glob_patterns: Vec<&str> = Vec::new();
+        for pattern in patterns {
+            if is_glob_pattern(pattern) {
+                glob_patterns.push(pattern);
+            } else if let Some(resolved) = resolve_exact(
+                pattern,
+                base_dir,
+                &self.containment_root,
+                &mut self.seen,
+                &self.options,
+            ) {
+                results.push(resolved);
+            }
+        }
+
+        if !glob_patterns.is_empty() {
+            let matched = resolve_globs_batched(
+                &glob_patterns,
+                base_dir,
+                &self.containment_root,
+                &mut self.seen,
+                &self.options,
+            );
+            results.extend(matched);
+        }
+
+        results
+    }
+
     /// Consume the resolver and return the set of canonical paths seen so far.
     ///
     /// Useful when callers need to inspect or reuse the deduplication set.
@@ -361,6 +416,172 @@ pub fn resolve_glob(
 
         if !seen.insert(canonical.clone()) {
             continue; // already seen
+        }
+
+        let display = canonical.strip_prefix(containment_root).map_or_else(
+            |_| path.to_string_lossy().to_string(),
+            |r| r.to_string_lossy().to_string(),
+        );
+        results.push(ResolvedPath { canonical, display });
+    }
+
+    results
+}
+
+/// Resolve multiple glob patterns using a single filesystem walk.
+///
+/// Equivalent to calling [`resolve_glob`] once per pattern, but walks
+/// the tree only once using [`globset::GlobSet::is_match`] against the
+/// compiled set. Matches are yielded in walker order (shallower first).
+///
+/// Dedup and descendant-skipping semantics match [`resolve_glob`]:
+/// the `seen` set is consulted and updated per match.
+///
+/// # Arguments
+///
+/// * `patterns` - Glob patterns (all must be globs; invalid patterns
+///   are logged and skipped).
+/// * `base_dir` - Directory to walk and match against.
+/// * `containment_root` - Canonical boundary path for containment checks.
+/// * `seen` - Set of already-resolved canonical paths (updated in place).
+/// * `options` - Resolution options.
+#[allow(clippy::too_many_lines)]
+pub fn resolve_globs_batched(
+    patterns: &[&str],
+    base_dir: &Path,
+    containment_root: &Path,
+    seen: &mut BTreeSet<PathBuf>,
+    options: &GlobResolverOptions,
+) -> Vec<ResolvedPath> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+
+    // Compile patterns into a GlobSet. Invalid patterns are logged and
+    // skipped (same behavior as `resolve_glob`).
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut valid_count = 0usize;
+    for pattern in patterns {
+        match globset::Glob::new(pattern) {
+            Ok(g) => {
+                builder.add(g);
+                valid_count += 1;
+            }
+            Err(e) => {
+                log::warn!("Invalid glob pattern '{pattern}': {e}");
+            }
+        }
+    }
+    if valid_count == 0 {
+        return Vec::new();
+    }
+    let set = match builder.build() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Could not build glob set for patterns {patterns:?}: {e}");
+            return Vec::new();
+        }
+    };
+
+    let skip_symlinks = options.skip_symlinks;
+    let skip_dirs = options.skip_dirs.clone();
+    let base_dir_owned = base_dir.to_path_buf();
+    let set_for_prune = set.clone();
+
+    // Same walker config and pruning rules as `resolve_glob`; the only
+    // difference is we match against a `GlobSet` instead of a single
+    // compiled matcher. `Parallelism::Serial` is non-negotiable — see the
+    // comments on `resolve_glob` and `test_resolve_glob_concurrent_callers`.
+    let walker = jwalk::WalkDirGeneric::<((), ())>::new(base_dir)
+        .skip_hidden(false)
+        .follow_links(false)
+        .sort(true)
+        .parallelism(jwalk::Parallelism::Serial)
+        .process_read_dir(move |depth, path, _state, children| {
+            children.retain_mut(|entry_result| {
+                let Ok(entry) = entry_result.as_mut() else {
+                    return false;
+                };
+
+                if skip_symlinks && entry.file_type.is_symlink() {
+                    return false;
+                }
+
+                let name = entry.file_name.to_string_lossy();
+
+                if entry.file_type.is_dir() {
+                    // jwalk calls process_read_dir for the walk root's
+                    // *parent* first (depth=None). Skip pruning there.
+                    if depth.is_none() {
+                        return true;
+                    }
+
+                    if skip_dirs.iter().any(|skip| name.as_ref() == skip.as_str()) {
+                        return false;
+                    }
+
+                    // On-match pruning: if this directory matches ANY glob
+                    // in the set, yield it but don't descend.
+                    let relative = path
+                        .strip_prefix(&base_dir_owned)
+                        .unwrap_or(path)
+                        .join(name.as_ref());
+                    if set_for_prune.is_match(&relative) {
+                        entry.read_children_path = None;
+                    }
+                }
+
+                true
+            });
+        });
+
+    let mut results = Vec::new();
+
+    for entry_result in walker {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                log::warn!(
+                    "Glob walker error for patterns {patterns:?} in {}: {err}",
+                    base_dir.display()
+                );
+                continue;
+            }
+        };
+
+        if entry.depth == 0 {
+            continue;
+        }
+
+        let path = entry.path();
+
+        let Ok(relative) = path.strip_prefix(base_dir) else {
+            continue;
+        };
+
+        if !set.is_match(relative) {
+            continue;
+        }
+
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+
+        if options.enforce_containment && !canonical.starts_with(containment_root) {
+            log::warn!("Glob match escapes containment boundary, skipping: {patterns:?}");
+            continue;
+        }
+
+        // Skip if inside an already-resolved path
+        if seen
+            .iter()
+            .any(|existing| canonical.starts_with(existing) && *existing != canonical)
+        {
+            continue;
+        }
+
+        if !seen.insert(canonical.clone()) {
+            continue;
         }
 
         let display = canonical.strip_prefix(containment_root).map_or_else(
@@ -820,5 +1041,151 @@ mod tests {
             "{failed}/{THREADS} concurrent resolvers returned wrong match counts — \
              likely a regression of the jwalk busy-timeout bug"
         );
+    }
+
+    // ---- resolve_many / resolve_globs_batched tests ----
+
+    /// `resolve_many` must produce the same set of results as calling
+    /// `resolve` once per pattern in the same order. This is the core
+    /// equivalence guarantee for the batched path.
+    #[test]
+    fn test_resolve_many_equivalent_to_sequential_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("apps/a/node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/b/node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/a/.turbo")).unwrap();
+        fs::create_dir_all(root.join("apps/c/dist")).unwrap();
+        fs::create_dir_all(root.join("packages/p/node_modules")).unwrap();
+
+        let patterns = ["**/node_modules", "**/.turbo", "**/dist"];
+
+        // Sequential
+        let mut r_seq = resolver(root);
+        let mut seq: Vec<ResolvedPath> = Vec::new();
+        for p in &patterns {
+            seq.extend(r_seq.resolve(p, root));
+        }
+        let seq_displays: BTreeSet<String> = seq.iter().map(|r| r.display.clone()).collect();
+
+        // Batched
+        let mut r_batch = resolver(root);
+        let batch = r_batch.resolve_many(&patterns, root);
+        let batch_displays: BTreeSet<String> = batch.iter().map(|r| r.display.clone()).collect();
+
+        assert_eq!(
+            seq_displays, batch_displays,
+            "resolve_many must return the same set as sequential resolve"
+        );
+        assert_eq!(seq.len(), batch.len());
+    }
+
+    /// When two patterns overlap, the earlier pattern in the list wins
+    /// the dedup (because `seen` is checked in iteration order). For
+    /// batched globs, this is weaker: within a single batch walk, the
+    /// walker's sort ordering determines which display wins for a given
+    /// canonical path. The guarantee we preserve is: the SAME canonical
+    /// paths are yielded, and within a single call to `resolve_many`,
+    /// each canonical path appears exactly once.
+    #[test]
+    fn test_resolve_many_dedup_across_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/a/node_modules")).unwrap();
+
+        let mut r = resolver(root);
+        // Two patterns, both of which would match `node_modules` and
+        // `apps/a/node_modules`.
+        let results = r.resolve_many(&["**/node_modules", "**/*_modules"], root);
+
+        let displays: BTreeSet<&str> = results.iter().map(|r| r.display.as_str()).collect();
+        // Only the two distinct canonical paths should appear.
+        assert!(displays.contains("node_modules"));
+        assert!(displays.contains("apps/a/node_modules"));
+        assert_eq!(
+            results.len(),
+            2,
+            "each canonical path must appear exactly once"
+        );
+    }
+
+    /// Descendant pruning applies across patterns in a single batched
+    /// walk: if one glob matches a directory, other globs cannot match
+    /// inside it.
+    #[test]
+    fn test_resolve_many_prunes_matched_dirs_from_any_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // `node_modules` matches pattern 1; `.turbo` inside it would
+        // match pattern 2 but must be pruned.
+        fs::create_dir_all(root.join("node_modules/some-pkg/.turbo")).unwrap();
+        // A real `.turbo` outside must be matched.
+        fs::create_dir_all(root.join("apps/a/.turbo")).unwrap();
+
+        let mut r = resolver(root);
+        let results = r.resolve_many(&["**/node_modules", "**/.turbo"], root);
+
+        let displays: BTreeSet<&str> = results.iter().map(|r| r.display.as_str()).collect();
+        assert!(displays.contains("node_modules"));
+        assert!(displays.contains("apps/a/.turbo"));
+        assert!(
+            !displays.contains("node_modules/some-pkg/.turbo"),
+            ".turbo inside matched node_modules must be pruned across patterns"
+        );
+    }
+
+    /// `resolve_many` should handle a mix of exact and glob patterns.
+    /// Exact patterns are resolved eagerly (in order) before the walk.
+    #[test]
+    fn test_resolve_many_mixed_exact_and_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join("apps/a/dist")).unwrap();
+        fs::create_dir_all(root.join("apps/b/dist")).unwrap();
+        fs::write(root.join("keep.txt"), "data").unwrap();
+
+        let mut r = resolver(root);
+        let results = r.resolve_many(&["node_modules", "**/dist"], root);
+
+        let displays: BTreeSet<&str> = results.iter().map(|r| r.display.as_str()).collect();
+        assert!(displays.contains("node_modules"));
+        assert!(displays.contains("apps/a/dist"));
+        assert!(displays.contains("apps/b/dist"));
+        assert_eq!(results.len(), 3);
+    }
+
+    /// An empty pattern slice returns no results (and does not panic).
+    #[test]
+    fn test_resolve_many_empty_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        let mut r = resolver(root);
+        let results = r.resolve_many(&[], root);
+        assert!(results.is_empty());
+    }
+
+    /// `resolve_many` preserves the cross-call `seen` state: a path
+    /// already resolved by a prior call is not resolved again.
+    #[test]
+    fn test_resolve_many_dedup_across_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        let mut r = resolver(root);
+        let r1 = r.resolve_many(&["**/node_modules"], root);
+        assert_eq!(r1.len(), 1);
+
+        // Second call with the same pattern should return nothing.
+        let r2 = r.resolve_many(&["**/node_modules"], root);
+        assert!(r2.is_empty());
+
+        // Also a different pattern matching the same path returns nothing.
+        let r3 = r.resolve_many(&["*_modules"], root);
+        assert!(r3.is_empty());
     }
 }

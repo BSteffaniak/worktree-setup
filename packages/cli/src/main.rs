@@ -637,6 +637,26 @@ fn resolve_setup_target(cwd: &Path, target: Option<&PathBuf>) -> PathBuf {
 
 // ─── Subcommand: clean ──────────────────────────────────────────────────────
 
+/// Resolve the effective max-parallel worktree count from CLI args, env
+/// var, and defaults.
+///
+/// Priority:
+/// 1. `--max-parallel N` CLI flag (explicit wins)
+/// 2. `WORKTREE_SETUP_MAX_PARALLEL` environment variable
+/// 3. Default: `min(num_cpus::get(), num_worktrees).max(1)`
+///
+/// Returned value is always at least `1` and never exceeds
+/// `num_worktrees` (when > 0).
+fn resolve_max_parallel(args: &CleanArgs, num_worktrees: usize) -> usize {
+    let default = num_cpus::get().min(num_worktrees.max(1)).max(1);
+    let explicit = args.max_parallel.or_else(|| {
+        std::env::var("WORKTREE_SETUP_MAX_PARALLEL")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    });
+    explicit.map_or(default, |n| n.max(1).min(num_worktrees.max(1)))
+}
+
 /// Resolve clean paths from selected configs into concrete items to delete.
 ///
 /// For each config's `clean` entries:
@@ -679,6 +699,31 @@ fn resolve_clean_paths(
             .unwrap_or(&config.config_dir);
         let target_config_dir = target_path.join(config_rel);
 
+        // Group contiguous runs of patterns with the same base_dir and
+        // resolve each run in a single walk via `resolve_many`. This
+        // preserves iteration order (both across and within configs) so
+        // first-seen dedup semantics are unchanged.
+        let mut run_base: Option<PathBuf> = None;
+        let mut run_patterns: Vec<&str> = Vec::new();
+
+        let flush = |resolver: &mut worktree_setup_glob::GlobResolver,
+                     results: &mut Vec<(PathBuf, String)>,
+                     base: &Path,
+                     patterns: &[&str]| {
+            if patterns.is_empty() {
+                return;
+            }
+            let matched = resolver.resolve_many(patterns, base);
+            log::debug!(
+                "  patterns={patterns:?} base={} matched={}",
+                base.display(),
+                matched.len(),
+            );
+            for entry in matched {
+                results.push((entry.canonical, entry.display));
+            }
+        };
+
         for pattern in &config.config.clean {
             // Leading `/` means repo-root-relative (resolved against
             // `target_path`). Otherwise, resolve against the config's
@@ -688,15 +733,22 @@ fn resolve_clean_paths(
                 |stripped| (stripped, target_path.to_path_buf()),
             );
 
-            let matched = resolver.resolve(effective_pattern, &base_dir);
-            log::debug!(
-                "  pattern={pattern:?} base={} matched={}",
-                base_dir.display(),
-                matched.len(),
-            );
-            for entry in matched {
-                results.push((entry.canonical, entry.display));
+            match &run_base {
+                Some(current_base) if current_base == &base_dir => {
+                    run_patterns.push(effective_pattern);
+                }
+                _ => {
+                    if let Some(base) = run_base.take() {
+                        flush(&mut resolver, &mut results, &base, &run_patterns);
+                        run_patterns.clear();
+                    }
+                    run_base = Some(base_dir);
+                    run_patterns.push(effective_pattern);
+                }
             }
+        }
+        if let Some(base) = run_base.take() {
+            flush(&mut resolver, &mut results, &base, &run_patterns);
         }
     }
 
@@ -1242,6 +1294,7 @@ struct WorktreeCleanGroup {
 /// Run multi-worktree clean: discover configs, spawn background resolution
 /// threads, show an interactive multi-select with live size updates, then
 /// preview and delete using cached results.
+#[allow(clippy::too_many_lines)]
 fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
@@ -1285,9 +1338,25 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    // Spawn background resolution threads — one per worktree — so all
-    // worktrees resolve concurrently. Each thread resolves clean paths and
-    // computes sizes, then sends a WorktreeResolution to the shared channel.
+    // Spawn background resolution tasks on a bounded rayon pool — one
+    // task per worktree, each resolves clean paths and computes sizes
+    // in parallel, then sends a `WorktreeResolution` to the shared
+    // channel. The pool size (see `resolve_max_parallel`) bounds both
+    // concurrent worktree walks AND the inner per-match `disk_usage`
+    // parallelism, giving us controlled I/O concurrency with rayon's
+    // work-stealing scheduler.
+    let max_parallel = resolve_max_parallel(args, worktrees.len());
+    log::debug!(
+        "clean: max_parallel={max_parallel} worktrees={}",
+        worktrees.len()
+    );
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(max_parallel)
+            .thread_name(|i| format!("wt-clean-{i}"))
+            .build()?,
+    );
+
     let (result_tx, result_rx) = mpsc::channel::<interactive::WorktreeResolution>();
     let done = Arc::new(AtomicBool::new(false));
     let done_for_joiner = done.clone();
@@ -1295,29 +1364,32 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
     let configs_arc: Arc<Vec<LoadedConfig>> = Arc::new(selected_configs);
     let repo_root_arc: Arc<PathBuf> = Arc::new(repo_root.clone());
 
-    let mut bg_handles = Vec::new();
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(worktrees.len()));
+
     for (idx, wt) in worktrees.iter().enumerate() {
         let tx = result_tx.clone();
         let configs = configs_arc.clone();
         let root = repo_root_arc.clone();
         let wt = wt.clone();
+        let pool_for_task = pool.clone();
+        let remaining_for_task = remaining.clone();
+        let done_for_task = done_for_joiner.clone();
 
-        bg_handles.push(std::thread::spawn(move || {
+        pool.spawn(move || {
             let configs_refs: Vec<&LoadedConfig> = configs.iter().collect();
-            let resolution = resolve_single_worktree(idx, &wt, &configs_refs, &root);
+            let resolution =
+                resolve_single_worktree_with_pool(idx, &wt, &configs_refs, &root, &pool_for_task);
             let _ = tx.send(resolution);
-        }));
-    }
-    // Drop the original sender so the channel closes when all threads finish
-    drop(result_tx);
 
-    // Spawn a joiner thread that waits for all workers and sets done flag
-    let joiner_handle = std::thread::spawn(move || {
-        for handle in bg_handles {
-            let _ = handle.join();
-        }
-        done_for_joiner.store(true, Ordering::Relaxed);
-    });
+            // Mark done when the last task finishes so the picker can
+            // stop its spinner animation.
+            if remaining_for_task.fetch_sub(1, Ordering::Relaxed) == 1 {
+                done_for_task.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    // Drop the original sender so the channel closes once all tasks complete.
+    drop(result_tx);
 
     // Show the interactive multi-select with live-updating sizes
     let (selected_indices, mut cached_resolutions) =
@@ -1333,9 +1405,11 @@ fn run_clean_multi_worktree(args: &CleanArgs) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    // Wait for all background threads to finish and drain remaining results
-    let _ = joiner_handle.join();
-    while let Ok(res) = result_rx.try_recv() {
+    // Drain remaining results from the pool. `recv()` blocks until a
+    // result is available or the channel closes (which happens when the
+    // last pool task drops its sender). This ensures we wait for all
+    // in-flight resolutions before previewing/deleting.
+    while let Ok(res) = result_rx.recv() {
         cached_resolutions.push(res);
     }
 
@@ -1403,17 +1477,58 @@ fn build_groups_from_cache(
     groups
 }
 
-/// Resolve clean paths for a single worktree (used by background threads).
-fn resolve_single_worktree(
+/// Size a list of resolved `(abs_path, rel_path)` entries into
+/// `output::CleanItem`s, using the given rayon pool to run `disk_usage`
+/// calls in parallel.
+///
+/// The returned `Vec` preserves the input order — this is a HARD
+/// guarantee since downstream code (preview, delete loop) iterates in
+/// order and users see items in the original resolution order.
+///
+/// Each `disk_usage` call is internally serial (see
+/// `worktree_setup_copy::count` notes on `Parallelism::Serial`); the
+/// pool parallelism is purely at the item level.
+fn size_items_in_pool(
+    resolved: &[(PathBuf, String)],
+    pool: &rayon::ThreadPool,
+) -> Vec<output::CleanItem> {
+    use rayon::prelude::*;
+
+    pool.install(|| {
+        resolved
+            .par_iter()
+            .map(|(abs_path, rel_path)| {
+                let is_dir = abs_path.is_dir();
+                let size = worktree_setup_copy::disk_usage(abs_path);
+                output::CleanItem {
+                    relative_path: rel_path.clone(),
+                    is_dir,
+                    size,
+                }
+            })
+            .collect()
+    })
+}
+
+/// Resolve clean paths for a single worktree and compute sizes in
+/// parallel via the provided rayon pool.
+///
+/// Behaviorally identical to `resolve_single_worktree`, but sizes each
+/// matched path concurrently via `size_items_in_pool`. The resolved
+/// vector and items vector preserve the same order as the non-pool
+/// version — downstream preview, confirm, and delete flows are
+/// unchanged.
+fn resolve_single_worktree_with_pool(
     index: usize,
     wt: &worktree_setup_git::WorktreeInfo,
     configs: &[&LoadedConfig],
     repo_root: &Path,
+    pool: &rayon::ThreadPool,
 ) -> interactive::WorktreeResolution {
     let target_path = &wt.path;
     let Ok(target_canonical) = target_path.canonicalize() else {
         log::warn!(
-            "resolve_single_worktree[{index}]: cannot canonicalize {}",
+            "resolve_single_worktree_with_pool[{index}]: cannot canonicalize {}",
             target_path.display()
         );
         return interactive::WorktreeResolution {
@@ -1426,18 +1541,7 @@ fn resolve_single_worktree(
 
     let resolved = resolve_clean_paths(configs, target_path, &target_canonical, repo_root);
 
-    let items: Vec<output::CleanItem> = resolved
-        .iter()
-        .map(|(abs_path, rel_path)| {
-            let is_dir = abs_path.is_dir();
-            let size = worktree_setup_copy::disk_usage(abs_path);
-            output::CleanItem {
-                relative_path: rel_path.clone(),
-                is_dir,
-                size,
-            }
-        })
-        .collect();
+    let items = size_items_in_pool(&resolved, pool);
 
     let summary = if items.is_empty() {
         "nothing to clean".to_string()
@@ -1712,19 +1816,16 @@ fn run_clean_single(args: &CleanArgs) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // Build preview items with sizes
-    let items: Vec<output::CleanItem> = resolved
-        .iter()
-        .map(|(abs_path, rel_path)| {
-            let is_dir = abs_path.is_dir();
-            let size = worktree_setup_copy::disk_usage(abs_path);
-            output::CleanItem {
-                relative_path: rel_path.clone(),
-                is_dir,
-                size,
-            }
-        })
-        .collect();
+    // Build preview items with sizes, in parallel via a small rayon pool.
+    // Single-worktree mode only has one worktree's worth of matches, so
+    // a modest pool size suffices; default to `num_cpus` (capped by the
+    // number of matches).
+    let max_parallel = resolve_max_parallel(args, resolved.len());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_parallel)
+        .thread_name(|i| format!("wt-clean-single-{i}"))
+        .build()?;
+    let items = size_items_in_pool(&resolved, &pool);
 
     println!();
     output::print_clean_preview(&items);

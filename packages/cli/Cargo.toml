@@ -22,8 +22,10 @@ dialoguer = { workspace = true }
 indicatif = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+num_cpus = { workspace = true }
 path-clean = { workspace = true }
 pretty_env_logger = { workspace = true }
+rayon = { workspace = true }
 worktree_setup_config = { workspace = true }
 worktree_setup_copy = { workspace = true }
 worktree_setup_git = { workspace = true }

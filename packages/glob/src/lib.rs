@@ -34,5 +34,5 @@ mod resolve;
 
 pub use resolve::{
     DEFAULT_SKIP_DIRS, GlobResolver, GlobResolverOptions, ResolvedPath, filter_descendants,
-    is_glob_pattern, resolve_exact, resolve_glob,
+    is_glob_pattern, resolve_exact, resolve_glob, resolve_globs_batched,
 };

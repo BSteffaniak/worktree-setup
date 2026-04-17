@@ -250,6 +250,15 @@ pub struct CleanArgs {
     #[arg(long = "no-progress")]
     pub no_progress: bool,
 
+    /// Maximum number of worktrees to resolve concurrently.
+    ///
+    /// Controls the size of the thread pool used for filesystem walks and
+    /// disk-usage computation. Defaults to `min(num_cpus, num_worktrees)`.
+    /// Can also be set via the `WORKTREE_SETUP_MAX_PARALLEL` environment
+    /// variable.
+    #[arg(long, value_name = "N")]
+    pub max_parallel: Option<usize>,
+
     /// Enable verbose output.
     #[arg(long, short = 'v')]
     pub verbose: bool,

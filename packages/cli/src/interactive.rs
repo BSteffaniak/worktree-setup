@@ -116,6 +116,7 @@ const SPINNER_TICK_MS: u64 = 80;
 /// * `↓`/`j`/`Tab` — move cursor down
 /// * `Space` — toggle selection
 /// * `a` — toggle all
+/// * `s` — toggle size sort (descending, then ascending)
 /// * `Enter` — confirm
 /// * `Escape`/`q` — cancel
 ///
@@ -152,7 +153,9 @@ pub fn select_worktrees_with_sizes(
         checked: vec![false; count],
         statuses: vec![None; count],
         resolutions: Vec::new(),
+        order: (0..count).collect(),
         cursor: 0,
+        sort_mode: SizeSortMode::Original,
         spinner_frame: 0,
     };
 
@@ -182,7 +185,7 @@ pub fn select_worktrees_with_sizes(
     let prompt_line = format!(
         "{} {}",
         "?".green().bold(),
-        "Select worktrees to clean (space to toggle, enter to confirm):".bold()
+        "Select worktrees to clean (space to toggle, s to sort by size, enter to confirm):".bold()
     );
     term.write_line(&prompt_line)?;
     render_items(
@@ -190,6 +193,7 @@ pub fn select_worktrees_with_sizes(
         &labels,
         &state.checked,
         &state.statuses,
+        &state.order,
         state.cursor,
         state.spinner_frame,
     )?;
@@ -209,12 +213,34 @@ pub fn select_worktrees_with_sizes(
     result.map(|sel| (sel, state.resolutions))
 }
 
+/// Size sort mode for the clean worktree picker.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SizeSortMode {
+    /// Preserve the original worktree discovery order.
+    Original,
+    /// Show larger resolved worktrees first.
+    Desc,
+    /// Show smaller resolved worktrees first.
+    Asc,
+}
+
+impl SizeSortMode {
+    const fn toggle(self) -> Self {
+        match self {
+            Self::Original | Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
 /// Mutable state for the custom multi-select widget.
 struct SelectState {
     checked: Vec<bool>,
     statuses: Vec<Option<output::CleanStats>>,
     resolutions: Vec<WorktreeResolution>,
+    order: Vec<usize>,
     cursor: usize,
+    sort_mode: SizeSortMode,
     spinner_frame: usize,
 }
 
@@ -235,12 +261,17 @@ fn run_select_loop(
     loop {
         // Drain all available background results
         let mut needs_redraw = false;
+        let mut needs_resort = false;
         while let Ok(res) = result_rx.try_recv() {
             if res.index < count {
                 state.statuses[res.index] = Some(res.stats.clone());
                 needs_redraw = true;
+                needs_resort = state.sort_mode != SizeSortMode::Original;
             }
             state.resolutions.push(res);
+        }
+        if needs_resort {
+            rebuild_select_order(state);
         }
 
         // Process all available key events
@@ -257,7 +288,9 @@ fn run_select_loop(
                 }
                 // Toggle current
                 Key::Char(' ') => {
-                    state.checked[state.cursor] = !state.checked[state.cursor];
+                    if let Some(&index) = state.order.get(state.cursor) {
+                        state.checked[index] = !state.checked[index];
+                    }
                 }
                 // Toggle all
                 Key::Char('a') => {
@@ -265,6 +298,11 @@ fn run_select_loop(
                     for c in &mut state.checked {
                         *c = !all_checked;
                     }
+                }
+                // Toggle size sort
+                Key::Char('s') => {
+                    state.sort_mode = state.sort_mode.toggle();
+                    rebuild_select_order(state);
                 }
                 // Confirm
                 Key::Enter => {
@@ -303,6 +341,7 @@ fn run_select_loop(
                 labels,
                 &state.checked,
                 &state.statuses,
+                &state.order,
                 state.cursor,
                 state.spinner_frame,
             )?;
@@ -310,6 +349,54 @@ fn run_select_loop(
 
         // Sleep to avoid busy-waiting (also controls spinner speed)
         std::thread::sleep(Duration::from_millis(SPINNER_TICK_MS));
+    }
+}
+
+fn rebuild_select_order(state: &mut SelectState) {
+    let focused_index = state.order.get(state.cursor).copied();
+    state.order = sorted_select_order(state.statuses.len(), &state.statuses, state.sort_mode);
+    state.cursor = focused_index
+        .and_then(|index| state.order.iter().position(|&ordered| ordered == index))
+        .unwrap_or(0);
+}
+
+fn sorted_select_order(
+    count: usize,
+    statuses: &[Option<output::CleanStats>],
+    sort_mode: SizeSortMode,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..count).collect();
+    match sort_mode {
+        SizeSortMode::Original => order,
+        SizeSortMode::Desc => {
+            order.sort_by(|&left, &right| compare_status_size(statuses, left, right, true));
+            order
+        }
+        SizeSortMode::Asc => {
+            order.sort_by(|&left, &right| compare_status_size(statuses, left, right, false));
+            order
+        }
+    }
+}
+
+fn compare_status_size(
+    statuses: &[Option<output::CleanStats>],
+    left: usize,
+    right: usize,
+    descending: bool,
+) -> std::cmp::Ordering {
+    match (statuses.get(left), statuses.get(right)) {
+        (Some(Some(left_stats)), Some(Some(right_stats))) => {
+            let size_cmp = if descending {
+                right_stats.total_size.cmp(&left_stats.total_size)
+            } else {
+                left_stats.total_size.cmp(&right_stats.total_size)
+            };
+            size_cmp.then_with(|| left.cmp(&right))
+        }
+        (Some(Some(_)), _) => std::cmp::Ordering::Less,
+        (_, Some(Some(_))) => std::cmp::Ordering::Greater,
+        _ => left.cmp(&right),
     }
 }
 
@@ -324,6 +411,7 @@ fn render_items(
     labels: &[String],
     checked: &[bool],
     statuses: &[Option<output::CleanStats>],
+    order: &[usize],
     cursor: usize,
     spinner_frame: usize,
 ) -> io::Result<()> {
@@ -333,11 +421,12 @@ fn render_items(
         .max()
         .unwrap_or(0);
 
-    for (i, label) in labels.iter().enumerate() {
-        let is_active = i == cursor;
+    for (row, &i) in order.iter().enumerate() {
+        let is_active = row == cursor;
 
         let prefix = if is_active { ">" } else { " " };
         let checkbox = if checked[i] { "[x]" } else { "[ ]" };
+        let label = &labels[i];
 
         let status = statuses[i].as_ref().map_or_else(
             || {
@@ -1305,4 +1394,57 @@ pub fn prompt_setup_operations(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(total_size: u64) -> output::CleanStats {
+        output::CleanStats {
+            item_count: 1,
+            total_size,
+            empty_dir_count: 0,
+            inaccessible: false,
+        }
+    }
+
+    #[test]
+    fn test_sorted_select_order_original() {
+        let statuses = vec![Some(stats(20)), None, Some(stats(10))];
+        assert_eq!(
+            sorted_select_order(statuses.len(), &statuses, SizeSortMode::Original),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn test_sorted_select_order_desc_and_asc_keep_pending_last() {
+        let statuses = vec![Some(stats(20)), None, Some(stats(10)), Some(stats(30))];
+        assert_eq!(
+            sorted_select_order(statuses.len(), &statuses, SizeSortMode::Desc),
+            vec![3, 0, 2, 1]
+        );
+        assert_eq!(
+            sorted_select_order(statuses.len(), &statuses, SizeSortMode::Asc),
+            vec![2, 0, 3, 1]
+        );
+    }
+
+    #[test]
+    fn test_rebuild_select_order_keeps_cursor_on_same_worktree() {
+        let mut state = SelectState {
+            checked: vec![false; 3],
+            statuses: vec![Some(stats(10)), Some(stats(30)), Some(stats(20))],
+            resolutions: Vec::new(),
+            order: vec![0, 1, 2],
+            cursor: 2,
+            sort_mode: SizeSortMode::Desc,
+            spinner_frame: 0,
+        };
+
+        rebuild_select_order(&mut state);
+        assert_eq!(state.order, vec![1, 2, 0]);
+        assert_eq!(state.cursor, 1);
+    }
 }

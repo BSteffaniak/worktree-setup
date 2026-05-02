@@ -134,13 +134,13 @@ worktree-setup clean --worktrees
 The `--worktrees` flag opens a multi-select picker that shows all worktrees with live-updating sizes as paths are resolved in the background:
 
 ```
-? Select worktrees to clean (space to toggle, enter to confirm):
+? Select worktrees to clean (space to toggle, s to sort by size, enter to confirm):
 > [ ] feature-a (/path/to/wt-a)  ████████ 3 items, 1.8 GiB
   [ ] feature-b (/path/to/wt-b)  ⠋ resolving...
   [ ] feature-c (/path/to/wt-c)  ∅ 2 empty dirs
 ```
 
-Items are resolved in parallel — sizes appear as each worktree finishes scanning. The live checkbox list does not reorder while you are selecting. Once sizes are known in the final preview, worktrees and clean items are sorted largest-first; truly empty directories are shown separately from almost-empty entries.
+Items are resolved in parallel — sizes appear as each worktree finishes scanning. The live checkbox list starts in discovery order and does not reorder unless you press `s`; `s` toggles size sorting between largest-first and smallest-first while preserving selections by worktree. Once sizes are known in the final preview, worktrees and clean items are sorted largest-first; truly empty directories are shown separately from almost-empty entries.
 
 ### remove
 

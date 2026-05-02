@@ -135,12 +135,12 @@ The `--worktrees` flag opens a multi-select picker that shows all worktrees with
 
 ```
 ? Select worktrees to clean (space to toggle, enter to confirm):
-> [ ] feature-a (/path/to/wt-a)  3 items, 150.2 MiB
+> [ ] feature-a (/path/to/wt-a)  ████████ 3 items, 1.8 GiB
   [ ] feature-b (/path/to/wt-b)  ⠋ resolving...
-  [-] master (/path/to/main) [main]
+  [ ] feature-c (/path/to/wt-c)  ∅ 2 empty dirs
 ```
 
-Items are resolved in parallel — sizes appear as each worktree finishes scanning. The main worktree is shown but cannot be selected.
+Items are resolved in parallel — sizes appear as each worktree finishes scanning. The live checkbox list does not reorder while you are selecting. Once sizes are known in the final preview, worktrees and clean items are sorted largest-first; truly empty directories are shown separately from almost-empty entries.
 
 ### remove
 

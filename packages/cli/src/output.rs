@@ -4,6 +4,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::cmp::Ordering;
+
 use colored::Colorize;
 
 /// Print a header message.
@@ -114,8 +116,36 @@ pub struct CleanItem {
     pub relative_path: String,
     /// Whether this is a directory (vs a file).
     pub is_dir: bool,
+    /// Whether this is a truly empty directory.
+    pub is_empty_dir: bool,
     /// Size in bytes.
     pub size: u64,
+}
+
+/// Aggregate clean preview statistics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanStats {
+    /// Total number of cleanable items.
+    pub item_count: usize,
+    /// Total size in bytes.
+    pub total_size: u64,
+    /// Number of truly empty directories.
+    pub empty_dir_count: usize,
+    /// Whether the worktree could not be accessed.
+    pub inaccessible: bool,
+}
+
+impl CleanStats {
+    /// Create stats for an inaccessible worktree.
+    #[must_use]
+    pub const fn inaccessible() -> Self {
+        Self {
+            item_count: 0,
+            total_size: 0,
+            empty_dir_count: 0,
+            inaccessible: true,
+        }
+    }
 }
 
 /// Format a byte count as a human-readable size string.
@@ -139,6 +169,151 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+fn sorted_items_for_display(items: &[CleanItem]) -> Vec<&CleanItem> {
+    let mut sorted_items: Vec<_> = items.iter().collect();
+    sorted_items.sort_by(|left, right| {
+        left.is_empty_dir
+            .cmp(&right.is_empty_dir)
+            .then_with(|| display_size_cmp(left.size, right.size))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    sorted_items
+}
+
+fn display_size_cmp(left: u64, right: u64) -> Ordering {
+    right.cmp(&left)
+}
+
+fn print_clean_item(item: &CleanItem, max_size: u64, indent: usize) {
+    let padding = " ".repeat(indent);
+    if item.is_empty_dir {
+        println!(
+            "{padding}{} {} {}",
+            "∅".cyan().bold(),
+            "[empty dir]".cyan().bold(),
+            item.relative_path.cyan().dimmed(),
+        );
+        return;
+    }
+
+    let type_label = if item.is_dir { "dir " } else { "file" };
+    let type_label = format!("[{type_label}]");
+    let size_label = color_by_size(&format_size(item.size), item.size);
+    println!(
+        "{padding}{} {} {} {} ({size_label})",
+        "•".dimmed(),
+        type_label.dimmed(),
+        item.relative_path.yellow(),
+        heat_bar(item.size, max_size),
+    );
+}
+
+fn heat_bar(size: u64, max_size: u64) -> String {
+    const BAR_WIDTH: usize = 8;
+    const BAR_WIDTH_U64: u64 = BAR_WIDTH as u64;
+
+    if max_size == 0 || size == 0 {
+        return "░░░░░░░░".dimmed().to_string();
+    }
+
+    let filled_u64 = size
+        .saturating_mul(BAR_WIDTH_U64)
+        .div_ceil(max_size)
+        .clamp(1, BAR_WIDTH_U64);
+    let filled = usize::try_from(filled_u64).map_or(BAR_WIDTH, |value| value);
+    let empty = BAR_WIDTH - filled;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+    color_by_size(&bar, size)
+}
+
+fn color_by_size(text: &str, size: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    if size >= GIB {
+        text.bright_red().bold().to_string()
+    } else if size >= 512 * MIB {
+        text.red().bold().to_string()
+    } else if size >= 100 * MIB {
+        text.red().to_string()
+    } else if size >= 10 * MIB {
+        text.yellow().bold().to_string()
+    } else if size >= MIB {
+        text.yellow().to_string()
+    } else {
+        text.dimmed().to_string()
+    }
+}
+
+/// Build clean statistics for a list of clean items.
+#[must_use]
+pub fn clean_stats(items: &[CleanItem]) -> CleanStats {
+    CleanStats {
+        item_count: items.len(),
+        total_size: items.iter().map(|i| i.size).sum(),
+        empty_dir_count: items.iter().filter(|i| i.is_empty_dir).count(),
+        inaccessible: false,
+    }
+}
+
+/// Format clean statistics as plain text.
+#[must_use]
+pub fn format_clean_stats_plain(stats: &CleanStats) -> String {
+    if stats.inaccessible {
+        return "inaccessible".to_string();
+    }
+    if stats.item_count == 0 {
+        return "nothing to clean".to_string();
+    }
+    if stats.empty_dir_count == stats.item_count {
+        return format!(
+            "{} empty dir{}",
+            stats.empty_dir_count,
+            if stats.empty_dir_count == 1 { "" } else { "s" }
+        );
+    }
+
+    let empty_suffix = if stats.empty_dir_count == 0 {
+        String::new()
+    } else {
+        format!(
+            ", {} empty dir{}",
+            stats.empty_dir_count,
+            if stats.empty_dir_count == 1 { "" } else { "s" }
+        )
+    };
+    format!(
+        "{} item{}, {}{}",
+        stats.item_count,
+        if stats.item_count == 1 { "" } else { "s" },
+        format_size(stats.total_size),
+        empty_suffix
+    )
+}
+
+/// Format clean statistics with heat indicators.
+#[must_use]
+pub fn format_clean_stats_heat(stats: &CleanStats, max_size: u64) -> String {
+    if stats.inaccessible {
+        return "inaccessible".red().bold().to_string();
+    }
+    if stats.item_count == 0 {
+        return "nothing to clean".dimmed().to_string();
+    }
+    if stats.empty_dir_count == stats.item_count {
+        return format!("∅ {}", format_clean_stats_plain(stats))
+            .cyan()
+            .bold()
+            .to_string();
+    }
+
+    format!(
+        "{} {}",
+        heat_bar(stats.total_size, max_size),
+        color_by_size(&format_clean_stats_plain(stats), stats.total_size)
+    )
+}
+
 /// Print a detailed preview of items that will be cleaned (deleted).
 ///
 /// Shows each item with its type (dir/file), relative path, and size.
@@ -155,23 +330,18 @@ pub fn print_clean_preview(items: &[CleanItem]) {
         if items.len() == 1 { "" } else { "s" }
     );
 
-    for item in items {
-        let type_label = if item.is_dir { "dir " } else { "file" };
-        let size_str = format_size(item.size);
-        println!(
-            "  {} {} {} {}",
-            "•".dimmed(),
-            format!("[{type_label}]").dimmed(),
-            item.relative_path.yellow(),
-            format!("({size_str})").dimmed(),
-        );
+    let sorted_items = sorted_items_for_display(items);
+    let max_size = sorted_items.iter().map(|item| item.size).max().unwrap_or(0);
+
+    for item in sorted_items {
+        print_clean_item(item, max_size, 2);
     }
 
-    let total_size: u64 = items.iter().map(|i| i.size).sum();
+    let stats = clean_stats(items);
     println!(
         "\n  {} {}",
         "Total:".bold(),
-        format!("{} items, {}", items.len(), format_size(total_size)).bold()
+        format_clean_stats_plain(&stats).bold()
     );
 }
 
@@ -196,28 +366,39 @@ pub fn print_multi_worktree_clean_preview(groups: &[(String, Vec<CleanItem>)]) {
         return;
     }
 
-    for (label, items) in groups {
-        if items.is_empty() {
-            continue;
-        }
+    let mut sorted_groups: Vec<_> = groups
+        .iter()
+        .filter(|(_, items)| !items.is_empty())
+        .collect();
+    sorted_groups.sort_by(|(left_label, left_items), (right_label, right_items)| {
+        let left_stats = clean_stats(left_items);
+        let right_stats = clean_stats(right_items);
+        display_size_cmp(left_stats.total_size, right_stats.total_size)
+            .then_with(|| left_stats.empty_dir_count.cmp(&right_stats.empty_dir_count))
+            .then_with(|| left_label.cmp(right_label))
+    });
 
+    let max_group_size = sorted_groups
+        .iter()
+        .map(|(_, items)| clean_stats(items).total_size)
+        .max()
+        .unwrap_or(0);
+    let max_item_size = sorted_groups
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|item| item.size))
+        .max()
+        .unwrap_or(0);
+
+    for (label, items) in sorted_groups {
+        let stats = clean_stats(items);
         println!(
-            "  {} ({} item{}):",
+            "  {} {}:",
             label.cyan().bold(),
-            items.len(),
-            if items.len() == 1 { "" } else { "s" }
+            format!("({})", format_clean_stats_heat(&stats, max_group_size)).bold()
         );
 
-        for item in items {
-            let type_label = if item.is_dir { "dir " } else { "file" };
-            let size_str = format_size(item.size);
-            println!(
-                "    {} {} {} {}",
-                "•".dimmed(),
-                format!("[{type_label}]").dimmed(),
-                item.relative_path.yellow(),
-                format!("({size_str})").dimmed(),
-            );
+        for item in sorted_items_for_display(items) {
+            print_clean_item(item, max_item_size, 4);
         }
         println!();
     }
@@ -226,16 +407,22 @@ pub fn print_multi_worktree_clean_preview(groups: &[(String, Vec<CleanItem>)]) {
         .iter()
         .flat_map(|(_, items)| items.iter().map(|i| i.size))
         .sum();
+    let empty_dir_count: usize = groups
+        .iter()
+        .flat_map(|(_, items)| items.iter().filter(|i| i.is_empty_dir))
+        .count();
     let worktree_count = groups.iter().filter(|(_, items)| !items.is_empty()).count();
+    let stats = CleanStats {
+        item_count: total_items,
+        total_size,
+        empty_dir_count,
+        inaccessible: false,
+    };
     println!(
-        "  {} {}",
+        "  {} {} across {worktree_count} worktree{}",
         "Total:".bold(),
-        format!(
-            "{total_items} items across {worktree_count} worktree{}, {}",
-            if worktree_count == 1 { "" } else { "s" },
-            format_size(total_size)
-        )
-        .bold()
+        format_clean_stats_plain(&stats).bold(),
+        if worktree_count == 1 { "" } else { "s" },
     );
 }
 

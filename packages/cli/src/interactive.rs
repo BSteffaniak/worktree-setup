@@ -72,8 +72,8 @@ pub struct WorktreeResolution {
     pub resolved: Vec<(PathBuf, String)>,
     /// Preview items with type and size info.
     pub items: Vec<output::CleanItem>,
-    /// Human-readable summary (e.g. "3 items, 150.2 MiB").
-    pub summary: String,
+    /// Structured summary data used for size heat rendering.
+    pub stats: output::CleanStats,
 }
 
 /// Resolved warning for a single worktree, produced by a background thread.
@@ -212,7 +212,7 @@ pub fn select_worktrees_with_sizes(
 /// Mutable state for the custom multi-select widget.
 struct SelectState {
     checked: Vec<bool>,
-    statuses: Vec<Option<String>>,
+    statuses: Vec<Option<output::CleanStats>>,
     resolutions: Vec<WorktreeResolution>,
     cursor: usize,
     spinner_frame: usize,
@@ -237,7 +237,7 @@ fn run_select_loop(
         let mut needs_redraw = false;
         while let Ok(res) = result_rx.try_recv() {
             if res.index < count {
-                state.statuses[res.index] = Some(res.summary.clone());
+                state.statuses[res.index] = Some(res.stats.clone());
                 needs_redraw = true;
             }
             state.resolutions.push(res);
@@ -318,15 +318,21 @@ fn run_select_loop(
 /// Matches dialoguer's plain theme styling:
 /// - `>` arrow for active item, 2-space indent for inactive
 /// - `[x]` / `[ ]` ASCII checkboxes
-/// - No color on checkbox text; size summary in dim
+/// - No color on checkbox text; size summary uses heat indicators
 fn render_items(
     term: &Term,
     labels: &[String],
     checked: &[bool],
-    statuses: &[Option<String>],
+    statuses: &[Option<output::CleanStats>],
     cursor: usize,
     spinner_frame: usize,
 ) -> io::Result<()> {
+    let max_size = statuses
+        .iter()
+        .filter_map(|status| status.as_ref().map(|stats| stats.total_size))
+        .max()
+        .unwrap_or(0);
+
     for (i, label) in labels.iter().enumerate() {
         let is_active = i == cursor;
 
@@ -338,7 +344,7 @@ fn render_items(
                 let frame = SPINNER_FRAMES[spinner_frame];
                 format!("  {frame} resolving...").yellow().to_string()
             },
-            |s| format!("  {s}").dimmed().to_string(),
+            |stats| format!("  {}", output::format_clean_stats_heat(stats, max_size)),
         );
 
         term.write_line(&format!("{prefix} {checkbox} {label}{status}"))?;

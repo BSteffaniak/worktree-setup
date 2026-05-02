@@ -1571,15 +1571,21 @@ fn size_items_in_pool(
             .par_iter()
             .map(|(abs_path, rel_path)| {
                 let is_dir = abs_path.is_dir();
+                let is_empty_dir = is_dir && is_dir_empty(abs_path);
                 let size = worktree_setup_copy::disk_usage(abs_path);
                 output::CleanItem {
                     relative_path: rel_path.clone(),
                     is_dir,
+                    is_empty_dir,
                     size,
                 }
             })
             .collect()
     })
+}
+
+fn is_dir_empty(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Resolve clean paths for a single worktree and compute sizes in
@@ -1607,7 +1613,7 @@ fn resolve_single_worktree_with_pool(
             index,
             resolved: Vec::new(),
             items: Vec::new(),
-            summary: "inaccessible".to_string(),
+            stats: output::CleanStats::inaccessible(),
         };
     };
 
@@ -1615,23 +1621,13 @@ fn resolve_single_worktree_with_pool(
 
     let items = size_items_in_pool(&resolved, pool);
 
-    let summary = if items.is_empty() {
-        "nothing to clean".to_string()
-    } else {
-        let total_size: u64 = items.iter().map(|i| i.size).sum();
-        format!(
-            "{} item{}, {}",
-            items.len(),
-            if items.len() == 1 { "" } else { "s" },
-            output::format_size(total_size)
-        )
-    };
+    let stats = output::clean_stats(&items);
 
     interactive::WorktreeResolution {
         index,
         resolved,
         items,
-        summary,
+        stats,
     }
 }
 
@@ -2777,6 +2773,49 @@ mod tests {
         assert_eq!(output::format_size(1_073_741_824), "1.0 GiB");
     }
 
+    #[test]
+    fn test_is_dir_empty_distinguishes_almost_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        let zero_file_dir = dir.path().join("zero-file");
+        let empty_child_dir = dir.path().join("empty-child");
+
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&zero_file_dir).unwrap();
+        std::fs::write(zero_file_dir.join("zero.txt"), "").unwrap();
+        std::fs::create_dir_all(empty_child_dir.join("child")).unwrap();
+
+        assert!(is_dir_empty(&empty));
+        assert!(!is_dir_empty(&zero_file_dir));
+        assert!(!is_dir_empty(&empty_child_dir));
+    }
+
+    #[test]
+    fn test_clean_stats_formats_empty_dirs_separately() {
+        let items = vec![
+            output::CleanItem {
+                relative_path: "empty".to_string(),
+                is_dir: true,
+                is_empty_dir: true,
+                size: 0,
+            },
+            output::CleanItem {
+                relative_path: "zero-file".to_string(),
+                is_dir: false,
+                is_empty_dir: false,
+                size: 0,
+            },
+        ];
+
+        let stats = output::clean_stats(&items);
+        assert_eq!(stats.item_count, 2);
+        assert_eq!(stats.empty_dir_count, 1);
+        assert_eq!(
+            output::format_clean_stats_plain(&stats),
+            "2 items, 0 B, 1 empty dir"
+        );
+    }
+
     // ─── resolve_clean_paths ────────────────────────────────────────────
 
     fn make_loaded_config_with_clean(
@@ -3512,30 +3551,22 @@ mod tests {
                     .iter()
                     .map(|(abs_path, rel_path)| {
                         let is_dir = abs_path.is_dir();
+                        let is_empty_dir = is_dir && is_dir_empty(abs_path);
                         let size = worktree_setup_copy::disk_usage(abs_path);
                         output::CleanItem {
                             relative_path: rel_path.clone(),
                             is_dir,
+                            is_empty_dir,
                             size,
                         }
                     })
                     .collect();
-                let summary = if items.is_empty() {
-                    "nothing to clean".to_string()
-                } else {
-                    let total: u64 = items.iter().map(|i| i.size).sum();
-                    format!(
-                        "{} item{}, {}",
-                        items.len(),
-                        if items.len() == 1 { "" } else { "s" },
-                        output::format_size(total)
-                    )
-                };
+                let stats = output::clean_stats(&items);
                 interactive::WorktreeResolution {
                     index: idx,
                     resolved,
                     items,
-                    summary,
+                    stats,
                 }
             })
             .collect();
@@ -3566,9 +3597,9 @@ mod tests {
                 seq.index, pool_res.index
             );
             assert_eq!(
-                seq.summary, pool_res.summary,
+                seq.stats, pool_res.stats,
                 "summaries must match for idx {}: seq={:?} pool={:?}",
-                seq.index, seq.summary, pool_res.summary,
+                seq.index, seq.stats, pool_res.stats,
             );
             assert_eq!(
                 seq.resolved.len(),
@@ -3577,16 +3608,16 @@ mod tests {
                 seq.index
             );
             // The pool path may sort items differently if `par_iter` is
-            // reordering internally; compare as sets of (rel_path, is_dir, size).
+            // reordering internally; compare as sets of item display fields.
             let seq_items: std::collections::BTreeSet<_> = seq
                 .items
                 .iter()
-                .map(|i| (i.relative_path.clone(), i.is_dir, i.size))
+                .map(|i| (i.relative_path.clone(), i.is_dir, i.is_empty_dir, i.size))
                 .collect();
             let pool_items: std::collections::BTreeSet<_> = pool_res
                 .items
                 .iter()
-                .map(|i| (i.relative_path.clone(), i.is_dir, i.size))
+                .map(|i| (i.relative_path.clone(), i.is_dir, i.is_empty_dir, i.size))
                 .collect();
             assert_eq!(
                 seq_items, pool_items,

@@ -63,6 +63,15 @@ pub struct Config {
     #[serde(default)]
     pub clean: Vec<String>,
 
+    /// Paths and glob patterns to preserve when running `clean`.
+    ///
+    /// These patterns use the same path rules as [`Self::clean`]. Any clean
+    /// match that equals, contains, or is contained by an ignored path is
+    /// excluded from deletion so ignored content is never removed via an
+    /// ancestor clean match.
+    #[serde(default)]
+    pub clean_ignore: Vec<String>,
+
     /// Profile names this config belongs to.
     ///
     /// Keys are profile names. When a user runs `--profile foo`, any config

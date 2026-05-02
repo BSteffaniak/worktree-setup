@@ -81,6 +81,7 @@ postSetup = ["npm install"]
             r#"
 description = "Config with clean paths"
 clean = ["node_modules", ".turbo", "**/dist", "*.log"]
+cleanIgnore = [".opencode/node_modules", "**/.cache"]
 "#
         )
         .unwrap();
@@ -91,6 +92,10 @@ clean = ["node_modules", ".turbo", "**/dist", "*.log"]
         assert_eq!(
             config.clean,
             vec!["node_modules", ".turbo", "**/dist", "*.log"]
+        );
+        assert_eq!(
+            config.clean_ignore,
+            vec![".opencode/node_modules", "**/.cache"]
         );
     }
 
@@ -106,6 +111,7 @@ clean = ["node_modules", ".turbo", "**/dist", "*.log"]
         assert!(config.copy.is_empty());
         assert!(!config.copy_unstaged);
         assert!(config.clean.is_empty());
+        assert!(config.clean_ignore.is_empty());
         assert!(config.profiles.is_empty());
     }
 

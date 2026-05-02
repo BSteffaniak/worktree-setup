@@ -679,37 +679,38 @@ fn resolve_max_parallel_inner(
     explicit.map_or(default, |n| n.max(1).min(cap))
 }
 
-/// Resolve clean paths from selected configs into concrete items to delete.
-///
-/// For each config's `clean` entries:
-/// * Paths starting with `/` are repo-root-relative (resolved against
-///   `target_path`)
-/// * Other paths are resolved relative to the config's directory as mapped
-///   into the target worktree
-/// * Glob patterns (containing `*`, `?`, or `[`) are expanded via a
-///   `walkdir` + `globset` walk that skips symlinks and prunes matched dirs
-///
-/// All resolved paths must be inside `target_canonical` (containment check).
-/// Paths that don't exist on disk are silently skipped.
-/// Duplicate paths (by canonical path) are deduplicated.
-fn resolve_clean_paths(
+/// Selects which clean pattern field to resolve.
+#[derive(Clone, Copy)]
+enum CleanPatternKind {
+    /// Positive include patterns from `clean`.
+    Include,
+    /// Negative ignore patterns from `cleanIgnore`.
+    Ignore,
+}
+
+impl CleanPatternKind {
+    fn patterns(self, config: &LoadedConfig) -> &[String] {
+        match self {
+            Self::Include => &config.config.clean,
+            Self::Ignore => &config.config.clean_ignore,
+        }
+    }
+}
+
+/// Resolve one clean pattern set from selected configs into concrete paths.
+fn resolve_clean_pattern_set(
     selected_configs: &[&LoadedConfig],
     target_path: &Path,
     target_canonical: &Path,
     repo_root: &Path,
-) -> Vec<(PathBuf, String)> {
-    log::debug!(
-        "resolve_clean_paths: target={} configs={}",
-        target_path.display(),
-        selected_configs.len()
-    );
-
+    kind: CleanPatternKind,
+) -> Vec<worktree_setup_glob::ResolvedPath> {
     let mut resolver = worktree_setup_glob::GlobResolver::new(
         target_canonical.to_path_buf(),
         worktree_setup_glob::GlobResolverOptions::default(),
     );
 
-    let mut results: Vec<(PathBuf, String)> = Vec::new();
+    let mut results = Vec::new();
 
     for config in selected_configs {
         // Map the config directory into the target worktree.
@@ -729,7 +730,7 @@ fn resolve_clean_paths(
         let mut run_patterns: Vec<&str> = Vec::new();
 
         let flush = |resolver: &mut worktree_setup_glob::GlobResolver,
-                     results: &mut Vec<(PathBuf, String)>,
+                     results: &mut Vec<worktree_setup_glob::ResolvedPath>,
                      base: &Path,
                      patterns: &[&str]| {
             if patterns.is_empty() {
@@ -741,12 +742,10 @@ fn resolve_clean_paths(
                 base.display(),
                 matched.len(),
             );
-            for entry in matched {
-                results.push((entry.canonical, entry.display));
-            }
+            results.extend(matched);
         };
 
-        for pattern in &config.config.clean {
+        for pattern in kind.patterns(config) {
             // Leading `/` means repo-root-relative (resolved against
             // `target_path`). Otherwise, resolve against the config's
             // directory mapped into the target worktree.
@@ -774,18 +773,66 @@ fn resolve_clean_paths(
         }
     }
 
-    // Filter out paths that are descendants of other resolved paths.
-    let as_resolved: Vec<worktree_setup_glob::ResolvedPath> = results
-        .iter()
-        .map(|(canonical, display)| worktree_setup_glob::ResolvedPath {
-            canonical: canonical.clone(),
-            display: display.clone(),
-        })
-        .collect();
-    let filtered = worktree_setup_glob::filter_descendants(&as_resolved);
-    filtered
+    results
+}
+
+fn clean_path_is_ignored(path: &Path, ignored: &[worktree_setup_glob::ResolvedPath]) -> bool {
+    ignored.iter().any(|ignored_path| {
+        path.starts_with(&ignored_path.canonical) || ignored_path.canonical.starts_with(path)
+    })
+}
+
+/// Resolve clean paths from selected configs into concrete items to delete.
+///
+/// For each config's `clean` entries:
+/// * Paths starting with `/` are repo-root-relative (resolved against
+///   `target_path`)
+/// * Other paths are resolved relative to the config's directory as mapped
+///   into the target worktree
+/// * Glob patterns (containing `*`, `?`, or `[`) are expanded via a
+///   `walkdir` + `globset` walk that skips symlinks and prunes matched dirs
+///
+/// Paths in `cleanIgnore` use the same path rules and remove matching clean
+/// results. A clean result is ignored if it equals, contains, or is contained
+/// by an ignored path, preventing parent deletes from removing preserved
+/// descendants.
+///
+/// All resolved paths must be inside `target_canonical` (containment check).
+/// Paths that don't exist on disk are silently skipped.
+/// Duplicate paths (by canonical path) are deduplicated.
+fn resolve_clean_paths(
+    selected_configs: &[&LoadedConfig],
+    target_path: &Path,
+    target_canonical: &Path,
+    repo_root: &Path,
+) -> Vec<(PathBuf, String)> {
+    log::debug!(
+        "resolve_clean_paths: target={} configs={}",
+        target_path.display(),
+        selected_configs.len()
+    );
+
+    let includes = resolve_clean_pattern_set(
+        selected_configs,
+        target_path,
+        target_canonical,
+        repo_root,
+        CleanPatternKind::Include,
+    );
+    let includes = worktree_setup_glob::filter_descendants(&includes);
+
+    let ignored = resolve_clean_pattern_set(
+        selected_configs,
+        target_path,
+        target_canonical,
+        repo_root,
+        CleanPatternKind::Ignore,
+    );
+
+    includes
         .into_iter()
-        .map(|r| (r.canonical, r.display))
+        .filter(|entry| !clean_path_is_ignored(&entry.canonical, &ignored))
+        .map(|entry| (entry.canonical, entry.display))
         .collect()
 }
 
@@ -2823,9 +2870,19 @@ mod tests {
         config_dir: &Path,
         clean: Vec<String>,
     ) -> LoadedConfig {
+        make_loaded_config_with_clean_ignore(relative_path, config_dir, clean, Vec::new())
+    }
+
+    fn make_loaded_config_with_clean_ignore(
+        relative_path: &str,
+        config_dir: &Path,
+        clean: Vec<String>,
+        clean_ignore: Vec<String>,
+    ) -> LoadedConfig {
         LoadedConfig {
             config: worktree_setup_config::Config {
                 clean,
+                clean_ignore,
                 ..Default::default()
             },
             config_path: config_dir.join("worktree.config.toml"),
@@ -3141,6 +3198,63 @@ mod tests {
         assert!(rel_paths.iter().all(|p| p.contains("dist")));
         assert!(rel_paths.iter().any(|p| p.contains("apps/my-app/dist")));
         assert!(rel_paths.iter().any(|p| p.contains("packages/utils/dist")));
+    }
+
+    #[test]
+    fn test_resolve_clean_ignore_excludes_specific_child_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.to_path_buf();
+        let target = repo_root.join("worktree");
+
+        std::fs::create_dir_all(target.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(target.join("apps/web/node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(target.join(".opencode/node_modules/pkg")).unwrap();
+
+        let config = make_loaded_config_with_clean_ignore(
+            "worktree.config.toml",
+            &config_dir,
+            vec!["/node_modules".to_string(), "/**/node_modules".to_string()],
+            vec!["/.opencode/node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        let rel_paths: std::collections::BTreeSet<String> =
+            resolved.iter().map(|(_, r)| r.clone()).collect();
+        assert_eq!(resolved.len(), 2, "unexpected clean paths: {rel_paths:?}");
+        assert!(rel_paths.contains("node_modules"));
+        assert!(rel_paths.contains("apps/web/node_modules"));
+        assert!(!rel_paths.contains(".opencode/node_modules"));
+    }
+
+    #[test]
+    fn test_resolve_clean_ignore_drops_parent_to_preserve_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let config_dir = repo_root.to_path_buf();
+        let target = repo_root.join("worktree");
+
+        std::fs::create_dir_all(target.join(".opencode/node_modules/pkg")).unwrap();
+        std::fs::write(target.join(".opencode/config.json"), "{}").unwrap();
+
+        let config = make_loaded_config_with_clean_ignore(
+            "worktree.config.toml",
+            &config_dir,
+            vec!["/.opencode".to_string()],
+            vec!["/.opencode/node_modules".to_string()],
+        );
+
+        let target_canonical = target.canonicalize().unwrap();
+        let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
+
+        assert!(
+            resolved.is_empty(),
+            "parent clean match should be dropped to preserve ignored child: {resolved:?}"
+        );
     }
 
     #[test]

@@ -234,6 +234,11 @@ clean = [
     ".turbo",
     "**/dist",
 ]
+
+# Paths and patterns to preserve from clean matches
+cleanIgnore = [
+    ".opencode/node_modules",
+]
 ```
 
 ### Clean Paths
@@ -250,6 +255,15 @@ clean = [
 ```
 
 Paths are relative to the config file's directory. Prefix with `/` for repo-root-relative paths. All resolved paths must remain within the target worktree directory (paths that escape the worktree are rejected).
+
+Use `cleanIgnore` to preserve exact paths or glob matches that would otherwise be deleted by `clean`:
+
+```toml
+clean = ["/**/node_modules"]
+cleanIgnore = ["/.opencode/node_modules"]
+```
+
+`cleanIgnore` uses the same path rules as `clean`. If an ignored path is inside a clean match, the parent clean match is dropped so ignored content is not removed indirectly.
 
 ### Repo-Root-Relative Paths
 
@@ -404,6 +418,7 @@ Per-config `allowPathEscape` overrides the global setting. When neither is set, 
 | `templates`       | array    | Copy source to target if target doesn't exist      |
 | `postSetup`       | string[] | Commands to run after setup                        |
 | `clean`           | string[] | Paths and glob patterns to delete with `clean`     |
+| `cleanIgnore`     | string[] | Paths and glob patterns to preserve during `clean` |
 | `allowPathEscape` | bool     | Allow paths to escape the worktree boundary        |
 
 **Path resolution:** All paths are relative to the config file's directory by default. Prefix with `/` for repo-root-relative paths (e.g., `"/.envrc"` → `<repo-root>/.envrc`).

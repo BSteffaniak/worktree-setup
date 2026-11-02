@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::{CopyEntry, CopyGlobEntry, CopyStrategy, CopyUnstaged};
 use serde::{Deserialize, Serialize};
 
 /// A template file mapping from source to target.
@@ -16,6 +17,9 @@ pub struct TemplateMapping {
     pub source: String,
     /// Target file path (relative to config directory).
     pub target: String,
+    /// Transfer strategy for this template.
+    #[serde(default)]
+    pub strategy: CopyStrategy,
 }
 
 /// Worktree setup configuration.
@@ -32,19 +36,19 @@ pub struct Config {
 
     /// Paths to copy only if they don't exist in target (relative to config directory).
     #[serde(default)]
-    pub copy: Vec<String>,
+    pub copy: Vec<CopyEntry>,
 
     /// Paths to always overwrite in target (relative to config directory).
     #[serde(default)]
-    pub overwrite: Vec<String>,
+    pub overwrite: Vec<CopyEntry>,
 
     /// Glob patterns to copy (relative to config directory).
     #[serde(default)]
-    pub copy_glob: Vec<String>,
+    pub copy_glob: Vec<CopyGlobEntry>,
 
     /// Whether to copy unstaged/untracked files from main worktree.
     #[serde(default)]
-    pub copy_unstaged: bool,
+    pub copy_unstaged: CopyUnstaged,
 
     /// Template file mappings (copy source to target if target doesn't exist).
     #[serde(default)]

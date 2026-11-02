@@ -36,7 +36,6 @@ use worktree_setup_git::{
 };
 use worktree_setup_operations::{
     ApplyConfigOptions, OperationType, execute_operation, plan_operations_with_progress,
-    plan_unstaged_operations,
 };
 
 fn main() {
@@ -279,7 +278,7 @@ fn execute_file_operations(
     // Handle copyUnstaged - check if any selected config enables it
     let should_copy_unstaged = selected_configs
         .iter()
-        .any(|c| copy_unstaged_override.unwrap_or(c.config.copy_unstaged));
+        .any(|c| copy_unstaged_override.unwrap_or_else(|| c.config.copy_unstaged.enabled()));
 
     if should_copy_unstaged {
         println!("Checking for unstaged files...");
@@ -290,12 +289,26 @@ fn execute_file_operations(
                 "Found {} unstaged/untracked files to copy",
                 unstaged_files.len()
             );
-            let unstaged_ops =
-                plan_unstaged_operations(&unstaged_files, main_worktree_path, target_path);
+            let mut unstaged_ops = Vec::new();
+            for config in selected_configs {
+                if copy_unstaged_override.unwrap_or_else(|| config.config.copy_unstaged.enabled()) {
+                    unstaged_ops.extend(
+                        worktree_setup_operations::plan_unstaged_operations_with_strategy(
+                            &unstaged_files,
+                            main_worktree_path,
+                            target_path,
+                            config.config.copy_unstaged.strategy(),
+                        ),
+                    );
+                }
+            }
+            unstaged_ops
+                .dedup_by(|a, b| a.target == b.target && a.copy_strategy == b.copy_strategy);
             all_operations.extend(unstaged_ops);
         }
     }
 
+    worktree_setup_operations::validate_copy_strategies(&all_operations)?;
     // Execute operations with progress
     for op in &all_operations {
         if op.will_skip {

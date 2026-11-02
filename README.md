@@ -619,6 +619,52 @@ copy = ["node_modules"]
 ```
 
 Unlike `symlinks`, modifications to these copied files do not modify the source.
+
+#### Per-entry copy strategies
+
+String entries keep the default `AUTO` behavior. Use an options object to select
+`BYTE_COPY` for individual files, directories, glob matches, or templates:
+
+```toml
+copy = [
+    "node_modules",
+    { path = "data", strategy = "BYTE_COPY" },
+]
+overwrite = [{ path = "config/local.json", strategy = "BYTE_COPY" }]
+copyGlob = ["*.env", { pattern = "fixtures/**/*.bin", strategy = "BYTE_COPY" }]
+templates = [{ source = ".env.example", target = ".env", strategy = "BYTE_COPY" }]
+copyUnstaged = { strategy = "BYTE_COPY" }
+```
+
+The equivalent TypeScript config uses the same entry shapes:
+
+```ts
+export default {
+    copy: ["node_modules", { path: "data", strategy: "BYTE_COPY" }],
+    overwrite: [{ path: "config/local.json", strategy: "BYTE_COPY" }],
+    copyGlob: ["*.env", { pattern: "fixtures/**/*.bin", strategy: "BYTE_COPY" }],
+    templates: [{ source: ".env.example", target: ".env", strategy: "BYTE_COPY" }],
+    copyUnstaged: { strategy: "BYTE_COPY" },
+};
+```
+
+* `AUTO` attempts cloning for new files, then falls back to ordinary copying.
+* `BYTE_COPY` uses bounded buffered reads/writes, never requesting cloning—not
+  even via `fs::copy`. It cannot prevent transparent filesystem/storage deduplication.
+* Omitted strategies default to `AUTO`. `copyUnstaged = true` and `false` retain
+  their existing meaning; its object form enables copying with the given strategy.
+* Directory strategies apply recursively; glob strategies apply to every match.
+* Strategy does not change copy-if-missing, overwrite, path-containment, or symlink
+  behavior. Existing-file byte-copy overwrites remain in place and refuse self-copy
+  (including hard-link aliases) before truncating. Like ordinary in-place overwrites,
+  a failed write can leave an existing destination partially updated.
+* Conflicting strategies for the same destination or overlapping directory copies
+  are rejected before file operations execute, including across selected configs
+  and unstaged copies. Use one strategy for an entire overlapping directory tree;
+  nested entries are not strategy overrides.
+* Verbose output shows each operation's strategy and separately counts byte-copied
+  files. No global switch changes other entries' strategies.
+
 Existing `symlinks` settings are never converted automatically. Git worktree
 creation and Git's shared object database are unchanged; this optimization applies
 to configured setup copies, including templates, glob matches, and new unstaged

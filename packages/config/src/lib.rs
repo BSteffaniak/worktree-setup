@@ -24,6 +24,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod copy;
+#[cfg(test)]
+mod copy_tests;
 mod discovery;
 mod error;
 mod global;
@@ -32,6 +35,10 @@ mod toml_loader;
 mod ts_loader;
 mod types;
 
+pub use copy::{
+    CopyEntry, CopyGlobEntry, CopyGlobOptions, CopyPathOptions, CopyStrategy, CopyUnstaged,
+    CopyUnstagedOptions,
+};
 pub use discovery::{discover_configs, get_config_display_name};
 pub use error::ConfigError;
 pub use global::{

@@ -9,7 +9,8 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::backend::{CopyMethod, copy_new};
+use crate::CopyStrategy;
+use crate::backend::{CopyMethod, byte_copy, copy_new};
 use crate::error::CopyError;
 use crate::progress::{CopyProgress, ProgressTracker};
 
@@ -57,6 +58,25 @@ pub fn copy_file<F>(source: &Path, target: &Path, on_progress: F) -> Result<Copy
 where
     F: Fn(&CopyProgress),
 {
+    copy_file_with_strategy(source, target, CopyStrategy::Auto, on_progress)
+}
+
+/// Copy using an explicit transfer strategy. Directory entries inherit the strategy.
+/// Existing destination skip/overwrite behavior is unchanged.
+///
+/// # Errors
+///
+/// * If enumeration, staging, transfer, permissions, or publication fails.
+/// * Byte-copy overwrites fail before truncation when source and target are the same file.
+pub fn copy_file_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: CopyStrategy,
+    on_progress: F,
+) -> Result<CopyResult, CopyError>
+where
+    F: Fn(&CopyProgress),
+{
     log::debug!("Copying file: {} -> {}", source.display(), target.display());
 
     if !source.exists() {
@@ -84,7 +104,7 @@ where
         })?;
     }
 
-    let method = copy_file_with_reflink(source, target)?;
+    let method = copy_file_with_reflink(source, target, strategy)?;
     log::debug!("Copy complete: {method:?}");
 
     // Report complete
@@ -111,6 +131,25 @@ where
 pub fn overwrite_file<F>(
     source: &Path,
     target: &Path,
+    on_progress: F,
+) -> Result<CopyResult, CopyError>
+where
+    F: Fn(&CopyProgress),
+{
+    overwrite_file_with_strategy(source, target, CopyStrategy::Auto, on_progress)
+}
+
+/// Copy using an explicit transfer strategy. Directory entries inherit the strategy.
+/// Existing destination skip/overwrite behavior is unchanged.
+///
+/// # Errors
+///
+/// * If enumeration, staging, transfer, permissions, or publication fails.
+/// * Byte-copy overwrites fail before truncation when source and target are the same file.
+pub fn overwrite_file_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: CopyStrategy,
     on_progress: F,
 ) -> Result<CopyResult, CopyError>
 where
@@ -145,14 +184,19 @@ where
     // Existing destinations must retain in-place overwrite semantics (links,
     // permissions and open handles). Cloning requires a new destination.
     if target.symlink_metadata().is_ok() {
-        fs::copy(source, target).map_err(|io_error| CopyError::FileCopyError {
+        (if strategy == CopyStrategy::ByteCopy {
+            byte_copy(source, target)
+        } else {
+            fs::copy(source, target)
+        })
+        .map_err(|io_error| CopyError::FileCopyError {
             source_path: source.to_path_buf(),
             target_path: target.to_path_buf(),
             io_error,
         })?;
-        log::debug!("Copy complete: Copied (existing destination, in-place overwrite)");
+        log::debug!("Copy complete: {strategy:?} (existing destination, in-place overwrite)");
     } else {
-        let method = copy_file_with_reflink(source, target)?;
+        let method = copy_file_with_reflink(source, target, strategy)?;
         log::debug!("Copy complete: {method:?}");
     }
 
@@ -183,6 +227,25 @@ where
 pub fn copy_directory<F>(
     source: &Path,
     target: &Path,
+    on_progress: F,
+) -> Result<CopyResult, CopyError>
+where
+    F: Fn(&CopyProgress) + Sync,
+{
+    copy_directory_with_strategy(source, target, CopyStrategy::Auto, on_progress)
+}
+
+/// Copy using an explicit transfer strategy. Directory entries inherit the strategy.
+/// Existing destination skip/overwrite behavior is unchanged.
+///
+/// # Errors
+///
+/// * If enumeration, staging, transfer, permissions, or publication fails.
+/// * Byte-copy overwrites fail before truncation when source and target are the same file.
+pub fn copy_directory_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: CopyStrategy,
     on_progress: F,
 ) -> Result<CopyResult, CopyError>
 where
@@ -244,6 +307,7 @@ where
 
     let cloned = std::sync::atomic::AtomicU64::new(0);
     let copied = std::sync::atomic::AtomicU64::new(0);
+    let byte_copied = std::sync::atomic::AtomicU64::new(0);
     entries
         .par_iter()
         .filter(|entry| !entry.is_directory)
@@ -251,9 +315,12 @@ where
             if entry.is_symlink {
                 copy_symlink(&entry.source, &entry.target)?;
             } else {
-                match copy_file_with_reflink(&entry.source, &entry.target)? {
+                match copy_file_with_reflink(&entry.source, &entry.target, strategy)? {
                     CopyMethod::Cloned => {
                         cloned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    CopyMethod::ByteCopied => {
+                        byte_copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     CopyMethod::Copied => {
                         copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -275,10 +342,11 @@ where
         })?;
 
     log::debug!(
-        "Copy complete for {}: {} cloned, {} copied, {} symlinks",
+        "Copy complete for {}: {} cloned, {} copied, {} byte-copied, {} symlinks",
         target.display(),
         cloned.load(std::sync::atomic::Ordering::Relaxed),
         copied.load(std::sync::atomic::Ordering::Relaxed),
+        byte_copied.load(std::sync::atomic::Ordering::Relaxed),
         entries.iter().filter(|entry| entry.is_symlink).count(),
     );
     // Final progress report
@@ -340,8 +408,12 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
 }
 
 /// Copy a single file, trying reflink first then falling back to regular copy.
-fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<CopyMethod, CopyError> {
-    copy_new(source, target).map_err(|io_error| CopyError::FileCopyError {
+fn copy_file_with_reflink(
+    source: &Path,
+    target: &Path,
+    strategy: CopyStrategy,
+) -> Result<CopyMethod, CopyError> {
+    copy_new(source, target, strategy).map_err(|io_error| CopyError::FileCopyError {
         source_path: source.to_path_buf(),
         target_path: target.to_path_buf(),
         io_error,

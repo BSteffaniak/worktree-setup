@@ -393,7 +393,7 @@ export default {{
         let config = load_ts_embedded(&path).unwrap();
         assert_eq!(config.description, "Test TS config");
         assert_eq!(config.symlinks, vec!["data/cache"]);
-        assert!(config.copy_unstaged);
+        assert!(config.copy_unstaged.enabled());
     }
 
     #[test]
@@ -490,6 +490,6 @@ export default {{
 
         assert_eq!(config.description, "Test TS config");
         assert_eq!(config.symlinks, vec!["data/cache"]);
-        assert!(config.copy_unstaged);
+        assert!(config.copy_unstaged.enabled());
     }
 }

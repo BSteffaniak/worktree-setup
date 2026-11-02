@@ -65,10 +65,31 @@ postSetup = ["npm install"]
 
         assert_eq!(config.description, "Test config");
         assert_eq!(config.symlinks, vec!["data/cache"]);
-        assert_eq!(config.copy, vec![".env.local"]);
-        assert_eq!(config.overwrite, vec!["config.json"]);
-        assert_eq!(config.copy_glob, vec!["**/*.env"]);
-        assert!(config.copy_unstaged);
+        assert_eq!(
+            config
+                .copy
+                .iter()
+                .map(crate::CopyEntry::path)
+                .collect::<Vec<_>>(),
+            vec![".env.local"]
+        );
+        assert_eq!(
+            config
+                .overwrite
+                .iter()
+                .map(crate::CopyEntry::path)
+                .collect::<Vec<_>>(),
+            vec!["config.json"]
+        );
+        assert_eq!(
+            config
+                .copy_glob
+                .iter()
+                .map(crate::CopyGlobEntry::pattern)
+                .collect::<Vec<_>>(),
+            vec!["**/*.env"]
+        );
+        assert!(config.copy_unstaged.enabled());
         assert_eq!(config.post_setup, vec!["npm install"]);
         assert!(config.clean.is_empty());
     }
@@ -109,7 +130,7 @@ cleanIgnore = [".opencode/node_modules", "**/.cache"]
         assert_eq!(config.description, "Minimal");
         assert!(config.symlinks.is_empty());
         assert!(config.copy.is_empty());
-        assert!(!config.copy_unstaged);
+        assert!(!config.copy_unstaged.enabled());
         assert!(config.clean.is_empty());
         assert!(config.clean_ignore.is_empty());
         assert!(config.profiles.is_empty());

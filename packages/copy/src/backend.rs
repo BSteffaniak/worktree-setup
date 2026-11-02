@@ -4,24 +4,38 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use crate::CopyStrategy;
 use std::{fs, io, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyMethod {
     Cloned,
     Copied,
+    ByteCopied,
 }
 
 /// Stage in the destination filesystem, then publish without replacing an existing path.
 /// A private directory confines cleanup to files owned by this operation, even when a
 /// failed backend leaves a partial file. Never delete the user's destination to retry.
-pub fn copy_new(source: &Path, target: &Path) -> io::Result<CopyMethod> {
-    copy_new_with(source, target, |from, to| reflink_copy::reflink(from, to))
+pub fn copy_new(source: &Path, target: &Path, strategy: CopyStrategy) -> io::Result<CopyMethod> {
+    copy_new_with_strategy(source, target, strategy, |from, to| {
+        reflink_copy::reflink(from, to)
+    })
 }
 
+#[cfg(test)]
 fn copy_new_with(
     source: &Path,
     target: &Path,
+    clone: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<CopyMethod> {
+    copy_new_with_strategy(source, target, CopyStrategy::Auto, clone)
+}
+
+fn copy_new_with_strategy(
+    source: &Path,
+    target: &Path,
+    strategy: CopyStrategy,
     clone: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<CopyMethod> {
     if !fs::metadata(source)?.is_file() {
@@ -38,31 +52,36 @@ fn copy_new_with(
         .prefix(".worktree-copy-")
         .tempdir_in(parent)?;
     let staged = staging.path().join("file");
-    let method = match clone(source, &staged) {
-        Ok(()) => CopyMethod::Cloned,
-        Err(error) => {
-            log::debug!(
-                "Clone unavailable for {} -> {}: {error}; using ordinary copy",
-                source.display(),
-                target.display()
-            );
-            // Some backends leave a partial (possibly read-only) destination.
-            // Remove it rather than writing through an unknown backend artifact.
-            #[cfg(windows)]
-            if let Ok(metadata) = staged.symlink_metadata() {
-                if metadata.is_file() && metadata.permissions().readonly() {
-                    let mut permissions = metadata.permissions();
-                    permissions.set_readonly(false);
-                    fs::set_permissions(&staged, permissions)?;
+    let method = if strategy == CopyStrategy::ByteCopy {
+        byte_copy(source, &staged)?;
+        CopyMethod::ByteCopied
+    } else {
+        match clone(source, &staged) {
+            Ok(()) => CopyMethod::Cloned,
+            Err(error) => {
+                log::debug!(
+                    "Clone unavailable for {} -> {}: {error}; using ordinary copy",
+                    source.display(),
+                    target.display()
+                );
+                // Some backends leave a partial (possibly read-only) destination.
+                // Remove it rather than writing through an unknown backend artifact.
+                #[cfg(windows)]
+                if let Ok(metadata) = staged.symlink_metadata() {
+                    if metadata.is_file() && metadata.permissions().readonly() {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_readonly(false);
+                        fs::set_permissions(&staged, permissions)?;
+                    }
                 }
+                match fs::remove_file(&staged) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                fs::copy(source, &staged)?;
+                CopyMethod::Copied
             }
-            match fs::remove_file(&staged) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            fs::copy(source, &staged)?;
-            CopyMethod::Copied
         }
     };
     // Linux FICLONE duplicates contents but not permissions. Match fs::copy on
@@ -74,6 +93,58 @@ fn copy_new_with(
     log::trace!("{method:?}: {} -> {}", source.display(), target.display());
     Ok(method)
 }
+
+/// Buffered transfer without std/OS copy acceleration. Open the destination without
+/// truncating, compare file identities (including hard links), then truncate it.
+pub fn byte_copy(source: &Path, target: &Path) -> io::Result<u64> {
+    use std::io::Write;
+    let mut input = fs::File::open(source)?;
+    if !input.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy source must be a regular file",
+        ));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target)?;
+    let source_handle = same_file::Handle::from_file(input.try_clone()?)?;
+    let target_handle = same_file::Handle::from_file(output.try_clone()?)?;
+    if source_handle == target_handle {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source and destination are the same file",
+        ));
+    }
+    output.set_len(0)?;
+    let written = transfer_bytes(&mut input, &mut output)?;
+    output.flush()?;
+    output.set_permissions(input.metadata()?.permissions())?;
+    Ok(written)
+}
+
+fn transfer_bytes(input: &mut impl io::Read, output: &mut impl io::Write) -> io::Result<u64> {
+    let mut buffer = vec![0_u8; 128 * 1024];
+    let mut written = 0;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+        written += count as u64;
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+#[path = "byte_tests.rs"]
+mod byte_tests;
 
 #[cfg(test)]
 mod tests {
@@ -187,7 +258,7 @@ mod tests {
         let target = destination_dir.path().join("target");
         fs::write(&source, vec![7_u8; 1024 * 1024]).unwrap();
         assert_eq!(
-            copy_new(&source, &target).unwrap(),
+            copy_new(&source, &target, CopyStrategy::Auto).unwrap(),
             CopyMethod::Copied,
             "chosen paths support cloning; this is not fallback coverage"
         );
@@ -208,31 +279,36 @@ mod tests {
             for index in 0..count {
                 fs::write(source.join(index.to_string()), &data).unwrap();
             }
-            for automatic in [true, false] {
-                let target = dir.path().join(format!("target-{name}-{automatic}"));
+            for mode in ["auto", "fallback", "byte-copy"] {
+                let target = dir.path().join(format!("target-{name}-{mode}"));
                 fs::create_dir(&target).unwrap();
                 let started = Instant::now();
                 let mut cloned = 0;
                 for index in 0..count {
                     let from = source.join(index.to_string());
                     let to = target.join(index.to_string());
-                    let method = if automatic {
-                        copy_new(&from, &to)
-                    } else {
-                        copy_new_with(&from, &to, unsupported)
+                    let method = match mode {
+                        "auto" => copy_new(&from, &to, CopyStrategy::Auto),
+                        "byte-copy" => copy_new(&from, &to, CopyStrategy::ByteCopy),
+                        _ => copy_new_with(&from, &to, unsupported),
                     }
                     .unwrap();
                     cloned += usize::from(method == CopyMethod::Cloned);
                 }
                 eprintln!(
-                    "{name}: automatic={automatic}, {count} files, {cloned} cloned, elapsed={:?}",
+                    "{name}: mode={mode}, {count} files, {cloned} cloned, elapsed={:?}",
                     started.elapsed()
                 );
                 let started = Instant::now();
                 for index in 0..count {
-                    crate::overwrite_file(
+                    crate::overwrite_file_with_strategy(
                         &source.join(index.to_string()),
                         &target.join(index.to_string()),
+                        if mode == "byte-copy" {
+                            CopyStrategy::ByteCopy
+                        } else {
+                            CopyStrategy::Auto
+                        },
                         |_| {},
                     )
                     .unwrap();
@@ -261,7 +337,7 @@ mod tests {
         let target = dir.path().join("target");
         fs::write(&source, vec![42_u8; 1024 * 1024]).unwrap();
         assert_eq!(
-            copy_new(&source, &target).unwrap(),
+            copy_new(&source, &target, CopyStrategy::Auto).unwrap(),
             CopyMethod::Cloned,
             "filesystem did not clone; fallback is not clone coverage"
         );

@@ -49,10 +49,37 @@ pub fn copy_file_with_progress<F>(
 where
     F: Fn(&CopyProgress),
 {
+    copy_file_with_strategy(
+        source,
+        target,
+        worktree_setup_config::CopyStrategy::Auto,
+        on_progress,
+    )
+}
+
+/// Execute a copy with an explicit per-entry transfer strategy.
+///
+/// # Errors
+///
+/// * If staging, enumeration, transfer, permissions, or publication fails.
+pub fn copy_file_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: worktree_setup_config::CopyStrategy,
+    on_progress: F,
+) -> Result<OperationResult, OperationError>
+where
+    F: Fn(&CopyProgress),
+{
     log::debug!("Copying file: {} -> {}", source.display(), target.display());
 
-    let result = worktree_setup_copy::copy_file(source, target, on_progress)
-        .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
+    let result = worktree_setup_copy::copy_file_with_strategy(
+        source,
+        target,
+        backend_strategy(strategy),
+        on_progress,
+    )
+    .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
 
     Ok(match result {
         worktree_setup_copy::CopyResult::Created { .. } => OperationResult::Created,
@@ -94,6 +121,28 @@ pub fn overwrite_file_with_progress<F>(
 where
     F: Fn(&CopyProgress),
 {
+    overwrite_file_with_strategy(
+        source,
+        target,
+        worktree_setup_config::CopyStrategy::Auto,
+        on_progress,
+    )
+}
+
+/// Execute a copy with an explicit per-entry transfer strategy.
+///
+/// # Errors
+///
+/// * If staging, enumeration, transfer, permissions, or publication fails.
+pub fn overwrite_file_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: worktree_setup_config::CopyStrategy,
+    on_progress: F,
+) -> Result<OperationResult, OperationError>
+where
+    F: Fn(&CopyProgress),
+{
     log::debug!(
         "Overwriting file: {} -> {}",
         source.display(),
@@ -107,8 +156,13 @@ where
 
     let existed = target.exists();
 
-    let result = worktree_setup_copy::overwrite_file(source, target, on_progress)
-        .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
+    let result = worktree_setup_copy::overwrite_file_with_strategy(
+        source,
+        target,
+        backend_strategy(strategy),
+        on_progress,
+    )
+    .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
 
     Ok(match result {
         worktree_setup_copy::CopyResult::Created { .. } => {
@@ -160,6 +214,28 @@ pub fn copy_directory_with_progress<F>(
 where
     F: Fn(&CopyProgress) + Sync,
 {
+    copy_directory_with_strategy(
+        source,
+        target,
+        worktree_setup_config::CopyStrategy::Auto,
+        on_progress,
+    )
+}
+
+/// Execute a copy with an explicit per-entry transfer strategy.
+///
+/// # Errors
+///
+/// * If staging, enumeration, transfer, permissions, or publication fails.
+pub fn copy_directory_with_strategy<F>(
+    source: &Path,
+    target: &Path,
+    strategy: worktree_setup_config::CopyStrategy,
+    on_progress: F,
+) -> Result<OperationResult, OperationError>
+where
+    F: Fn(&CopyProgress) + Sync,
+{
     log::debug!(
         "Copying directory: {} -> {}",
         source.display(),
@@ -174,14 +250,30 @@ where
         })?;
     }
 
-    let result = worktree_setup_copy::copy_directory(source, target, on_progress)
-        .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
+    let result = worktree_setup_copy::copy_directory_with_strategy(
+        source,
+        target,
+        backend_strategy(strategy),
+        on_progress,
+    )
+    .map_err(|e| OperationError::CopyModuleError(e.to_string()))?;
 
     Ok(match result {
         worktree_setup_copy::CopyResult::Created { .. } => OperationResult::Created,
         worktree_setup_copy::CopyResult::Exists => OperationResult::Exists,
         worktree_setup_copy::CopyResult::SourceNotFound => OperationResult::Skipped,
     })
+}
+
+const fn backend_strategy(
+    strategy: worktree_setup_config::CopyStrategy,
+) -> worktree_setup_copy::CopyStrategy {
+    match strategy {
+        worktree_setup_config::CopyStrategy::Auto => worktree_setup_copy::CopyStrategy::Auto,
+        worktree_setup_config::CopyStrategy::ByteCopy => {
+            worktree_setup_copy::CopyStrategy::ByteCopy
+        }
+    }
 }
 
 #[cfg(test)]

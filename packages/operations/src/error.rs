@@ -45,6 +45,16 @@ pub enum OperationError {
         error: std::io::Error,
     },
 
+    /// Conflicting transfer policies for overlapping destination paths.
+    #[error("Conflicting copy strategies {first} and {second} at {}", target.display())]
+    CopyStrategyConflict {
+        /// Overlapping destination.
+        target: PathBuf,
+        /// First strategy.
+        first: String,
+        /// Second strategy.
+        second: String,
+    },
     /// Git operation error.
     #[error("Git error: {0}")]
     GitError(#[from] worktree_setup_git::GitError),

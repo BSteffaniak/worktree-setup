@@ -14,6 +14,7 @@ description = "Fast parallel file copying with progress tracking"
 jwalk = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
+same-file = { workspace = true }
 reflink-copy = { workspace = true }
 thiserror = { workspace = true }
 

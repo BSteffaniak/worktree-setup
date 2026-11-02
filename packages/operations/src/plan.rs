@@ -7,12 +7,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use worktree_setup_config::LoadedConfig;
+use worktree_setup_config::{CopyEntry, CopyGlobEntry, CopyStrategy, LoadedConfig};
 use worktree_setup_copy::{count_files, count_files_with_progress};
 use worktree_setup_glob::{GlobResolverOptions, is_glob_pattern, resolve_glob};
 
 use crate::ApplyConfigOptions;
 use crate::error::OperationError;
+use crate::validate_copy_strategies;
 
 /// Type of operation to perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,8 @@ pub struct PlannedOperation {
     pub skip_reason: Option<String>,
     /// Whether to force-overwrite existing targets.
     pub force_overwrite: bool,
+    /// Transfer policy for this operation; ignored for symlinks.
+    pub copy_strategy: CopyStrategy,
 }
 
 /// Resolve a path from config, handling repo-root-relative paths.
@@ -239,6 +242,7 @@ where
         &config.config.templates,
     ));
 
+    validate_copy_strategies(&operations)?;
     Ok(operations)
 }
 
@@ -290,6 +294,7 @@ where
             will_skip,
             skip_reason,
             force_overwrite: force,
+            copy_strategy: CopyStrategy::Auto,
         });
     }
 
@@ -300,14 +305,15 @@ where
 fn plan_copy_ops<F>(
     ctx: &PlanContext<'_, F>,
     current_op: &mut usize,
-    copies: &[String],
+    copies: &[CopyEntry],
 ) -> Vec<PlannedOperation>
 where
     F: Fn(usize, usize, &str, Option<u64>),
 {
     let mut operations = Vec::new();
 
-    for copy_path in copies {
+    for entry in copies {
+        let copy_path = entry.path();
         *current_op += 1;
         let (source, display_str) =
             resolve_path(ctx.main_worktree, ctx.config_relative_dir, copy_path);
@@ -374,6 +380,7 @@ where
             will_skip,
             skip_reason,
             force_overwrite: false,
+            copy_strategy: entry.strategy(),
         });
     }
 
@@ -384,14 +391,15 @@ where
 fn plan_overwrite_ops<F>(
     ctx: &PlanContext<'_, F>,
     current_op: &mut usize,
-    overwrites: &[String],
+    overwrites: &[CopyEntry],
 ) -> Vec<PlannedOperation>
 where
     F: Fn(usize, usize, &str, Option<u64>),
 {
     let mut operations = Vec::new();
 
-    for overwrite_path in overwrites {
+    for entry in overwrites {
+        let overwrite_path = entry.path();
         *current_op += 1;
         let (source, display_str) =
             resolve_path(ctx.main_worktree, ctx.config_relative_dir, overwrite_path);
@@ -432,6 +440,7 @@ where
             will_skip,
             skip_reason,
             force_overwrite: false,
+            copy_strategy: entry.strategy(),
         });
     }
 
@@ -463,7 +472,7 @@ fn glob_target_status(target: &Path, overwrite: bool) -> (bool, Option<String>, 
 fn plan_glob_ops<F>(
     ctx: &PlanContext<'_, F>,
     current_op: &mut usize,
-    patterns: &[String],
+    patterns: &[CopyGlobEntry],
 ) -> Vec<PlannedOperation>
 where
     F: Fn(usize, usize, &str, Option<u64>),
@@ -482,7 +491,10 @@ where
     let empty_root = PathBuf::new();
     let containment_root = ctx.containment_root.as_ref().unwrap_or(&empty_root);
 
-    for pattern in patterns {
+    for entry in patterns {
+        let pattern = entry.pattern();
+        let start = operations.len();
+        seen.clear();
         *current_op += 1;
 
         // Determine search directory and display prefix based on root-relative
@@ -492,7 +504,7 @@ where
                 (
                     ctx.main_worktree.join(ctx.config_relative_dir),
                     ctx.config_relative_dir.to_path_buf(),
-                    pattern.as_str(),
+                    pattern,
                 )
             },
             |stripped| (ctx.main_worktree.to_path_buf(), PathBuf::new(), stripped),
@@ -523,8 +535,17 @@ where
                 glob_pattern,
             );
         }
+        for op in &mut operations[start..] {
+            op.copy_strategy = entry.strategy();
+        }
     }
-
+    let mut seen_targets = BTreeSet::new();
+    operations.retain(|op| {
+        seen_targets.insert((
+            op.target.clone(),
+            op.copy_strategy == CopyStrategy::ByteCopy,
+        ))
+    });
     operations
 }
 
@@ -591,6 +612,7 @@ fn plan_glob_exact<F>(
         will_skip,
         skip_reason,
         force_overwrite: false,
+        copy_strategy: CopyStrategy::Auto,
     });
 }
 
@@ -652,6 +674,7 @@ fn plan_glob_pattern<F>(
             will_skip,
             skip_reason,
             force_overwrite: false,
+            copy_strategy: CopyStrategy::Auto,
         });
     }
 }
@@ -709,6 +732,7 @@ where
             will_skip,
             skip_reason,
             force_overwrite: false,
+            copy_strategy: template.strategy,
         });
     }
 
@@ -735,6 +759,22 @@ pub fn plan_unstaged_operations(
     main_worktree: &Path,
     target_worktree: &Path,
 ) -> Vec<PlannedOperation> {
+    plan_unstaged_operations_with_strategy(
+        unstaged_files,
+        main_worktree,
+        target_worktree,
+        CopyStrategy::Auto,
+    )
+}
+
+/// Plan unstaged copies using the selected entry's transfer strategy.
+#[must_use]
+pub fn plan_unstaged_operations_with_strategy(
+    unstaged_files: &[String],
+    main_worktree: &Path,
+    target_worktree: &Path,
+    strategy: CopyStrategy,
+) -> Vec<PlannedOperation> {
     let mut operations = Vec::new();
 
     for file in unstaged_files {
@@ -753,6 +793,7 @@ pub fn plan_unstaged_operations(
                 will_skip: false,
                 skip_reason: None,
                 force_overwrite: false,
+                copy_strategy: strategy,
             });
         }
     }
@@ -773,8 +814,8 @@ mod tests {
             config: Config {
                 description: "Test".to_string(),
                 symlinks: vec!["data".to_string()],
-                copy: vec!["config.json".to_string()],
-                overwrite: vec!["settings.json".to_string()],
+                copy: vec!["config.json".into()],
+                overwrite: vec!["settings.json".into()],
                 ..Default::default()
             },
             config_path: dir.join("worktree.config.toml"),
@@ -815,7 +856,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy: vec!["config.json".to_string()],
+                copy: vec!["config.json".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -846,7 +887,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy: vec!["data".to_string()],
+                copy: vec!["data".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -876,7 +917,7 @@ mod tests {
         let config = LoadedConfig {
             config: Config {
                 symlinks: vec!["data".to_string()],
-                copy: vec!["config.json".to_string()],
+                copy: vec!["config.json".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -949,7 +990,7 @@ mod tests {
         // Config in subdirectory referencing root files with /
         let config = LoadedConfig {
             config: Config {
-                copy: vec!["/.nix".to_string(), "/.envrc".to_string()],
+                copy: vec!["/.nix".into(), "/.envrc".into()],
                 ..Default::default()
             },
             config_path: app_dir.join("worktree.config.toml"),
@@ -993,8 +1034,8 @@ mod tests {
         let config = LoadedConfig {
             config: Config {
                 copy: vec![
-                    "/.envrc".to_string(),      // root-relative
-                    "local.config".to_string(), // config-relative
+                    "/.envrc".into(),      // root-relative
+                    "local.config".into(), // config-relative
                 ],
                 ..Default::default()
             },
@@ -1038,6 +1079,7 @@ mod tests {
                 templates: vec![worktree_setup_config::TemplateMapping {
                     source: "/.env.template".to_string(), // root-relative source
                     target: ".env.local".to_string(),     // config-relative target
+                    strategy: worktree_setup_config::CopyStrategy::Auto,
                 }],
                 ..Default::default()
             },
@@ -1112,7 +1154,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy: vec!["../outer/secret.txt".to_string()],
+                copy: vec!["../outer/secret.txt".into()],
                 ..Default::default()
             },
             config_path: main_dir.join("worktree.config.toml"),
@@ -1145,7 +1187,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                overwrite: vec!["../outer/secret.txt".to_string()],
+                overwrite: vec!["../outer/secret.txt".into()],
                 ..Default::default()
             },
             config_path: main_dir.join("worktree.config.toml"),
@@ -1181,6 +1223,7 @@ mod tests {
                 templates: vec![worktree_setup_config::TemplateMapping {
                     source: "../outer/template.txt".to_string(),
                     target: "output.txt".to_string(),
+                    strategy: worktree_setup_config::CopyStrategy::Auto,
                 }],
                 ..Default::default()
             },
@@ -1213,7 +1256,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy: vec!["../outer/secret.txt".to_string()],
+                copy: vec!["../outer/secret.txt".into()],
                 ..Default::default()
             },
             config_path: main_dir.join("worktree.config.toml"),
@@ -1245,7 +1288,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy_glob: vec!["*.txt".to_string()],
+                copy_glob: vec!["*.txt".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -1282,7 +1325,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy_glob: vec!["**/dist".to_string()],
+                copy_glob: vec!["**/dist".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -1322,7 +1365,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy_glob: vec!["dist".to_string()],
+                copy_glob: vec!["dist".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),
@@ -1350,7 +1393,7 @@ mod tests {
 
         let config = LoadedConfig {
             config: Config {
-                copy_glob: vec!["*.js".to_string()],
+                copy_glob: vec!["*.js".into()],
                 ..Default::default()
             },
             config_path: main_dir.path().join("worktree.config.toml"),

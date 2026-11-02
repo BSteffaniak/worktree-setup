@@ -12,11 +12,14 @@ use worktree_setup_git::{get_unstaged_and_untracked_files, open_repo};
 
 use crate::OperationResult;
 use crate::copy::{
-    copy_directory_with_progress, copy_file_with_progress, overwrite_file_with_progress,
+    copy_directory_with_strategy, copy_file_with_strategy, overwrite_file_with_strategy,
 };
 use crate::error::OperationError;
-use crate::plan::{OperationType, PlannedOperation, plan_operations, plan_unstaged_operations};
+use crate::plan::{
+    OperationType, PlannedOperation, plan_operations, plan_unstaged_operations_with_strategy,
+};
 use crate::symlink::{create_symlink, force_create_symlink};
+use crate::validate_copy_strategies;
 
 /// Record of a single file operation.
 #[derive(Debug, Clone)]
@@ -86,7 +89,21 @@ pub fn apply_config(
     let mut result = ApplyResult::default();
 
     // Plan and execute regular operations
-    let operations = plan_operations(config, main_worktree, target_worktree, options)?;
+    let mut operations = plan_operations(config, main_worktree, target_worktree, options)?;
+    if options
+        .copy_unstaged
+        .unwrap_or_else(|| config.config.copy_unstaged.enabled())
+    {
+        let repo = open_repo(main_worktree)?;
+        let files = get_unstaged_and_untracked_files(&repo)?;
+        operations.extend(plan_unstaged_operations_with_strategy(
+            &files,
+            main_worktree,
+            target_worktree,
+            config.config.copy_unstaged.strategy(),
+        ));
+    }
+    validate_copy_strategies(&operations)?;
 
     for op in &operations {
         let op_result = execute_operation(op, |_, _| {})?;
@@ -101,25 +118,6 @@ pub fn apply_config(
             OperationType::Overwrite => result.overwrites.push(record),
             OperationType::Template => result.templates.push(record),
             OperationType::Unstaged => result.unstaged.push(record),
-        }
-    }
-
-    // Handle unstaged files separately (requires git operations)
-    let should_copy_unstaged = options.copy_unstaged.unwrap_or(config.config.copy_unstaged);
-
-    if should_copy_unstaged {
-        log::info!("Copying unstaged and untracked files");
-
-        let repo = open_repo(main_worktree)?;
-        let files = get_unstaged_and_untracked_files(&repo)?;
-        let unstaged_ops = plan_unstaged_operations(&files, main_worktree, target_worktree);
-
-        for op in &unstaged_ops {
-            let op_result = execute_operation(op, |_, _| {})?;
-            result.unstaged.push(OperationRecord {
-                path: op.display_path.clone(),
-                result: op_result,
-            });
         }
     }
 
@@ -159,6 +157,7 @@ where
         });
     }
 
+    log::debug!("Operation {}: {:?}", op.display_path, op.copy_strategy);
     match op.operation_type {
         OperationType::Symlink => {
             if op.force_overwrite {
@@ -170,9 +169,10 @@ where
         OperationType::Copy | OperationType::CopyGlob | OperationType::Template => {
             if op.is_directory {
                 // Directory copy with progress
-                let result = copy_directory_with_progress(
+                let result = copy_directory_with_strategy(
                     &op.source,
                     &op.target,
+                    op.copy_strategy,
                     |progress: &CopyProgress| {
                         on_progress(progress.files_copied, progress.files_total);
                     },
@@ -182,18 +182,24 @@ where
                 Ok(result)
             } else {
                 // Single file copy
-                copy_file_with_progress(&op.source, &op.target, |progress: &CopyProgress| {
-                    on_progress(progress.files_copied, progress.files_total);
-                })
+                copy_file_with_strategy(
+                    &op.source,
+                    &op.target,
+                    op.copy_strategy,
+                    |progress: &CopyProgress| {
+                        on_progress(progress.files_copied, progress.files_total);
+                    },
+                )
             }
         }
         OperationType::Overwrite | OperationType::Unstaged => {
             if op.is_directory {
                 // For overwrite, we'd need to delete first then copy
                 // For now, treat as regular copy (directory overwrites are rare)
-                let result = copy_directory_with_progress(
+                let result = copy_directory_with_strategy(
                     &op.source,
                     &op.target,
+                    op.copy_strategy,
                     |progress: &CopyProgress| {
                         on_progress(progress.files_copied, progress.files_total);
                     },
@@ -201,9 +207,14 @@ where
                 on_progress(op.file_count, op.file_count);
                 Ok(result)
             } else {
-                overwrite_file_with_progress(&op.source, &op.target, |progress: &CopyProgress| {
-                    on_progress(progress.files_copied, progress.files_total);
-                })
+                overwrite_file_with_strategy(
+                    &op.source,
+                    &op.target,
+                    op.copy_strategy,
+                    |progress: &CopyProgress| {
+                        on_progress(progress.files_copied, progress.files_total);
+                    },
+                )
             }
         }
     }
@@ -222,8 +233,8 @@ mod tests {
             config: Config {
                 description: "Test".to_string(),
                 symlinks: vec!["data".to_string()],
-                copy: vec!["config.json".to_string()],
-                overwrite: vec!["settings.json".to_string()],
+                copy: vec!["config.json".into()],
+                overwrite: vec!["settings.json".into()],
                 ..Default::default()
             },
             config_path: dir.join("worktree.config.toml"),

@@ -30,8 +30,13 @@ mod copy;
 mod count;
 mod error;
 mod progress;
+mod strategy;
 
 pub use copy::{CopyResult, copy_directory, copy_file, overwrite_file};
+pub use copy::{
+    copy_directory_with_strategy, copy_file_with_strategy, overwrite_file_with_strategy,
+};
 pub use count::{count_files, count_files_with_progress, disk_usage};
 pub use error::CopyError;
 pub use progress::{CopyProgress, ProgressTracker};
+pub use strategy::CopyStrategy;

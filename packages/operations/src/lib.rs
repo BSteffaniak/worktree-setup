@@ -31,6 +31,9 @@ mod apply;
 mod copy;
 mod error;
 mod plan;
+mod strategy;
+#[cfg(test)]
+mod strategy_tests;
 mod symlink;
 
 pub use apply::{
@@ -40,11 +43,16 @@ pub use copy::{
     copy_directory, copy_directory_with_progress, copy_file, copy_file_with_progress,
     overwrite_file, overwrite_file_with_progress,
 };
+pub use copy::{
+    copy_directory_with_strategy, copy_file_with_strategy, overwrite_file_with_strategy,
+};
 pub use error::OperationError;
+pub use plan::plan_unstaged_operations_with_strategy;
 pub use plan::{
     OperationType, PlannedOperation, plan_operations, plan_operations_with_progress,
     plan_unstaged_operations,
 };
+pub use strategy::validate_copy_strategies;
 pub use symlink::{create_symlink, force_create_symlink};
 pub use worktree_setup_copy::CopyProgress;
 

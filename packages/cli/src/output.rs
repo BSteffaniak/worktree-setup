@@ -348,7 +348,7 @@ pub fn print_clean_preview(items: &[CleanItem]) {
 /// Print a summary after cleaning completes.
 pub fn print_clean_summary(deleted_count: usize, total_size: u64) {
     println!(
-        "Deleted {} item{}, freed {}",
+        "Deleted {} item{} ({} reported size; shared blocks may remain)",
         deleted_count,
         if deleted_count == 1 { "" } else { "s" },
         format_size(total_size)
@@ -433,7 +433,7 @@ pub fn print_multi_worktree_clean_summary(
     worktree_count: usize,
 ) {
     println!(
-        "Deleted {} item{} across {} worktree{}, freed {}",
+        "Deleted {} item{} across {} worktree{} ({} reported size; shared blocks may remain)",
         deleted_count,
         if deleted_count == 1 { "" } else { "s" },
         worktree_count,

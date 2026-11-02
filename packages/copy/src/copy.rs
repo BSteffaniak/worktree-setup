@@ -9,6 +9,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::backend::{CopyMethod, copy_new};
 use crate::error::CopyError;
 use crate::progress::{CopyProgress, ProgressTracker};
 
@@ -35,6 +36,8 @@ struct FileEntry {
     target: std::path::PathBuf,
     /// Whether this is a symlink.
     is_symlink: bool,
+    /// Whether this entry is a directory (including empty directories).
+    is_directory: bool,
 }
 
 /// Copy a single file with progress callback.
@@ -61,7 +64,7 @@ where
         return Ok(CopyResult::SourceNotFound);
     }
 
-    if target.exists() {
+    if target.symlink_metadata().is_ok() {
         log::debug!("Target already exists");
         return Ok(CopyResult::Exists);
     }
@@ -81,8 +84,8 @@ where
         })?;
     }
 
-    // Try reflink first, fall back to regular copy
-    copy_file_with_reflink(source, target)?;
+    let method = copy_file_with_reflink(source, target)?;
+    log::debug!("Copy complete: {method:?}");
 
     // Report complete
     on_progress(&CopyProgress::new(
@@ -139,8 +142,19 @@ where
         })?;
     }
 
-    // Try reflink first, fall back to regular copy
-    copy_file_with_reflink(source, target)?;
+    // Existing destinations must retain in-place overwrite semantics (links,
+    // permissions and open handles). Cloning requires a new destination.
+    if target.symlink_metadata().is_ok() {
+        fs::copy(source, target).map_err(|io_error| CopyError::FileCopyError {
+            source_path: source.to_path_buf(),
+            target_path: target.to_path_buf(),
+            io_error,
+        })?;
+        log::debug!("Copy complete: Copied (existing destination, in-place overwrite)");
+    } else {
+        let method = copy_file_with_reflink(source, target)?;
+        log::debug!("Copy complete: {method:?}");
+    }
 
     // Report complete
     on_progress(&CopyProgress::new(
@@ -185,25 +199,16 @@ where
         return Ok(CopyResult::SourceNotFound);
     }
 
-    if target.exists() {
+    if target.symlink_metadata().is_ok() {
         log::debug!("Target already exists");
         return Ok(CopyResult::Exists);
     }
 
     // Phase 1: Enumerate all files using jwalk (parallel)
     let entries = enumerate_directory(source, target)?;
-    let total_files = entries.len() as u64;
+    let total_files = entries.iter().filter(|entry| !entry.is_directory).count() as u64;
 
     log::debug!("Found {total_files} files to copy");
-
-    if total_files == 0 {
-        // Empty directory - just create the target
-        fs::create_dir_all(target).map_err(|e| CopyError::CreateDirError {
-            path: target.to_path_buf(),
-            io_error: e,
-        })?;
-        return Ok(CopyResult::Created { files_copied: 0 });
-    }
 
     // Create progress tracker
     let tracker = ProgressTracker::new();
@@ -216,7 +221,11 @@ where
     // First, collect all unique parent directories and create them
     let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
         std::collections::BTreeSet::new();
+    dirs.insert(target.to_path_buf());
     for entry in &entries {
+        if entry.is_directory {
+            dirs.insert(entry.target.clone());
+        }
         if let Some(parent) = entry.target.parent() {
             dirs.insert(parent.to_path_buf());
         }
@@ -233,13 +242,23 @@ where
     let tracker_ref = &tracker;
     let on_progress_ref = &on_progress;
 
+    let cloned = std::sync::atomic::AtomicU64::new(0);
+    let copied = std::sync::atomic::AtomicU64::new(0);
     entries
         .par_iter()
+        .filter(|entry| !entry.is_directory)
         .try_for_each(|entry| -> Result<(), CopyError> {
             if entry.is_symlink {
                 copy_symlink(&entry.source, &entry.target)?;
             } else {
-                copy_file_with_reflink(&entry.source, &entry.target)?;
+                match copy_file_with_reflink(&entry.source, &entry.target)? {
+                    CopyMethod::Cloned => {
+                        cloned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    CopyMethod::Copied => {
+                        copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
 
             tracker_ref.increment_copied();
@@ -255,6 +274,13 @@ where
             Ok(())
         })?;
 
+    log::debug!(
+        "Copy complete for {}: {} cloned, {} copied, {} symlinks",
+        target.display(),
+        cloned.load(std::sync::atomic::Ordering::Relaxed),
+        copied.load(std::sync::atomic::Ordering::Relaxed),
+        entries.iter().filter(|entry| entry.is_symlink).count(),
+    );
     // Final progress report
     on_progress(&tracker.snapshot(None));
 
@@ -290,11 +316,7 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
             continue;
         }
 
-        // Skip directories (we only copy files and symlinks)
         let file_type = entry.file_type();
-        if file_type.is_dir() {
-            continue;
-        }
 
         // Calculate relative path and target
         let rel_path =
@@ -310,6 +332,7 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
             source: source_path.clone(),
             target: target_path,
             is_symlink: file_type.is_symlink(),
+            is_directory: file_type.is_dir(),
         });
     }
 
@@ -317,20 +340,12 @@ fn enumerate_directory(source: &Path, target: &Path) -> Result<Vec<FileEntry>, C
 }
 
 /// Copy a single file, trying reflink first then falling back to regular copy.
-fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<(), CopyError> {
-    // Try reflink first (copy-on-write, instant on APFS/Btrfs/ReFS)
-    if matches!(reflink_copy::reflink(source, target), Ok(())) {
-        log::trace!("Reflinked {} -> {}", source.display(), target.display());
-    } else {
-        // Fall back to regular copy
-        fs::copy(source, target).map_err(|e| CopyError::FileCopyError {
-            source_path: source.to_path_buf(),
-            target_path: target.to_path_buf(),
-            io_error: e,
-        })?;
-        log::trace!("Copied {} -> {}", source.display(), target.display());
-    }
-    Ok(())
+fn copy_file_with_reflink(source: &Path, target: &Path) -> Result<CopyMethod, CopyError> {
+    copy_new(source, target).map_err(|io_error| CopyError::FileCopyError {
+        source_path: source.to_path_buf(),
+        target_path: target.to_path_buf(),
+        io_error,
+    })
 }
 
 /// Copy a symlink, preserving it as a symlink.
@@ -379,6 +394,10 @@ fn copy_symlink(source: &Path, target: &Path) -> Result<(), CopyError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "copy_tests.rs"]
+mod copy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -601,7 +601,72 @@ worktree-setup ../new-wt -c shared -c web
 | `templates`    | Copies source to target path, only if target doesn't exist        |
 | `copyUnstaged` | Copies files with uncommitted changes from master worktree        |
 
-File copying uses reflink (copy-on-write) when the filesystem supports it (APFS on macOS, Btrfs on Linux). This makes copying large directories nearly instant.
+### Portable, copy-on-write copying
+
+`copy` creates independent files, using the best mechanism available for the source
+and destination. File copying first attempts a filesystem clone: APFS on macOS,
+reflinks on compatible Linux filesystems such as Btrfs and XFS, or block cloning
+on supported Windows ReFS configurations. If cloning fails (including unsupported
+filesystems or cross-volume copies), it falls back to ordinary copying. No
+platform-specific configuration, privileges, or external copy utilities are needed.
+Windows support depends on the filesystem and the `reflink-copy` backend; it is
+not a promise that all Windows drives support cloning.
+
+For example, choose an isolated dependency tree instead of a shared symlink:
+
+```toml
+copy = ["node_modules"]
+```
+
+Unlike `symlinks`, modifications to these copied files do not modify the source.
+Existing `symlinks` settings are never converted automatically. Git worktree
+creation and Git's shared object database are unchanged; this optimization applies
+to configured setup copies, including templates, glob matches, and new unstaged
+files.
+
+New files are staged on the destination filesystem, then published without
+replacing an existing path. Failed attempts clean up their private staging area.
+Executable permissions are preserved with either copy backend. Directory copies
+preserve symlinks without traversing them, and include empty directories. Existing
+file overwrites deliberately use ordinary in-place copying: replacing the inode
+just to enable cloning would change hard-link, symlink, and open-handle behavior.
+Existing directory overwrite behavior is unchanged (an existing directory is skipped).
+
+Cloning avoids duplicating file contents initially, but directory traversal and
+per-file metadata still take time, especially for dependency trees with many small
+files. Subsequent writes need additional storage. Copies of actively changing
+directories are **not atomic snapshots**. Build caches may contain absolute paths
+or stale state; cheap copying does not guarantee that a cache is reusable.
+
+Use `--verbose` to see cloned/copied counts for directories, the mechanism used
+for single files, and clone fallback errors. Normal output remains unchanged.
+Reported disk usage is not exclusive physical storage: shared extents may be
+counted for both copies, and deleting a clone may reclaim less than its reported
+size. The tool does not claim exact clone savings or reclaimed bytes.
+
+#### Copy validation and benchmarks
+
+Portable regression tests run with `cargo test -p worktree_setup_copy`. Explicit
+filesystem tests fail if the expected mechanism was not actually used:
+
+```bash
+# Requires a clone-capable filesystem for the temporary directory.
+# Set TMPDIR to a directory on that filesystem if necessary.
+cargo test -p worktree_setup_copy real_clone_is_independent -- --ignored --nocapture
+
+# Select an existing writable directory on another volume or unsupported filesystem.
+WORKTREE_COPY_FALLBACK_ROOT=/path/on/other-volume \
+  cargo test -p worktree_setup_copy real_filesystem_fallback -- --ignored --nocapture
+
+# Synthetic large-file and many-small-file workloads; prints actual clone counts,
+# automatic vs forced fallback timings, existing overwrites, and parallel tree copies.
+cargo test --release -p worktree_setup_copy benchmark_copy_backends -- --ignored --nocapture
+```
+
+The benchmark uses temporary data and includes staging/publication overhead. Forced
+fallback uses `fs::copy`, which the OS may itself accelerate; it is not guaranteed
+to be a physical byte-by-byte copy. Compare multiple runs on your actual filesystem;
+these timings are not a universal speed guarantee.
 
 ## Requirements
 

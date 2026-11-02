@@ -17,7 +17,6 @@ rayon = { workspace = true }
 reflink-copy = { workspace = true }
 thiserror = { workspace = true }
 
-[dev-dependencies]
 tempfile = { workspace = true }
 
 [features]

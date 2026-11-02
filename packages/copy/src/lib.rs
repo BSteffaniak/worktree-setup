@@ -25,6 +25,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod backend;
 mod copy;
 mod count;
 mod error;

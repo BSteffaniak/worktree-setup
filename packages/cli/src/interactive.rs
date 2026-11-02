@@ -295,9 +295,7 @@ fn run_select_loop(
                 // Toggle all
                 Key::Char('a') => {
                     let all_checked = state.checked.iter().all(|&c| c);
-                    for c in &mut state.checked {
-                        *c = !all_checked;
-                    }
+                    state.checked.fill(!all_checked);
                 }
                 // Toggle size sort
                 Key::Char('s') => {

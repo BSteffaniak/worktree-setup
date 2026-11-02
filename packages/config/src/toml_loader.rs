@@ -91,7 +91,7 @@ postSetup = ["npm install"]
         );
         assert!(config.copy_unstaged.enabled());
         assert_eq!(config.post_setup, vec!["npm install"]);
-        assert!(config.clean.is_empty());
+        assert_eq!(config.clean, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -128,11 +128,11 @@ cleanIgnore = [".opencode/node_modules", "**/.cache"]
         let config = load_toml_config(file.path()).unwrap();
 
         assert_eq!(config.description, "Minimal");
-        assert!(config.symlinks.is_empty());
+        assert_eq!(config.symlinks, [] as [std::string::String; 0]);
         assert!(config.copy.is_empty());
         assert!(!config.copy_unstaged.enabled());
-        assert!(config.clean.is_empty());
-        assert!(config.clean_ignore.is_empty());
+        assert_eq!(config.clean, [] as [std::string::String; 0]);
+        assert_eq!(config.clean_ignore, [] as [std::string::String; 0]);
         assert!(config.profiles.is_empty());
     }
 
@@ -248,6 +248,6 @@ postSetup = ["bun install", "bun migrate"]
                 "bun migrate".to_string(),
             ]))
         );
-        assert!(defaults.skip_post_setup.is_empty());
+        assert_eq!(defaults.skip_post_setup, [] as [std::string::String; 0]);
     }
 }

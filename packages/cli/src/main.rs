@@ -2995,7 +2995,10 @@ mod tests {
         let target_canonical = target.canonicalize().unwrap();
         let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
 
-        assert!(resolved.is_empty());
+        assert_eq!(
+            resolved,
+            [] as [(std::path::PathBuf, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -3023,7 +3026,10 @@ mod tests {
         let resolved = resolve_clean_paths(&[&config], &target, &target_canonical, repo_root);
 
         // The escaping path should be rejected
-        assert!(resolved.is_empty());
+        assert_eq!(
+            resolved,
+            [] as [(std::path::PathBuf, std::string::String); 0]
+        );
     }
 
     #[test]

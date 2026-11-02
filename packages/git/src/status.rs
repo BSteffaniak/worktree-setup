@@ -104,7 +104,7 @@ mod tests {
     fn test_get_unstaged_files_empty() {
         let (_dir, repo) = create_test_repo();
         let files = get_unstaged_and_untracked_files(&repo).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files, [] as [std::string::String; 0]);
     }
 
     #[test]

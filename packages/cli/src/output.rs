@@ -220,7 +220,7 @@ fn heat_bar(size: u64, max_size: u64) -> String {
         .saturating_mul(BAR_WIDTH_U64)
         .div_ceil(max_size)
         .clamp(1, BAR_WIDTH_U64);
-    let filled = usize::try_from(filled_u64).map_or(BAR_WIDTH, |value| value);
+    let filled = usize::try_from(filled_u64).unwrap_or(BAR_WIDTH);
     let empty = BAR_WIDTH - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
     color_by_size(&bar, size)

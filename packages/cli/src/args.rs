@@ -93,6 +93,17 @@ pub struct Args {
 /// Subcommands for worktree-setup.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Install the optional worktree setup reminder hook.
+    Init(HookInstallArgs),
+    /// Remove an unchanged worktree-setup reminder hook.
+    Uninit(HookScopeArgs),
+    /// Internal, non-interactive reminder invoked by Git.
+    #[command(hide = true)]
+    HookPostCheckout {
+        old_head: String,
+        new_head: String,
+        branch_checkout: String,
+    },
     /// Apply worktree configs to an existing directory.
     ///
     /// Discovers worktree configuration files and applies file operations
@@ -114,6 +125,25 @@ pub enum Command {
     /// worktree. When run from the main worktree (no path given), opens
     /// an interactive multi-select picker.
     Remove(RemoveArgs),
+}
+
+/// Installation options for the optional reminder.
+#[derive(Debug, Parser)]
+pub struct HookInstallArgs {
+    /// Install for all repositories via global core.hooksPath.
+    #[arg(long)]
+    pub global: bool,
+    /// Accept the global hooksPath precedence warning without prompting.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+/// Scope of the reminder to uninstall.
+#[derive(Debug, Parser)]
+pub struct HookScopeArgs {
+    /// Remove the global integration instead of the repository-local hook.
+    #[arg(long)]
+    pub global: bool,
 }
 
 /// Arguments for the `setup` subcommand.

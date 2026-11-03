@@ -66,6 +66,10 @@ pub enum ConfigError {
     #[error("IO error during config discovery: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// Configuration composition failed.
+    #[error("Failed to compose configuration: {0}")]
+    Composition(#[from] bmux_config_composition::Error),
+
     /// Profile not found.
     #[error("Profile not found: '{0}'. Use --list to see available profiles.")]
     ProfileNotFound(String),

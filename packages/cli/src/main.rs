@@ -7,6 +7,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod args;
+mod hooks;
 mod interactive;
 mod output;
 mod progress;
@@ -46,6 +47,11 @@ fn main() {
         Some(args::Command::Setup(setup_args)) => setup_args.verbose,
         Some(args::Command::Clean(clean_args)) => clean_args.verbose,
         Some(args::Command::Remove(remove_args)) => remove_args.verbose,
+        Some(
+            args::Command::Init(_)
+            | args::Command::Uninit(_)
+            | args::Command::HookPostCheckout { .. },
+        ) => false,
         None => args.verbose,
     };
 
@@ -61,6 +67,16 @@ fn main() {
         Some(args::Command::Setup(ref setup_args)) => run_setup(setup_args),
         Some(args::Command::Clean(ref clean_args)) => run_clean(clean_args),
         Some(args::Command::Remove(ref remove_args)) => run_remove(remove_args),
+        Some(args::Command::Init(ref options)) => hooks::install(options),
+        Some(args::Command::Uninit(ref options)) => hooks::uninstall(options.global),
+        Some(args::Command::HookPostCheckout {
+            ref old_head,
+            ref branch_checkout,
+            ..
+        }) => {
+            hooks::remind(old_head, branch_checkout);
+            Ok(())
+        }
         None => run_create(&args),
     };
 

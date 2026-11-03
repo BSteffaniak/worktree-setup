@@ -30,6 +30,8 @@ The default command creates a worktree and applies configs. Subcommands handle o
 | `worktree-setup setup [path]`  | Apply configs to an existing directory          |
 | `worktree-setup clean [path]`  | Delete files/directories specified in configs   |
 | `worktree-setup remove [path]` | Remove worktrees and optionally delete branches |
+| `worktree-setup init [--global]` | Install a non-blocking setup reminder hook |
+| `worktree-setup uninit [--global]` | Remove the reminder integration |
 
 ```bash
 cd your-repo
@@ -372,8 +374,9 @@ Global settings are loaded from two locations (repo-level overrides global):
 
 | Location                               | Scope     |
 | -------------------------------------- | --------- |
-| `~/.config/worktree-setup/config.toml` | All repos |
-| `.worktree-setup.toml` (at repo root)  | This repo |
+| Linux: `$XDG_CONFIG_HOME/worktree-setup/config.toml` (default `~/.config/...`) | All repos |
+| macOS: `~/Library/Application Support/worktree-setup/config.toml` | All repos |
+| `.worktree-setup.toml` (at the main repo root) | This repo and its linked worktrees |
 
 If neither file exists, defaults are used. Example:
 
@@ -384,6 +387,57 @@ branch_delete = "ASK"
 [security]
 allow_path_escape = false
 ```
+
+### Worktree Setup Reminders
+
+Install an optional, non-blocking `post-checkout` reminder:
+
+```bash
+worktree-setup init                  # Current repository and linked worktrees
+worktree-setup init --global         # Explicitly confirm global integration
+worktree-setup init --global --yes   # Accept the warning without prompting
+
+worktree-setup uninit                # Remove the repo-local integration
+worktree-setup uninit --global       # Remove the global integration
+```
+
+After direct `git worktree add`, the hook prints instructions to enter the new
+worktree and run `worktree-setup setup .`. Setup uses the existing configuration
+selection flow to apply copies, symlinks, templates, and post-setup commands. Use
+`--profile <name>` if you normally select a profile. It does not recreate the
+worktree or alter the branch Git already selected.
+
+The hook never runs setup automatically, prompts, deletes files, or blocks Git.
+It is silent for ordinary checkouts, clones, and creation through worktree-setup.
+`git worktree add --no-checkout` skips Git's hook. The executable must be on Git's
+`PATH`; if unavailable, the hook quietly does nothing.
+
+Repo-local installation adds only `.git/hooks/post-checkout` in the shared Git
+directory. It does not change Git config, shell startup files, or PATH. Existing,
+modified, or symlinked hooks are never overwritten or removed; conflicts include
+a manual integration snippet. If `core.hooksPath` is configured, repo-local
+installation refuses to modify the potentially shared directory.
+
+**Global caveat:** Git does not merge global and repo-local hooks. Global install
+reuses an existing absolute global `core.hooksPath`, or creates `hooks/` beside
+the platform config file and configures Git to use it. This can disable existing
+repo-local hooks; repositories overriding `core.hooksPath` do not use the global
+reminder. Installation asks for confirmation. Uninstall restores default routing
+only for a tool-managed directory that has no other files and is still selected;
+pre-existing global routing is preserved.
+
+Preferences reuse the global and repo config files:
+
+```toml
+[hooks]
+setup_reminder = false # Default: true, but only effective once a hook is installed
+```
+
+Configuration documents are composed using `bmux_config_composition` before
+applying defaults. Omitted repo fields preserve global values; explicit values
+(including `false`) override them. Config preferences alone do not install hooks.
+Existing platform config locations are unchanged. The composition crate tracks
+bmux's `master` branch, with the resolved commit recorded in `Cargo.lock`.
 
 ### Branch Delete Policy
 

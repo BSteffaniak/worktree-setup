@@ -13,6 +13,7 @@ keywords = ["git", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+bmux_config_composition = { git = "https://github.com/BSteffaniak/bmux", branch = "master", default-features = false }
 # Internal packages
 worktree_setup_cli = { version = "0.4.0", path = "packages/cli", default-features = false }
 worktree_setup_config = { version = "0.4.0", path = "packages/config", default-features = false }

@@ -179,6 +179,7 @@ pub fn create_worktree(
     log::debug!("Running: git {}", args.join(" "));
 
     let output = Command::new("git")
+        .env("WORKTREE_SETUP_CREATING", "1")
         .args(&args)
         .current_dir(&repo_root)
         .output()

@@ -2,8 +2,9 @@
 //!
 //! Supports two config file locations, with repo-level overriding global:
 //!
-//! * **Global**: `$XDG_CONFIG_HOME/worktree-setup/config.toml`
-//!   (typically `~/.config/worktree-setup/config.toml`)
+//! * **Global**: the platform config directory plus `worktree-setup/config.toml`
+//!   (`$XDG_CONFIG_HOME` / `~/.config` on Linux;
+//!   `~/Library/Application Support` on macOS)
 //! * **Repo-level**: `.worktree-setup.toml` at the repository root
 //!
 //! If neither file exists, all settings use their defaults. Files are never
@@ -61,12 +62,35 @@ pub struct SecurityConfig {
     pub allow_path_escape: bool,
 }
 
+/// Preferences for the optional Git reminder integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// Print setup instructions after direct Git worktree creation.
+    #[serde(default = "reminder_enabled")]
+    pub setup_reminder: bool,
+}
+
+const fn reminder_enabled() -> bool {
+    true
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            setup_reminder: true,
+        }
+    }
+}
+
 /// Global configuration for worktree-setup.
 ///
 /// Loaded from an optional global file and an optional repo-level file.
 /// If neither exists, all fields use their `Default` values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
+    /// Preferences for installed Git hooks.
+    #[serde(default)]
+    pub hooks: HooksConfig,
     /// Settings for the `remove` subcommand.
     #[serde(default)]
     pub remove: RemoveConfig,
@@ -77,11 +101,12 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
-    /// Merge another `GlobalConfig` on top of self.
+    /// Merge a complete, already-defaulted typed configuration on top of self.
     ///
-    /// Values from `other` override values in `self`. This is used to
-    /// layer repo-level config on top of global config.
+    /// This replaces all settings, including defaults. File layering instead
+    /// composes raw documents before applying serde defaults, preserving omitted fields.
     pub const fn merge(&mut self, other: &Self) {
+        self.hooks.setup_reminder = other.hooks.setup_reminder;
         self.remove.branch_delete = other.remove.branch_delete;
         self.security.allow_path_escape = other.security.allow_path_escape;
     }
@@ -89,7 +114,8 @@ impl GlobalConfig {
 
 /// Return the path to the global config file.
 ///
-/// Uses the platform config directory (e.g. `~/.config` on Linux/macOS)
+/// Uses the platform config directory (`~/.config` on Linux,
+/// `~/Library/Application Support` on macOS)
 /// joined with `worktree-setup/config.toml`.
 ///
 /// Returns `None` if the platform config directory cannot be determined.
@@ -114,6 +140,7 @@ pub fn repo_config_path(repo_root: &Path) -> PathBuf {
 ///
 /// * If the file exists but cannot be read
 /// * If the file exists but contains invalid TOML
+#[cfg(test)]
 fn load_config_file(path: &Path) -> Result<Option<GlobalConfig>, ConfigError> {
     if !path.is_file() {
         return Ok(None);
@@ -153,24 +180,33 @@ fn load_config_file(path: &Path) -> Result<Option<GlobalConfig>, ConfigError> {
 ///
 /// * If a config file exists but cannot be read or parsed
 pub fn load_global_config(repo_root: Option<&Path>) -> Result<GlobalConfig, ConfigError> {
-    let mut config = GlobalConfig::default();
+    use bmux_config_composition::{Layer, LoadContext, Loader, Requirement, TomlCodec};
 
-    // Layer 1: global config file
-    if let Some(global_path) = global_config_path()
-        && let Some(global) = load_config_file(&global_path)?
-    {
-        config.merge(&global);
+    let context = LoadContext::new(std::env::current_dir()?, std::env::vars().collect())?;
+    let mut builder = Loader::builder();
+    if let Some(path) = global_config_path() {
+        builder = builder.layer(
+            "global",
+            Layer::File {
+                path,
+                requirement: Requirement::Optional,
+            },
+        );
     }
-
-    // Layer 2: repo-level config file (overrides global)
     if let Some(root) = repo_root {
-        let repo_path = repo_config_path(root);
-        if let Some(repo) = load_config_file(&repo_path)? {
-            config.merge(&repo);
-        }
+        builder = builder.layer(
+            "repository",
+            Layer::File {
+                path: repo_config_path(root),
+                requirement: Requirement::Optional,
+            },
+        );
     }
-
-    Ok(config)
+    Ok(builder
+        .build()?
+        .capture(&context)?
+        .resolve(&TomlCodec)?
+        .decode()?)
 }
 
 #[cfg(test)]

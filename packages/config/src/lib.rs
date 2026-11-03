@@ -42,8 +42,8 @@ pub use copy::{
 pub use discovery::{discover_configs, get_config_display_name};
 pub use error::ConfigError;
 pub use global::{
-    BranchDeletePolicy, GlobalConfig, RemoveConfig, SecurityConfig, global_config_path,
-    load_global_config, repo_config_path,
+    BranchDeletePolicy, GlobalConfig, HooksConfig, RemoveConfig, SecurityConfig,
+    global_config_path, load_global_config, repo_config_path,
 };
 pub use profiles::resolve_profiles;
 pub use toml_loader::load_toml_config;

@@ -49,6 +49,7 @@ fn main() {
         Some(args::Command::Remove(remove_args)) => remove_args.verbose,
         Some(
             args::Command::Init(_)
+            | args::Command::Hook { .. }
             | args::Command::Uninit(_)
             | args::Command::HookPostCheckout { .. },
         ) => false,
@@ -67,6 +68,9 @@ fn main() {
         Some(args::Command::Setup(ref setup_args)) => run_setup(setup_args),
         Some(args::Command::Clean(ref clean_args)) => run_clean(clean_args),
         Some(args::Command::Remove(ref remove_args)) => run_remove(remove_args),
+        Some(args::Command::Hook {
+            command: args::HookCommand::Render { ref executable, .. },
+        }) => hooks::render(executable.as_deref()).map(|script| print!("{script}")),
         Some(args::Command::Init(ref options)) => hooks::install(options),
         Some(args::Command::Uninit(ref options)) => hooks::uninstall(options.global),
         Some(args::Command::HookPostCheckout {

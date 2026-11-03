@@ -426,6 +426,19 @@ reminder. Installation asks for confirmation. Uninstall restores default routing
 only for a tool-managed directory that has no other files and is still selected;
 pre-existing global routing is preserved.
 
+For declarative managers such as Home Manager, render the canonical hook without
+installing it or changing Git configuration:
+
+```bash
+worktree-setup hook render post-checkout > post-checkout
+# Pin the handler to a package-manager executable (absolute path):
+worktree-setup hook render post-checkout --executable /absolute/path/to/worktree-setup
+```
+
+The renderer and `init` share the same script generator. Mark the rendered file
+executable and let your configuration manager include it alongside your other
+Git hooks. This avoids writing into immutable managed hook directories.
+
 Preferences reuse the global and repo config files:
 
 ```toml

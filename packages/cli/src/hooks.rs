@@ -20,6 +20,32 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const HOOK: &str = "#!/bin/sh\n# worktree-setup reminder v1 (managed; do not edit)\nif [ -z \"${WORKTREE_SETUP_CREATING:-}\" ] && command -v worktree-setup >/dev/null 2>&1; then\n    worktree-setup hook-post-checkout \"$@\" || :\nfi\nexit 0\n";
 const MANAGED_PATH: &str = "worktreeSetup.managedHooksPath";
 
+/// Render the canonical hook, optionally bound to a package-manager executable.
+///
+/// # Errors
+///
+/// * If an explicit executable is not an absolute UTF-8 path.
+pub fn render(executable: Option<&Path>) -> Result<String> {
+    let command = if let Some(path) = executable {
+        if !path.is_absolute() {
+            return Err("Hook executable must be an absolute path".into());
+        }
+        let value = path.to_str().ok_or("Hook executable must be UTF-8")?;
+        format!("'{}'", value.replace('\'', "'\\''"))
+    } else {
+        "worktree-setup".to_owned()
+    };
+    Ok(HOOK
+        .replace(
+            "command -v worktree-setup",
+            &format!("command -v {command}"),
+        )
+        .replace(
+            "    worktree-setup hook-post-checkout",
+            &format!("    {command} hook-post-checkout"),
+        ))
+}
+
 fn git(args: &[&str]) -> Result<String> {
     let output = Command::new("git").args(args).output()?;
     if !output.status.success() {
@@ -129,7 +155,7 @@ pub fn install(options: &HookInstallArgs) -> Result<()> {
             options.mode(0o755);
         }
         let mut file = options.open(&path)?;
-        file.write_all(HOOK.as_bytes())?;
+        file.write_all(render(None)?.as_bytes())?;
     }
     #[cfg(unix)]
     {

@@ -93,6 +93,11 @@ pub struct Args {
 /// Subcommands for worktree-setup.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Render upstream-owned Git hooks for declarative configuration managers.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     /// Install the optional worktree setup reminder hook.
     Init(HookInstallArgs),
     /// Remove an unchanged worktree-setup reminder hook.
@@ -125,6 +130,20 @@ pub enum Command {
     /// worktree. When run from the main worktree (no path given), opens
     /// an interactive multi-select picker.
     Remove(RemoveArgs),
+}
+
+/// Declarative hook generation commands.
+#[derive(Debug, Subcommand)]
+pub enum HookCommand {
+    /// Print the same post-checkout script used by init; makes no changes.
+    Render {
+        /// Git hook to render.
+        #[arg(value_parser = ["post-checkout"])]
+        name: String,
+        /// Absolute executable path to embed instead of resolving through PATH.
+        #[arg(long)]
+        executable: Option<PathBuf>,
+    },
 }
 
 /// Installation options for the optional reminder.

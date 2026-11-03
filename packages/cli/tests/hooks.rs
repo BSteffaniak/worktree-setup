@@ -101,6 +101,58 @@ fn reminder(output: &Output) -> bool {
 }
 
 #[test]
+fn rendering_matches_installer_and_quotes_absolute_executables() {
+    let fixture = Fixture::new();
+    let rendered = fixture.cli(&["hook", "render", "post-checkout"]);
+    assert_ok(&rendered);
+    assert_ok(&fixture.cli(&["init"]));
+    assert_eq!(
+        rendered.stdout,
+        fs::read(fixture.root.path().join("repo/.git/hooks/post-checkout")).unwrap()
+    );
+    assert!(
+        !fixture
+            .cli(&[
+                "hook",
+                "render",
+                "post-checkout",
+                "--executable",
+                "relative"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .cli(&["hook", "render", "pre-commit"])
+            .status
+            .success()
+    );
+
+    // The pinned executable must work even when its path needs shell quoting,
+    // independently of whether worktree-setup can be found through PATH.
+    let pinned = fixture.root.path().join("pinned ' executable");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_worktree-setup"), &pinned).unwrap();
+    let rendered = fixture.cli(&[
+        "hook",
+        "render",
+        "post-checkout",
+        "--executable",
+        pinned.to_str().unwrap(),
+    ]);
+    assert_ok(&rendered);
+    let hook = fixture.root.path().join("repo/.git/hooks/post-checkout");
+    fs::write(&hook, rendered.stdout).unwrap();
+    fs::remove_file(fixture.root.path().join("bin/worktree-setup")).unwrap();
+    assert!(reminder(&fixture.git(&[
+        "worktree",
+        "add",
+        "--detach",
+        "../rendered"
+    ])));
+}
+
+#[test]
 fn local_hook_reminds_only_on_initial_linked_checkout_and_is_reversible() {
     let fixture = Fixture::new();
     assert_ok(&fixture.cli(&["init"]));
